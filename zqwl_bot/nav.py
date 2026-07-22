@@ -298,6 +298,9 @@ class Navigator:
         self._seg_timeout = cfg.get("seg_timeout", 10.0)
         self._wp_tol = cfg.get("wp_tol", 3.0)
 
+        # Foxglove streamer (可选, 调参用)
+        self._streamer = cfg.get("streamer", None)
+
         # PID
         self._pos_pid = _PosPID2D(
             kp=cfg.get("kp_v", 1.5),
@@ -488,6 +491,14 @@ class Navigator:
 
         if not has_path and not has_goals:
             self._send_vel(0.0, 0.0, 0.0)
+            # 空闲时也推数据, Foxglove 波形不间断
+            if self._streamer:
+                self._streamer.send_data({
+                    "target_x": x, "target_y": y, "target_theta": th,
+                    "current_x": x, "current_y": y, "current_theta": th,
+                    "error_x": 0.0, "error_y": 0.0, "error_theta": 0.0,
+                    "vx_cmd": 0.0, "vy_cmd": 0.0, "w_cmd": 0.0,
+                })
             return
 
         if has_path:
@@ -524,6 +535,15 @@ class Navigator:
         dt = 1.0 / self._freq
         vx, vy = self._pos_pid.compute(dxb, dyb, x, y, dt, self._max_v)
         w = self._ang_pid.compute(dth, th, dt, self._max_w)
+
+        # Foxglove 数据推送 (调参用)
+        if self._streamer:
+            self._streamer.send_data({
+                "target_x": gx, "target_y": gy, "target_theta": gth,
+                "current_x": x, "current_y": y, "current_theta": th,
+                "error_x": dxb, "error_y": dyb, "error_theta": dth,
+                "vx_cmd": vx, "vy_cmd": vy, "w_cmd": w,
+            })
 
         # 到达判定
         if math.hypot(dxb, dyb) < self._pos_tol and abs(dth) < self._ang_tol:
@@ -602,6 +622,15 @@ class Navigator:
         vx, vy = self._pos_pid.compute(dxb, dyb, x, y, dt, self._max_v)
         w = self._ang_pid.compute(dth, th, dt, self._max_w)
 
+        # Foxglove 数据推送 (调参用)
+        if self._streamer:
+            self._streamer.send_data({
+                "target_x": tx, "target_y": ty, "target_theta": t_h,
+                "current_x": x, "current_y": y, "current_theta": th,
+                "error_x": dxb, "error_y": dyb, "error_theta": dth,
+                "vx_cmd": vx, "vy_cmd": vy, "w_cmd": w,
+            })
+
         # 速度缩放: 路径巡航速度
         spd = math.hypot(vx, vy)
         if spd > self._v_cruise:
@@ -644,7 +673,7 @@ def init(**cfg) -> None:
     if _nav is not None:
         _nav.stop()
     _nav = Navigator(**cfg)
-    _nav.start()
+    _nav.start(ser_mod=cfg.get("ser_mod", None))
 
 
 def shutdown() -> None:
