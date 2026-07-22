@@ -19,7 +19,7 @@ HEADER = (0xAA, 0x55)
 TYPE_CMD_VEL = 0x01
 TYPE_POSE = 0x02
 TYPE_ROTATE = 0x03  # 转盘位置切换, payload 1B (0-4)
-TYPE_ARM = 0x04  # 机械臂状态切换, payload 1B (0/1/2)
+TYPE_ARM = 0x04  # 机械臂状态切换, payload 1B (0-7)
 TYPE_LIGHT = 0x05  # 补光灯控制, payload 2B [id, on_off]
 # ponytail: 单线程状态机 + if-elif 分发, 消息类型 >3 类再考虑 dispatch table
 
