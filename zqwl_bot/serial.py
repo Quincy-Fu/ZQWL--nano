@@ -41,7 +41,7 @@ def pack_frame(msg_type: int, payload: bytes) -> bytes:
 
 
 class SerialComm:
-    def __init__(self, port: str = "/dev/ttyUSB0", baudrate: int = 115200, timeout: float = 0.1):
+    def __init__(self, port: str = "/dev/ttyACM0", baudrate: int = 115200, timeout: float = 0.1):
         self._port = port
         self._baudrate = baudrate
         self._timeout = timeout
@@ -169,7 +169,7 @@ class SerialComm:
 _comm: SerialComm | None = None
 
 
-def init(port: str = "/dev/ttyUSB0", baudrate: int = 115200) -> None:
+def init(port: str = "/dev/ttyACM0", baudrate: int = 115200) -> None:
     global _comm
     if _comm is not None:
         _comm.stop()

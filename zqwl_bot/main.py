@@ -42,7 +42,7 @@ def main():
 
     streamer = FoxgloveStreamer(port=8765)
     fake = _FakeSerial()
-    nav = Navigator(streamer=streamer)
+    nav = Navigator(streamer=streamer, max_v=1, kp_v=2.0, ki_v=0.02, kd_v=0.2, pos_tol=0.005)
     nav.start(ser_mod=fake)
 
     print("=" * 55)
@@ -53,6 +53,8 @@ def main():
     print("  goto x y    单次目标点")
     print("  kp/kd/ki    改位置环 (运行时直接改, 立刻生效)")
     print("  kpw/kdw/kiw 改朝向环")
+    print("  maxv 值     改最大线速度 m/s")
+    print("  maxw 值     改最大角速度 rad/s")
     print("  s           查看状态")
     print("  q           退出")
     print("=" * 55)
@@ -101,7 +103,7 @@ def main():
                 continue
 
             # ── PID 参数 ──
-            if head in ('kp', 'ki', 'kd', 'kpw', 'kiw', 'kdw'):
+            if head in ('kp', 'ki', 'kd', 'kpw', 'kiw', 'kdw', 'maxv', 'maxw'):
                 if len(parts) != 2:
                     print("用法: kp 2.0")
                     continue
@@ -123,7 +125,12 @@ def main():
                     nav._ang_pid.ki = val
                 elif head == 'kdw':
                     nav._ang_pid.kd = val
-                nav._reset_pids()
+                elif head == 'maxv':
+                    nav._max_v = val
+                elif head == 'maxw':
+                    nav._max_w = val
+                if head not in ('maxv', 'maxw'):
+                    nav._reset_pids()
                 print(f"✓ {head} = {val}")
                 continue
 
