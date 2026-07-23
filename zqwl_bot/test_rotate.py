@@ -1,12 +1,12 @@
 """测试转盘通信: 依次发送位置 0-4, 间隔 2 秒.
-用法: python3 test_rotate.py [/dev/ttyACM0]
+用法: python3 test_rotate.py [/dev/ttyCH341USB0]
 """
 import sys
 import time
 
-from zqwl_bot.serial import init, send_rotate
+from comm import init, send_rotate
 
-PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyACM0"
+PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyCH341USB0"
 
 print(f"连接 {PORT} @ 115200...")
 init(PORT, 115200)
