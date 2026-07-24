@@ -64,7 +64,7 @@ class PathRunner:
 
     def start(self, ser_mod=None) -> None:
         if ser_mod is None:
-            from . import serial as ser_mod
+            from . import comm as ser_mod
         self._ser = ser_mod
 
     def stop(self) -> None:
