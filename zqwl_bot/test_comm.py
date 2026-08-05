@@ -16,7 +16,8 @@
     y <val>            锁轴: Y 移到 val m      例: y 0.3
     g <x> <y>          位置环 GOTO (m)         例: g 0.3 0.3
     t <deg>            角度环 TURNTO (CW+)     例: t 90
-    arc cx cy r a0 a1  圆弧 (圆心/半径m, 起止角度)  例: arc 0 0.3 0.3 -90 0
+    arc r dir sweep    圆弧 (半径m, dir: 1=右转/-1=左转, 扫过角度°, 圆心自动算)
+                       例: arc 0.5 1 180  (右转半圆)
     s <x> <y>          重置坐标                例: s 0 0
     p                  打印当前位姿 (下位机50Hz上报)
     n <f|b|l|r|s>      视觉微调 (体坐标系, 慢速) 例: n f
@@ -84,9 +85,10 @@ def do_goto(x: float, y: float):
 def do_turn(deg: float):
     return timed(f"TURNTO {deg:.1f}°", lambda: comm.turnto(deg, 30.0))
 
-def do_arc(cx: float, cy: float, r: float, a0: float, a1: float):
-    return timed(f"ARC 圆心({cx:.3f},{cy:.3f}) r={r:.3f} {a0:.1f}°→{a1:.1f}°",
-                 lambda: comm.arc(cx, cy, r, a0, a1, 120.0))
+def do_arc(r: float, dir_: int, sweep: float):
+    dname = "右转" if dir_ > 0 else "左转"
+    return timed(f"ARC r={r:.3f} {dname} {abs(sweep):.1f}° (车头沿切线)",
+                 lambda: comm.arc(r, dir_, sweep))
 
 def do_sync(x: float, y: float):
     print(f"  >> SYNC 坐标重置为 ({x:.3f}, {y:.3f})")
@@ -146,8 +148,8 @@ def do_all() -> bool:
         ("第11步: TURNTO 90°",         lambda: do_turn(90.0)),
         ("第12步: TURNTO 0°",          lambda: do_turn(0.0)),
         ("第13步: GOTO 回原点",        lambda: do_goto(0.0, 0.0)),
-        ("第14步: 1/4圆弧 (原点→(0.3,0.3))",
-                                       lambda: do_arc(0.0, 0.3, 0.3, -90.0, 0.0)),
+        ("第14步: 1/4圆弧 (右转 r=0.3, 90° → (0.3,0.3))",
+                                       lambda: do_arc(0.3, 1, 90.0)),
         ("第15步: GOTO 回原点",        lambda: do_goto(0.0, 0.0)),
     ]
     n_ok = 0
@@ -171,7 +173,7 @@ HELP = """命令:
     y <val>            锁轴 Y 移到 val m
     g <x> <y>          位置环 GOTO
     t <deg>            角度环 TURNTO (CW+)
-    arc cx cy r a0 a1  圆弧
+    arc r dir sweep    圆弧 (dir: 1=右转 -1=左转, 扫过角度°)  例: arc 0.5 1 180
     s <x> <y>          重置坐标
     p                  打印当前位姿
     n <f|b|l|r|s>      视觉微调 (f=前 b=后 l=左 r=右 s=停止+锁死)
@@ -250,11 +252,10 @@ def main():
                         continue
                     do_turn(float(parts[1]))
                 elif cmd == "arc":
-                    if len(parts) < 6:
-                        print("用法: arc <cx> <cy> <r> <起始角> <终止角>")
+                    if len(parts) < 4:
+                        print("用法: arc <半径m> <方向: 1右转/-1左转> <扫过角度°>  例: arc 0.5 1 180")
                         continue
-                    do_arc(float(parts[1]), float(parts[2]), float(parts[3]),
-                           float(parts[4]), float(parts[5]))
+                    do_arc(float(parts[1]), int(float(parts[2])), float(parts[3]))
                 elif cmd == "s":
                     if len(parts) < 3:
                         print("用法: s <x> <y>")

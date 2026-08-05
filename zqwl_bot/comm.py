@@ -192,12 +192,29 @@ class SerialComm:
         self._check_finite(yaw_deg)
         self._send_nav(TYPE_CMD_TURNTO, struct.pack("<f", yaw_deg))
 
-    def send_arc(self, cx: float, cy: float, r: float,
-                 start_deg: float, end_deg: float) -> None:
-        self._check_finite(cx, cy, r, start_deg, end_deg)
-        if r <= 0:
-            raise ValueError(f"arc radius must be > 0, got {r}")
-        self._send_nav(TYPE_CMD_ARC, struct.pack("<fffff", cx, cy, r, start_deg, end_deg))
+    def send_arc(self, radius: float, dir: int, sweep_deg: float,
+                 speed: float | None = None) -> None:
+        """发送圆弧命令 (新语义: 半径+方向+扫过角度, 圆心由 MCU 按当前位姿自动算).
+
+        radius: 圆弧半径 m, 必须 > 0
+        dir:    +1=右转(顺时针), -1=左转(逆时针), 0 非法
+        sweep_deg: 圆弧扫过角度(度), 符号忽略, 转向由 dir 决定
+        speed:  可选线速度 m/s, 缺省时 MCU 用默认速度 0.10
+        payload: <fff>(12B) 或 <ffff>(16B, 含速度)
+        """
+        self._check_finite(radius, sweep_deg)
+        if radius <= 0:
+            raise ValueError(f"arc radius must be > 0, got {radius}")
+        if dir == 0:
+            raise ValueError("arc dir must be +1 (right turn) or -1 (left turn)")
+        d = 1.0 if dir > 0 else -1.0
+        sweep = abs(float(sweep_deg))
+        if speed is None:
+            self._send_nav(TYPE_CMD_ARC, struct.pack("<fff", radius, d, sweep))
+        else:
+            self._check_finite(speed)
+            self._send_nav(TYPE_CMD_ARC,
+                           struct.pack("<ffff", radius, d, sweep, speed))
 
     def send_fine_move(self, dx_mm: float, dy_mm: float) -> None:
         self._check_finite(dx_mm, dy_mm)
@@ -268,7 +285,8 @@ class SerialComm:
 
     # --- 高层运动命令 ("选择形式", 阻塞式, 返回成败) ---
     # 与下位机一一对应: 锁轴=TOX/TOY(1数据), 走点=GOTO(2数据)或GOTO+TURNTO(3数据),
-    # 圆弧=ARC(5数据). 坐标单位米, yaw 单位度(CW+). 每条命令 MCU 阻塞执行后回 status.
+    # 圆弧=ARC(3数据: 半径/方向/扫角, 可选第4个速度). 坐标单位米, yaw 单位度(CW+).
+    # 每条命令 MCU 阻塞执行后回 status.
 
     def lock_axis(self, axis: str, target: float, timeout: float = 40.0) -> bool:
         """锁轴移动 (1 个数据).
@@ -321,17 +339,23 @@ class SerialComm:
         self.send_turnto(yaw_deg)
         return self.wait_for(TYPE_CMD_TURNTO_RESP, timeout)
 
-    def arc(self, cx: float, cy: float, r: float,
-            start_deg: float, end_deg: float, timeout: float = 70.0) -> bool:
-        """圆弧 (单独函数, 5 个数据).
+    def arc(self, radius: float, dir: int, sweep_deg: float,
+            speed: float | None = None, timeout: float | None = None) -> bool:
+        """圆弧 (新语义, 从当前位姿出发, 圆心由 MCU 自动算).
 
-        圆心 (cx, cy) 与半径 r 单位米; start_deg/end_deg 单位度(CW+).
-        下位机速度固定 0.10 m/s, sweep 自动归一化定方向. 阻塞等待响应.
+        radius: 半径 m; dir: +1=右转 / -1=左转; sweep_deg: 扫过角度(度).
+        speed: 可选线速度 m/s (缺省 0.10). 车头始终沿切线朝前, 不会原地打转.
+        例: 机器人在 (0,0) 朝向0, arc(0.5, +1, 180) → 右转半圆到 (1,0), 朝向180.
+        timeout=None 时按弧长自动估算 (2.5倍裕量 + 15s 基底).
 
         Returns:
-            True = 圆弧走完; 超时返回 False.
+            True = 圆弧走完; 超时/失败返回 False.
         """
-        self.send_arc(cx, cy, r, start_deg, end_deg)
+        if timeout is None:
+            v = speed if speed is not None else 0.10
+            arclen = abs(sweep_deg) * math.pi / 180.0 * radius
+            timeout = arclen / v * 2.5 + 15.0
+        self.send_arc(radius, dir, sweep_deg, speed)
         return self.wait_for(TYPE_CMD_ARC_RESP, timeout)
 
     def vision_nudge(self, direction: int, timeout: float = 3.0) -> bool:
@@ -564,11 +588,11 @@ def send_turnto(yaw_deg: float) -> None:
         raise RuntimeError("serial not initialized")
     _comm.send_turnto(yaw_deg)
 
-def send_arc(cx: float, cy: float, r: float,
-             start_deg: float, end_deg: float) -> None:
+def send_arc(radius: float, dir: int, sweep_deg: float,
+             speed: float | None = None) -> None:
     if _comm is None:
         raise RuntimeError("serial not initialized")
-    _comm.send_arc(cx, cy, r, start_deg, end_deg)
+    _comm.send_arc(radius, dir, sweep_deg, speed)
 
 def send_fine_move(dx_mm: float, dy_mm: float) -> None:
     if _comm is None:
@@ -610,11 +634,11 @@ def goto(x: float, y: float, yaw: float | None = None,
         raise RuntimeError("serial not initialized, call init() first")
     return _comm.goto(x, y, yaw, timeout)
 
-def arc(cx: float, cy: float, r: float,
-        start_deg: float, end_deg: float, timeout: float = 70.0) -> bool:
+def arc(radius: float, dir: int, sweep_deg: float,
+        speed: float | None = None, timeout: float | None = None) -> bool:
     if _comm is None:
         raise RuntimeError("serial not initialized, call init() first")
-    return _comm.arc(cx, cy, r, start_deg, end_deg, timeout)
+    return _comm.arc(radius, dir, sweep_deg, speed, timeout)
 
 def run(timeout: float = 5.0) -> bool:
     if _comm is None:
@@ -774,10 +798,13 @@ def _self_check() -> None:
     assert len(c._ser.written) == n + 1, "TURNTO must not follow failed GOTO"
     c._ser.status = 1
 
-    # 6.7 arc → 一帧 ARC, 5 个 float
-    assert c.arc(0.0, 0.0, 0.3, 0.0, 90.0)
+    # 6.7 arc → 一帧 ARC, 3 个 float (半径/方向/扫角); 带速度时 4 个 float
+    assert c.arc(0.3, 1, 90.0)
     assert c._ser.written[-1] == pack_frame(
-        TYPE_CMD_ARC, struct.pack("<fffff", 0.0, 0.0, 0.3, 0.0, 90.0))
+        TYPE_CMD_ARC, struct.pack("<fff", 0.3, 1.0, 90.0))
+    assert c.arc(0.3, -1, 180.0, speed=0.08)
+    assert c._ser.written[-1] == pack_frame(
+        TYPE_CMD_ARC, struct.pack("<ffff", 0.3, -1.0, 180.0, 0.08))
 
     # 6.8 run → 空 payload 帧 AA 55 06 00 + 收到 RUN_RESP
     assert c.run()
@@ -842,8 +869,13 @@ def _self_check() -> None:
         except ValueError:
             pass
     try:
-        c.send_arc(0.0, 0.0, 0.0, 0.0, 90.0)
+        c.send_arc(0.0, 1, 90.0)
         assert False, "arc r<=0 must raise"
+    except ValueError:
+        pass
+    try:
+        c.send_arc(0.3, 0, 90.0)
+        assert False, "arc dir=0 must raise"
     except ValueError:
         pass
 

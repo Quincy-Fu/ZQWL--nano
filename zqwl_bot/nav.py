@@ -16,7 +16,7 @@ MCU 侧内置了:
     {"cmd": "toy", "y": -0.662}
     {"cmd": "turnto", "yaw": 90.0}
     {"cmd": "goto", "x": 1.0, "y": 0.5}
-    {"cmd": "arc", "cx": 1.055, "cy": -0.575, "r": 0.949, "a0": -5.2, "a1": 93.9}
+    {"cmd": "arc", "r": 0.5, "dir": 1, "sweep": 180.0}   # dir: 1=右转 -1=左转, sweep=扫过角度°, 可选 "v": 速度m/s
     {"cmd": "sync", "x": 0.0, "y": 0.0}
     {"cmd": "fine", "dx": 5.0, "dy": -3.0}
     可选字段: "vision": True (段后暂停视觉纠偏), "label": "段1: HOME→(0,295)"
@@ -177,8 +177,8 @@ class PathRunner:
             elif c == "goto":
                 self._ser.send_goto(cmd["x"], cmd["y"])
             elif c == "arc":
-                self._ser.send_arc(cmd["cx"], cmd["cy"], cmd["r"],
-                                   cmd["a0"], cmd["a1"])
+                self._ser.send_arc(cmd["r"], cmd["dir"], cmd["sweep"],
+                                   cmd.get("v"))
             elif c == "sync":
                 self._ser.send_sync_pose(cmd["x"], cmd["y"])
             elif c == "fine":
@@ -266,8 +266,8 @@ class _FakeSerial:
     def send_toy(self, y):      self.sent.append(("toy", y))
     def send_turnto(self, yaw): self.sent.append(("turnto", yaw))
     def send_goto(self, x, y):  self.sent.append(("goto", x, y))
-    def send_arc(self, cx, cy, r, a0, a1):
-        self.sent.append(("arc", cx, cy, r, a0, a1))
+    def send_arc(self, r, dir_, sweep, speed=None):
+        self.sent.append(("arc", r, dir_, sweep, speed))
     def send_sync_pose(self, x, y):
         self.sent.append(("sync", x, y))
     def send_fine_move(self, dx, dy):
@@ -301,14 +301,13 @@ def _self_check() -> None:
     assert fake.sent[2] == ("turnto", 90.0)
     print("  [1/4] basic command sequence OK")
 
-    # 2. 圆弧命令
+    # 2. 圆弧命令 (新语义: 半径/方向/扫角)
     fake.sent.clear()
-    arc_cmd = {"cmd": "arc", "cx": 1.055, "cy": -0.575,
-               "r": 0.949, "a0": -5.2, "a1": 93.9, "label": "arc1"}
+    arc_cmd = {"cmd": "arc", "r": 0.949, "dir": 1, "sweep": 99.1, "label": "arc1"}
     ok = runner.run([arc_cmd])
     assert ok
     assert fake.sent[0][0] == "arc"
-    assert abs(fake.sent[0][3] - 0.949) < 0.001
+    assert abs(fake.sent[0][1] - 0.949) < 0.001
     print("  [2/4] arc command OK")
 
     # 3. 超时处理
