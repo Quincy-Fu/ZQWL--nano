@@ -21,6 +21,7 @@ HEADER = (0xAA, 0x55)
 
 # 辅助命令
 TYPE_CMD_VEL  = 0x01
+TYPE_POSE     = 0x02   # 下位机50Hz上报位姿, payload 12B [x(f32), y(f32), theta(f32,CCW弧度)]
 TYPE_ROTATE   = 0x03   # 转盘位置切换, payload 1B (0-4)
 TYPE_ARM      = 0x04   # 机械臂状态切换, payload 1B (0-7, 0=默认位)
 TYPE_LIGHT    = 0x05   # 补光灯控制, payload 2B [id, on_off] (id: 0=全部, 1-4=单灯, 4=PA3/TIM5)
@@ -46,12 +47,24 @@ TYPE_CMD_SYNC_RESP    = 0x1B
 TYPE_CMD_ARC          = 0x1C
 TYPE_CMD_ARC_RESP     = 0x1D
 
+# 视觉微调 (到位后视觉闭环方向微调, 体坐标系)
+TYPE_CMD_VISION_NUDGE       = 0x27   # PC->MCU: payload 1B direction
+TYPE_CMD_VISION_NUDGE_RESP  = 0x28   # MCU->PC: payload 1B status (1=executed)
+
+# 视觉微调方向码
+NUDGE_STOP     = 0   # 立即停止+电磁锁死
+NUDGE_FORWARD  = 1   # 体坐标系前进 (+Y)
+NUDGE_BACKWARD = 2   # 体坐标系后退 (-Y)
+NUDGE_LEFT     = 3   # 体坐标系左移 (-X)
+NUDGE_RIGHT    = 4   # 体坐标系右移 (+X)
+
 # 所有导航响应类型集合
 _NAV_RESP_TYPES = frozenset({
     TYPE_CMD_GOTO_RESP, TYPE_CMD_TOX_RESP, TYPE_CMD_TOY_RESP,
     TYPE_CMD_TURNTO_RESP, TYPE_CMD_FINE_RESP, TYPE_CMD_SYNC_RESP,
     TYPE_CMD_ARC_RESP, TYPE_RUN_RESP,
     TYPE_ROTATE_RESP, TYPE_ARM_RESP, TYPE_LIGHT_RESP,
+    TYPE_CMD_VISION_NUDGE_RESP,
 })
 
 FRAME_OVERHEAD = 2 + 1 + 1 + 2  # header + type + len + crc16
@@ -87,6 +100,9 @@ class SerialComm:
         self._resp_sent_seq: int = 0   # 最近一次发命令时的 seq 基线 (发送瞬间记录)
         self._nav_resp_type: int = 0
         self._nav_resp_status: int = 0
+        # 位姿 (下位机50Hz常驻上报, 存最新一帧供随时读取)
+        self._pose: tuple[float, float, float] | None = None   # (x, y, yaw_deg)
+        self._pose_ts: float = 0.0                               # monotonic 时间戳
         self._reset_parser()
 
     def start(self) -> None:
@@ -190,6 +206,17 @@ class SerialComm:
     def send_sync_pose(self, x: float, y: float) -> None:
         self._check_finite(x, y)
         self._send_nav(TYPE_CMD_SYNC_POSE, struct.pack("<ff", x, y))
+
+    def send_vision_nudge(self, direction: int) -> None:
+        """发送视觉微调命令 (体坐标系方向, 1B payload).
+
+        direction: NUDGE_STOP/FORWARD/BACKWARD/LEFT/RIGHT
+                   0=停止+锁死, 1-4=慢速运动 (MCU 固定速度, 无需指定)
+        """
+        if direction not in (NUDGE_STOP, NUDGE_FORWARD, NUDGE_BACKWARD,
+                             NUDGE_LEFT, NUDGE_RIGHT):
+            raise ValueError(f"nudge direction must be 0-4, got {direction}")
+        self._send_nav(TYPE_CMD_VISION_NUDGE, struct.pack("<B", direction))
 
     # --- 导航响应接收 ---
 
@@ -307,6 +334,22 @@ class SerialComm:
         self.send_arc(cx, cy, r, start_deg, end_deg)
         return self.wait_for(TYPE_CMD_ARC_RESP, timeout)
 
+    def vision_nudge(self, direction: int, timeout: float = 3.0) -> bool:
+        """视觉微调 (体坐标系方向, 非阻塞运动).
+
+        direction: NUDGE_STOP/FORWARD/BACKWARD/LEFT/RIGHT
+                   0=停止+锁死, 1-4=慢速运动 (MCU 固定速度 0.05 m/s)
+
+        MCU 收到 dir=1-4 后立即设慢速并回响应 (不阻塞), Emm_V5 维持速度
+        直到收到 dir=0 停止. 上位机视觉闭环: 发方向→看画面→发停止.
+        MotorTask 2s 看门狗: 无新命令自动停止+锁死.
+
+        Returns:
+            True = MCU 已执行 (收到 RESP); 超时返回 False.
+        """
+        self.send_vision_nudge(direction)
+        return self.wait_for(TYPE_CMD_VISION_NUDGE_RESP, timeout)
+
     def run(self, timeout: float = 5.0) -> bool:
         """启动命令 (模拟按下启动按键).
 
@@ -410,8 +453,36 @@ class SerialComm:
                 self._nav_resp_status = payload[0]
                 self._nav_resp_seq += 1
                 self._resp_cond.notify_all()
+        elif msg_type == TYPE_POSE and len(payload) >= 12:
+            x, y, theta_rad = struct.unpack("<fff", payload[:12])
+            with self._lock:
+                self._pose = (x, y, math.degrees(theta_rad))
+                self._pose_ts = time.monotonic()
         else:
             log.debug("unhandled type 0x%02x len=%d", msg_type, len(payload))
+
+    def get_pose(self, max_age: float = 1.0) -> tuple[float, float, float] | None:
+        """读取最新位姿 (下位机50Hz常驻上报, 无需发请求).
+
+        Args:
+            max_age: 帧龄上限 s, 超过视为通信中断.
+        Returns:
+            (x, y, yaw_deg): x/y 米, yaw 度 CCW+ (与下位机一致);
+            从未收到帧或帧过旧返回 None.
+        """
+        with self._lock:
+            if self._pose is None:
+                return None
+            if time.monotonic() - self._pose_ts > max_age:
+                return None
+            return self._pose
+
+    def pose_age(self) -> float:
+        """最新位姿帧的年龄 s (从未收到返回 inf)."""
+        with self._lock:
+            if self._pose is None:
+                return float('inf')
+            return time.monotonic() - self._pose_ts
 
 
 # --- 模块级单例 ---
@@ -432,6 +503,20 @@ def shutdown() -> None:
     if _comm is not None:
         _comm.stop()
         _comm = None
+
+
+def get_pose(max_age: float = 1.0) -> tuple[float, float, float] | None:
+    """读取最新位姿 (x米, y米, yaw度CCW+), 帧过旧/未收到返回 None."""
+    if _comm is None:
+        return None
+    return _comm.get_pose(max_age)
+
+
+def pose_age() -> float:
+    """最新位姿帧年龄 s (未收到=inf)."""
+    if _comm is None:
+        return float('inf')
+    return _comm.pose_age()
 
 
 def send_velocity(vx: float, vy: float, w: float) -> None:
@@ -495,6 +580,11 @@ def send_sync_pose(x: float, y: float) -> None:
         raise RuntimeError("serial not initialized")
     _comm.send_sync_pose(x, y)
 
+def send_vision_nudge(direction: int) -> None:
+    if _comm is None:
+        raise RuntimeError("serial not initialized")
+    _comm.send_vision_nudge(direction)
+
 def wait_nav_response(timeout: float = 30.0) -> tuple[int, int] | None:
     if _comm is None:
         return None
@@ -551,6 +641,11 @@ def light(light_id: int, on: bool, timeout: float = 5.0) -> bool:
         raise RuntimeError("serial not initialized, call init() first")
     return _comm.light(light_id, on, timeout)
 
+def vision_nudge(direction: int, timeout: float = 3.0) -> bool:
+    if _comm is None:
+        raise RuntimeError("serial not initialized, call init() first")
+    return _comm.vision_nudge(direction, timeout)
+
 
 # --- 自检 ---
 
@@ -591,6 +686,18 @@ def _self_check() -> None:
     assert c._nav_resp_type == TYPE_CMD_ARC_RESP
     assert c._nav_resp_status == 0
 
+    # 4.5 POSE 帧: 不进响应计数, 位姿被正确缓存 (theta 弧度→度)
+    assert c.get_pose() is None, "收帧前 get_pose 应为 None"
+    seq2 = c._nav_resp_seq
+    for b in pack_frame(TYPE_POSE, struct.pack("<fff", 0.5, -0.25, 1.5707963)):
+        c._feed_byte(b)
+    assert c._nav_resp_seq == seq2, "POSE 不得计入导航响应"
+    pose = c.get_pose()
+    assert pose is not None
+    assert abs(pose[0] - 0.5) < 1e-6 and abs(pose[1] + 0.25) < 1e-6
+    assert abs(pose[2] - 90.0) < 0.01, f"theta 应转为 90°, got {pose[2]}"
+    assert c.pose_age() < 0.5
+
     # 5. wait_nav_response 语义: 只计调用之后到达的新响应
     def _later_feed():
         time.sleep(0.02)
@@ -614,6 +721,7 @@ def _self_check() -> None:
             TYPE_ROTATE:      TYPE_ROTATE_RESP,
             TYPE_ARM:         TYPE_ARM_RESP,
             TYPE_LIGHT:       TYPE_LIGHT_RESP,
+            TYPE_CMD_VISION_NUDGE: TYPE_CMD_VISION_NUDGE_RESP,
         }
 
         def __init__(self, comm):
@@ -755,6 +863,24 @@ def _self_check() -> None:
             return super().write(data)
     c._ser = _StaleEcho(c)
     assert c.run(), "迟到的错类型响应必须被跳过, RUN_RESP 仍要命中"
+
+    # 6.18 send_vision_nudge: 1B payload 方向码, 0-4 合法, 越界抛 ValueError
+    c._ser = _EchoSerial(c)   # 重置为干净 Echo
+    for d in (NUDGE_STOP, NUDGE_FORWARD, NUDGE_BACKWARD, NUDGE_LEFT, NUDGE_RIGHT):
+        c.send_vision_nudge(d)
+        assert c._ser.written[-1] == pack_frame(TYPE_CMD_VISION_NUDGE, struct.pack("<B", d))
+    for badv in (-1, 5, 255):
+        try:
+            c.send_vision_nudge(badv)
+            assert False, "nudge direction out-of-range must raise"
+        except ValueError:
+            pass
+
+    # 6.19 高层 vision_nudge: 帧 + VISION_NUDGE_RESP 确认 (非阻塞, 即时应答)
+    assert c.vision_nudge(NUDGE_FORWARD)
+    assert c._ser.written[-1] == pack_frame(TYPE_CMD_VISION_NUDGE, struct.pack("<B", NUDGE_FORWARD))
+    assert c.vision_nudge(NUDGE_STOP)
+    assert c._ser.written[-1] == pack_frame(TYPE_CMD_VISION_NUDGE, struct.pack("<B", NUDGE_STOP))
 
     print("self-check OK")
 

@@ -1,35 +1,34 @@
-"""上位机综合测试脚本 (Jetson Nano 上位机, 经 USB-TTL 连 STM32).
+"""上位机综合测试脚本 (交互式, Jetson Nano 上位机, 经 USB-TTL 连 STM32).
 
-基于 comm.py 的高层阻塞 API, 逐条命令发送并等待下位机真实响应,
-覆盖: 启动按键 / 补光灯 / 机械臂 / 转盘 / 位置环 / 角度环 / 圆弧 / 坐标重置.
+启动一次, 然后在提示符下输入命令即可, 类似 Windows 时的 nav_test.py.
 
-TTL 设备名固定为 /dev/ttyCH341USB0 (与 comm.py 默认一致), 无需传串口:
+用法:
+    python3 test_comm.py                    # 默认 TTL: /dev/ttyCH341USB0
+    python3 test_comm.py /dev/ttyUSB0       # 换串口
 
-    # 单项测试 (在 zqwl_bot 目录下运行)
-    python3 test_comm.py run                   # 启动按键 (PD15 脉冲)
-    python3 test_comm.py light 1 on            # 灯1 开 (id: 0=全部, 1-4)
-    python3 test_comm.py light 0 off           # 全部关
-    python3 test_comm.py arm 1                 # 机械臂姿态1 (0-7, 0=默认)
-    python3 test_comm.py rotate 2              # 转盘切到槽位2 (0-4)
-    python3 test_comm.py rotate all            # 依次走完 5 个槽位
-    python3 test_comm.py axis x 0.3            # 锁轴: X 移到 0.3m
-    python3 test_comm.py pos 0.3 0.3           # 位置环: GOTO (0.3, 0.3)
-    python3 test_comm.py turn 90               # 角度环: 转到 90° (CW+)
-    python3 test_comm.py arc 0 0.3 0.3 -90 0   # 圆弧: 圆心/半径/起止角(度)
-    python3 test_comm.py sync 0 0              # 重置坐标为 (0, 0)
-
-    # 综合测试: 按安全顺序跑一遍全部子系统, 最后回原点
-    python3 test_comm.py all
-
-    # 可选参数 (换串口/超时/波特率)
-    python3 test_comm.py --port /dev/ttyUSB0 turn 90   # 换串口
-    python3 test_comm.py pos 0.5 0.5 --timeout 60 --baud 115200
+命令:
+    r <pos>            转盘槽位 0-4           例: r 2
+    r all              转盘依次走完 5 个槽位
+    a <state>          机械臂姿态 0-7 (0=默认) 例: a 1
+    l <id> on|off      补光灯 (0=全部, 1-4)    例: l 1 on
+    run                启动按键 (PD15 500ms 脉冲)
+    x <val>            锁轴: X 移到 val m      例: x 0.3
+    y <val>            锁轴: Y 移到 val m      例: y 0.3
+    g <x> <y>          位置环 GOTO (m)         例: g 0.3 0.3
+    t <deg>            角度环 TURNTO (CW+)     例: t 90
+    arc cx cy r a0 a1  圆弧 (圆心/半径m, 起止角度)  例: arc 0 0.3 0.3 -90 0
+    s <x> <y>          重置坐标                例: s 0 0
+    p                  打印当前位姿 (下位机50Hz上报)
+    n <f|b|l|r|s>      视觉微调 (体坐标系, 慢速) 例: n f
+                       f=前进 b=后退 l=左 r=右 s=停止+锁死
+    all                综合测试 (全部子系统按安全顺序跑一遍, 最后回原点)
+    h                  显示帮助
+    q                  退出
 
 坐标系: +X=右, +Y=前, 角度 CW 为正, 单位 m / deg. MCU 上电 odom 归零.
 注意: 转盘响应是"估算移动时间到"而非电机真实到位; TOX/TOY 恒回成功(时序握手).
 """
 
-import argparse
 import sys
 import time
 
@@ -39,191 +38,247 @@ except ImportError:
     import comm                 # 作为脚本直接运行
 
 
-# ── 工具 ──
-
-def _timed(label: str, fn, timeout: float) -> bool:
+def timed(label: str, fn) -> bool:
     """执行一条阻塞命令, 打印耗时与结果."""
     print(f"  >> {label}")
     t0 = time.perf_counter()
-    ok = fn()
+    try:
+        ok = bool(fn())
+    except ValueError as e:
+        print(f"  !! 参数错误: {e}")
+        return False
     dt = time.perf_counter() - t0
-    print(f"  << {'OK  ' if ok else 'FAIL'}  {label}   ({dt:.2f}s)")
-    return bool(ok)
+    print(f"  << {'OK  ' if ok else 'FAIL'}  ({dt:.2f}s)")
+    return ok
 
 
-class Tally:
-    def __init__(self):
-        self.ok = 0
-        self.fail = 0
+# ── 各命令 ──
 
-    def add(self, ok: bool):
-        if ok:
-            self.ok += 1
-        else:
-            self.fail += 1
+def do_run():
+    return timed("RUN 启动按键", lambda: comm.run(5.0))
 
-    def report(self):
-        total = self.ok + self.fail
-        print("\n" + "═" * 40)
-        print(f"结果: {self.ok}/{total} 通过" + (f", {self.fail} 失败" if self.fail else ""))
-        print("═" * 40)
-        return self.fail == 0
+def do_light(lid: int, on: bool):
+    name = f"灯{lid}" if lid else "全部灯"
+    return timed(f"LIGHT {name} {'开' if on else '关'}",
+                 lambda: comm.light(lid, on, 5.0))
 
+def do_arm(state: int):
+    return timed(f"ARM 姿态 {state} (五次多项式缓动)", lambda: comm.arm(state, 6.0))
 
-# ── 单项测试 ──
-
-def do_run(t: Tally, timeout: float):
-    t.add(_timed("RUN 启动按键 (PD15 500ms 脉冲)", lambda: comm.run(timeout), timeout))
-
-
-def do_light(t: Tally, light_id: int, on: bool, timeout: float):
-    state = "开" if on else "关"
-    name = f"灯{light_id}" if light_id else "全部灯"
-    t.add(_timed(f"LIGHT {name} {state}", lambda: comm.light(light_id, on, timeout), timeout))
-
-
-def do_arm(t: Tally, state: int, timeout: float):
-    t.add(_timed(f"ARM 姿态 {state} (五次多项式缓动)", lambda: comm.arm(state, timeout), timeout))
-
-
-def do_rotate(t: Tally, pos, timeout: float):
+def do_rotate(pos) -> bool:
     if pos == "all":
+        ok = True
         for p in range(5):
-            t.add(_timed(f"ROTATE 槽位 {p}", lambda p=p: comm.rotate(p, timeout), timeout))
-    else:
-        t.add(_timed(f"ROTATE 槽位 {pos}", lambda: comm.rotate(pos, timeout), timeout))
+            ok &= timed(f"ROTATE 槽位 {p}", lambda p=p: comm.rotate(p, 12.0))
+        return ok
+    return timed(f"ROTATE 槽位 {pos}", lambda: comm.rotate(pos, 12.0))
 
-
-def do_axis(t: Tally, axis: str, target: float, timeout: float):
+def do_axis(axis: str, target: float):
     name = "X (锁Y)" if axis == 'x' else "Y (锁X)"
-    t.add(_timed(f"锁轴 {name} → {target:.3f}m",
-                 lambda: comm.lock_axis(axis, target, timeout), timeout))
+    return timed(f"锁轴 {name} → {target:.3f}m",
+                 lambda: comm.lock_axis(axis, target, 40.0))
 
+def do_goto(x: float, y: float):
+    return timed(f"GOTO ({x:.3f}, {y:.3f})", lambda: comm.goto(x, y, timeout=40.0))
 
-def do_pos(t: Tally, x: float, y: float, timeout: float):
-    t.add(_timed(f"GOTO ({x:.3f}, {y:.3f})", lambda: comm.goto(x, y, timeout=timeout), timeout))
+def do_turn(deg: float):
+    return timed(f"TURNTO {deg:.1f}°", lambda: comm.turnto(deg, 30.0))
 
+def do_arc(cx: float, cy: float, r: float, a0: float, a1: float):
+    return timed(f"ARC 圆心({cx:.3f},{cy:.3f}) r={r:.3f} {a0:.1f}°→{a1:.1f}°",
+                 lambda: comm.arc(cx, cy, r, a0, a1, 120.0))
 
-def do_turn(t: Tally, deg: float, timeout: float):
-    t.add(_timed(f"TURNTO {deg:.1f}°", lambda: comm.turnto(deg, timeout), timeout))
-
-
-def do_arc(t: Tally, cx: float, cy: float, r: float,
-           a0: float, a1: float, timeout: float):
-    t.add(_timed(f"ARC 圆心({cx:.3f},{cy:.3f}) r={r:.3f} {a0:.1f}°→{a1:.1f}°",
-                 lambda: comm.arc(cx, cy, r, a0, a1, timeout), timeout))
-
-
-def do_sync(t: Tally, x: float, y: float, timeout: float = 5.0):
-    # sync 没有高层封装, 直接用底层 send + wait_for
+def do_sync(x: float, y: float):
     print(f"  >> SYNC 坐标重置为 ({x:.3f}, {y:.3f})")
     t0 = time.perf_counter()
     comm.send_sync_pose(x, y)
-    ok = comm.wait_for(comm.TYPE_CMD_SYNC_RESP, timeout)
+    ok = comm.wait_for(comm.TYPE_CMD_SYNC_RESP, 5.0)
     dt = time.perf_counter() - t0
-    print(f"  << {'OK  ' if ok else 'FAIL'}  SYNC   ({dt:.2f}s)")
-    t.add(bool(ok))
+    print(f"  << {'OK  ' if ok else 'FAIL'}  ({dt:.2f}s)")
+    return bool(ok)
 
 
-# ── 综合测试 ──
-
-def do_all(t: Tally, timeout: float):
-    print("── 第1步: 坐标重置 ──")
-    do_sync(t, 0.0, 0.0)
-
-    print("── 第2步: 原地设备 (启动/灯/机械臂/转盘) ──")
-    do_run(t, 5.0)
-    do_light(t, 1, True, 5.0)
-    do_light(t, 1, False, 5.0)
-    do_arm(t, 1, 6.0)
-    do_arm(t, 0, 6.0)            # 回默认位
-    do_rotate(t, 1, 12.0)
-    do_rotate(t, 0, 12.0)        # 回槽位0
-
-    print("── 第3步: 位置环 (锁轴) ──")
-    do_axis(t, 'x', 0.3, timeout)
-    do_axis(t, 'y', 0.3, timeout)
-
-    print("── 第4步: 角度环 ──")
-    do_turn(t, 90.0, 30.0)
-    do_turn(t, 0.0, 30.0)
-
-    print("── 第5步: 位置环 (走点回原点) ──")
-    do_pos(t, 0.0, 0.0, timeout)
-
-    print("── 第6步: 圆弧 (从原点出发, 1/4 弧到 (0.3, 0.3)) ──")
-    do_arc(t, 0.0, 0.3, 0.3, -90.0, 0.0, 120.0)
-    do_pos(t, 0.0, 0.0, timeout)   # 收尾回原点
+def do_pose() -> bool:
+    """打印下位机当前位姿 (50Hz 常驻上报, 直接读缓存, 不发请求)."""
+    pose = comm.get_pose(max_age=1.0)
+    if pose is None:
+        age = comm.pose_age()
+        if age == float('inf'):
+            print("  !! 未收到 POSE 帧: 确认 MCU 已上电且串口连通")
+        else:
+            print(f"  !! POSE 帧已 {age:.1f}s 未更新, 通信可能中断")
+        return False
+    x, y, yaw_deg = pose
+    age = comm.pose_age()
+    print(f"  坐标: x={x:.4f}m  y={y:.4f}m  yaw={yaw_deg:.1f}° (CCW+)  "
+          f"(帧龄 {age*1000:.0f}ms)")
+    return True
 
 
-# ── 主入口 ──
+_NUDGE_MAP = {
+    "f": (comm.NUDGE_FORWARD,  "前进"),
+    "b": (comm.NUDGE_BACKWARD, "后退"),
+    "l": (comm.NUDGE_LEFT,     "左移"),
+    "r": (comm.NUDGE_RIGHT,    "右移"),
+    "s": (comm.NUDGE_STOP,     "停止+锁死"),
+}
+
+def do_nudge(sub: str):
+    if sub not in _NUDGE_MAP:
+        print("用法: n <f|b|l|r|s>  (f=前进 b=后退 l=左 r=右 s=停止+锁死)")
+        return
+    code, name = _NUDGE_MAP[sub]
+    return timed(f"NUDGE {name}", lambda: comm.vision_nudge(code, 3.0))
+
+
+def do_all() -> bool:
+    steps = [
+        ("第1步: 坐标重置",            lambda: do_sync(0.0, 0.0)),
+        ("第2步: RUN",                 do_run),
+        ("第3步: 灯1 开",              lambda: do_light(1, True)),
+        ("第4步: 灯1 关",              lambda: do_light(1, False)),
+        ("第5步: 机械臂姿态1",          lambda: do_arm(1)),
+        ("第6步: 机械臂回默认位",       lambda: do_arm(0)),
+        ("第7步: 转盘槽位1",           lambda: do_rotate(1)),
+        ("第8步: 转盘回槽位0",          lambda: do_rotate(0)),
+        ("第9步: 锁轴 X→0.3",          lambda: do_axis('x', 0.3)),
+        ("第10步: 锁轴 Y→0.3",         lambda: do_axis('y', 0.3)),
+        ("第11步: TURNTO 90°",         lambda: do_turn(90.0)),
+        ("第12步: TURNTO 0°",          lambda: do_turn(0.0)),
+        ("第13步: GOTO 回原点",        lambda: do_goto(0.0, 0.0)),
+        ("第14步: 1/4圆弧 (原点→(0.3,0.3))",
+                                       lambda: do_arc(0.0, 0.3, 0.3, -90.0, 0.0)),
+        ("第15步: GOTO 回原点",        lambda: do_goto(0.0, 0.0)),
+    ]
+    n_ok = 0
+    for label, fn in steps:
+        print(f"── {label} ──")
+        if fn():
+            n_ok += 1
+        else:
+            print("  !! 本步失败, 继续后续步骤 (Ctrl+C 可中断)")
+    print(f"\n综合测试结果: {n_ok}/{len(steps)} 通过")
+    return n_ok == len(steps)
+
+
+HELP = """命令:
+    r <pos>            转盘槽位 0-4           例: r 2
+    r all              转盘依次走完 5 个槽位
+    a <state>          机械臂姿态 0-7 (0=默认) 例: a 1
+    l <id> on|off      补光灯 (0=全部, 1-4)    例: l 1 on
+    run                启动按键 (PD15 脉冲)
+    x <val>            锁轴 X 移到 val m
+    y <val>            锁轴 Y 移到 val m
+    g <x> <y>          位置环 GOTO
+    t <deg>            角度环 TURNTO (CW+)
+    arc cx cy r a0 a1  圆弧
+    s <x> <y>          重置坐标
+    p                  打印当前位姿
+    n <f|b|l|r|s>      视觉微调 (f=前 b=后 l=左 r=右 s=停止+锁死)
+    all                综合测试
+    q                  退出"""
+
+
+# ── 主循环 ──
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="ZQWL 上位机综合测试 (基于 comm.py 阻塞 API)")
-    ap.add_argument("cmd", choices=[
-        "run", "light", "arm", "rotate", "axis", "pos",
-        "turn", "arc", "sync", "all"])
-    ap.add_argument("args", nargs="*", help="命令参数 (见文件头用法)")
-    ap.add_argument("--port", default="/dev/ttyCH341USB0",
-                    help="TTL 串口设备名 (默认 /dev/ttyCH341USB0)")
-    ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--timeout", type=float, default=40.0,
-                    help="单条命令超时 s (默认 40)")
-    ns = ap.parse_args()
+    port = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyCH341USB0"
 
-    print(f"连接 {ns.port} @ {ns.baud} ...")
+    print(f"连接 {port} @ 115200 ...")
     try:
-        comm.init(ns.port, ns.baud)
+        comm.init(port, 115200)
     except Exception as e:
         print(f"串口打开失败: {e}")
         sys.exit(1)
-
-    # 等 POSE 帧建立通信 (最多 2s, 仅观察, 不影响后续)
-    time.sleep(1.0)
+    time.sleep(1.0)   # 等 POSE 帧建立通信
     print("已连接\n")
+    print("═══  综合测试 (输入 h 查看命令)  ═══\n")
 
-    t = Tally()
     try:
-        a = ns.args
-        if ns.cmd == "run":
-            do_run(t, 5.0)
-        elif ns.cmd == "light":
-            lid = int(a[0]) if a else 0
-            on = (a[1].lower() in ("on", "1", "true")) if len(a) > 1 else True
-            do_light(t, lid, on, 5.0)
-        elif ns.cmd == "arm":
-            do_arm(t, int(a[0]) if a else 0, 6.0)
-        elif ns.cmd == "rotate":
-            pos = a[0] if a else "all"
-            pos = "all" if pos == "all" else int(pos)
-            do_rotate(t, pos, 12.0)
-        elif ns.cmd == "axis":
-            do_axis(t, a[0], float(a[1]), ns.timeout)
-        elif ns.cmd == "pos":
-            do_pos(t, float(a[0]), float(a[1]), ns.timeout)
-        elif ns.cmd == "turn":
-            do_turn(t, float(a[0]), 30.0)
-        elif ns.cmd == "arc":
-            do_arc(t, float(a[0]), float(a[1]), float(a[2]),
-                   float(a[3]), float(a[4]), 120.0)
-        elif ns.cmd == "sync":
-            do_sync(t, float(a[0]) if a else 0.0,
-                    float(a[1]) if len(a) > 1 else 0.0)
-        elif ns.cmd == "all":
-            do_all(t, ns.timeout)
-    except ValueError as e:
-        print(f"参数错误: {e}")
-        comm.shutdown()
-        sys.exit(2)
-    except IndexError:
-        print("缺少参数, 用法见文件头注释")
-        comm.shutdown()
-        sys.exit(2)
+        while True:
+            try:
+                line = input("> ").strip().lower()
+            except EOFError:
+                break
+            if not line:
+                continue
 
-    ok = t.report()
+            parts = line.split()
+            cmd = parts[0]
+
+            try:
+                if cmd == "q":
+                    break
+                elif cmd == "h":
+                    print(HELP)
+                elif cmd == "run":
+                    do_run()
+                elif cmd == "r":
+                    if len(parts) < 2:
+                        print("用法: r <0-4> 或 r all")
+                        continue
+                    pos = parts[1]
+                    do_rotate("all" if pos == "all" else int(pos))
+                elif cmd == "a":
+                    if len(parts) < 2:
+                        print("用法: a <0-7>")
+                        continue
+                    do_arm(int(parts[1]))
+                elif cmd == "l":
+                    if len(parts) < 3:
+                        print("用法: l <0-4> on|off")
+                        continue
+                    do_light(int(parts[1]), parts[2] in ("on", "1", "true"))
+                elif cmd == "x":
+                    if len(parts) < 2:
+                        print("用法: x <米>")
+                        continue
+                    do_axis('x', float(parts[1]))
+                elif cmd == "y":
+                    if len(parts) < 2:
+                        print("用法: y <米>")
+                        continue
+                    do_axis('y', float(parts[1]))
+                elif cmd == "g":
+                    if len(parts) < 3:
+                        print("用法: g <x> <y>")
+                        continue
+                    do_goto(float(parts[1]), float(parts[2]))
+                elif cmd == "t":
+                    if len(parts) < 2:
+                        print("用法: t <角度>")
+                        continue
+                    do_turn(float(parts[1]))
+                elif cmd == "arc":
+                    if len(parts) < 6:
+                        print("用法: arc <cx> <cy> <r> <起始角> <终止角>")
+                        continue
+                    do_arc(float(parts[1]), float(parts[2]), float(parts[3]),
+                           float(parts[4]), float(parts[5]))
+                elif cmd == "s":
+                    if len(parts) < 3:
+                        print("用法: s <x> <y>")
+                        continue
+                    do_sync(float(parts[1]), float(parts[2]))
+                elif cmd == "p":
+                    do_pose()
+                elif cmd == "n":
+                    if len(parts) < 2:
+                        print("用法: n <f|b|l|r|s>  (f=前进 b=后退 l=左 r=右 s=停止+锁死)")
+                        continue
+                    do_nudge(parts[1])
+                elif cmd == "all":
+                    do_all()
+                else:
+                    print(f"未知命令: {cmd} (输入 h 查看帮助)")
+            except ValueError:
+                print("参数格式错误, 请输入数字")
+
+    except KeyboardInterrupt:
+        pass
+
     comm.shutdown()
-    sys.exit(0 if ok else 1)
+    print("\n串口已关闭")
 
 
 if __name__ == "__main__":
