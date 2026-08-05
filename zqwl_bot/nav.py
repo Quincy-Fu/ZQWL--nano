@@ -153,8 +153,19 @@ class PathRunner:
 
     # ──────────── internal ────────────
 
+    # 命令 → 期望响应类型 (与 comm.py 常量一致, 必须核对类型防陈旧响应顶替)
+    _EXPECT = {
+        "tox":    0x13,   # TYPE_CMD_TOX_RESP
+        "toy":    0x15,   # TYPE_CMD_TOY_RESP
+        "turnto": 0x17,   # TYPE_CMD_TURNTO_RESP
+        "goto":   0x11,   # TYPE_CMD_GOTO_RESP
+        "arc":    0x1D,   # TYPE_CMD_ARC_RESP
+        "sync":   0x1B,   # TYPE_CMD_SYNC_RESP
+        "fine":   0x19,   # TYPE_CMD_FINE_RESP
+    }
+
     def _execute_one(self, cmd: dict, timeout: float) -> bool:
-        """发送一条导航命令并等待响应. Returns True=成功."""
+        """发送一条导航命令并等待对应类型的响应. Returns True=成功."""
         c = cmd["cmd"]
         try:
             if c == "tox":
@@ -181,11 +192,8 @@ class PathRunner:
             self._emit(EV_ERROR, error=str(exc))
             return False
 
-        # 等待响应
-        resp = self._ser.wait_nav_response(timeout)
-        if resp is None:
-            return False
-        return resp[1] == 1  # status=1 means success
+        # 等待响应: 必须核对类型 (wait_for 会跳过陈旧/错类型响应)
+        return self._ser.wait_for(self._EXPECT[c], timeout)
 
 
 # ═══════════════ 模块级 API (单例) ═══════════════
@@ -265,10 +273,8 @@ class _FakeSerial:
     def send_fine_move(self, dx, dy):
         self.sent.append(("fine", dx, dy))
 
-    def wait_nav_response(self, timeout=30.0):
-        if self._ok:
-            return (0x11, 1)  # type=GOTO_RESP, status=1
-        return None
+    def wait_for(self, expect: int, timeout: float = 30.0) -> bool:
+        return self._ok
 
 
 def _self_check() -> None:
