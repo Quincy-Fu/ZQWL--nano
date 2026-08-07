@@ -5,7 +5,7 @@ import time
 
 if __name__ == "__main__":
     detect_cameras()
-    cap = cv2.VideoCapture(0,cv2.CAP_V4L2)
+    cap = cv2.VideoCapture(1,cv2.CAP_V4L2)
 
     fourcc = cv2.VideoWriter_fourcc(*'MJPG')
     cap.set(cv2.CAP_PROP_FOURCC, fourcc)
