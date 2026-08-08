@@ -112,7 +112,7 @@ def do_pose() -> bool:
         return False
     x, y, yaw_deg = pose
     age = comm.pose_age()
-    print(f"  坐标: x={x:.4f}m  y={y:.4f}m  yaw={yaw_deg:.1f}° (CCW+)  "
+    print(f"  坐标: x={x:.4f}m  y={y:.4f}m  yaw={yaw_deg:.1f}° (CW+)  "
           f"(帧龄 {age*1000:.0f}ms)")
     return True
 

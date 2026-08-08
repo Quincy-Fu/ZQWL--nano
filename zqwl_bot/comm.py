@@ -21,7 +21,7 @@ HEADER = (0xAA, 0x55)
 
 # 辅助命令
 TYPE_CMD_VEL  = 0x01
-TYPE_POSE     = 0x02   # 下位机50Hz上报位姿, payload 12B [x(f32), y(f32), theta(f32,CCW弧度)]
+TYPE_POSE     = 0x02   # 下位机50Hz上报位姿, payload 12B [x(f32), y(f32), theta(f32,CW弧度,编码器)]
 TYPE_ROTATE   = 0x03   # 转盘位置切换, payload 1B (0-4)
 TYPE_ARM      = 0x04   # 机械臂状态切换, payload 1B (0-7, 0=默认位)
 TYPE_LIGHT    = 0x05   # 补光灯控制, payload 2B [id, on_off] (id: 0=全部, 1-4=单灯, 4=PA3/TIM5)
@@ -51,6 +51,10 @@ TYPE_CMD_ARC_RESP     = 0x1D
 TYPE_CMD_VISION_NUDGE       = 0x27   # PC->MCU: payload 1B direction
 TYPE_CMD_VISION_NUDGE_RESP  = 0x28   # MCU->PC: payload 1B status (1=executed)
 
+# 转盘零点设置 (一次性标定: 将当前位置存为零点并写入 flash)
+TYPE_CMD_SET_ZERO        = 0x29   # PC->MCU: payload 空
+TYPE_CMD_SET_ZERO_RESP   = 0x2A   # MCU->PC: payload 1B status (1=saved)
+
 # 视觉微调方向码
 NUDGE_STOP     = 0   # 立即停止+电磁锁死
 NUDGE_FORWARD  = 1   # 体坐标系前进 (+Y)
@@ -65,6 +69,7 @@ _NAV_RESP_TYPES = frozenset({
     TYPE_CMD_ARC_RESP, TYPE_RUN_RESP,
     TYPE_ROTATE_RESP, TYPE_ARM_RESP, TYPE_LIGHT_RESP,
     TYPE_CMD_VISION_NUDGE_RESP,
+    TYPE_CMD_SET_ZERO_RESP,
 })
 
 FRAME_OVERHEAD = 2 + 1 + 1 + 2  # header + type + len + crc16
@@ -147,6 +152,12 @@ class SerialComm:
         if not self._ser:
             raise RuntimeError("serial not started")
         self._send_nav(TYPE_RUN, b"")
+
+    def send_set_zero(self) -> None:
+        """发送转盘零点设置命令 (payload 空, MCU 调 Emm_V5_Origin_Set_O 写 flash)."""
+        if not self._ser:
+            raise RuntimeError("serial not started")
+        self._send_nav(TYPE_CMD_SET_ZERO, b"")
 
     def send_light(self, light_id: int, on: bool) -> None:
         if not self._ser:
@@ -386,6 +397,19 @@ class SerialComm:
         self.send_run()
         return self.wait_for(TYPE_RUN_RESP, timeout)
 
+    def set_zero(self, timeout: float = 5.0) -> bool:
+        """转盘零点设置: 将当前位置存为零点并写入 flash, 阻塞等待 TYPE_CMD_SET_ZERO_RESP.
+
+        使用方法: 先手动把转盘转到 slot 0 位置, 然后调用本函数.
+        MCU 收到后调 Emm_V5_Origin_Set_O(0x05, true) 将当前位置写入 flash.
+        以后每次上电, Emm_V5_Origin_Trigger_Return 会自动回到此零点.
+
+        Returns:
+            True = 零点已保存; 超时/异常返回 False.
+        """
+        self.send_set_zero()
+        return self.wait_for(TYPE_CMD_SET_ZERO_RESP, timeout)
+
     def rotate(self, pos: int, timeout: float = 10.0) -> bool:
         """转盘切槽位 (0-4), 阻塞等待 TYPE_ROTATE_RESP.
 
@@ -479,8 +503,12 @@ class SerialComm:
                 self._resp_cond.notify_all()
         elif msg_type == TYPE_POSE and len(payload) >= 12:
             x, y, theta_rad = struct.unpack("<fff", payload[:12])
+            yaw = math.degrees(theta_rad)
+            # 下位机 move_yaw(编码器) 内部是累加值(不解卷), 防御性归一到 (-180, 180],
+            # 避免位姿显示出现 540/720 累加 (新固件已在MCU侧归一)
+            yaw = (yaw + 180.0) % 360.0 - 180.0
             with self._lock:
-                self._pose = (x, y, math.degrees(theta_rad))
+                self._pose = (x, y, yaw)
                 self._pose_ts = time.monotonic()
         else:
             log.debug("unhandled type 0x%02x len=%d", msg_type, len(payload))
@@ -491,7 +519,7 @@ class SerialComm:
         Args:
             max_age: 帧龄上限 s, 超过视为通信中断.
         Returns:
-            (x, y, yaw_deg): x/y 米, yaw 度 CCW+ (与下位机一致);
+            (x, y, yaw_deg): x/y 米, yaw 度 CW+ (编码器里程计, 与命令约定一致);
             从未收到帧或帧过旧返回 None.
         """
         with self._lock:
@@ -530,7 +558,7 @@ def shutdown() -> None:
 
 
 def get_pose(max_age: float = 1.0) -> tuple[float, float, float] | None:
-    """读取最新位姿 (x米, y米, yaw度CCW+), 帧过旧/未收到返回 None."""
+    """读取最新位姿 (x米, y米, yaw度CW+), 帧过旧/未收到返回 None."""
     if _comm is None:
         return None
     return _comm.get_pose(max_age)
@@ -645,6 +673,15 @@ def run(timeout: float = 5.0) -> bool:
         raise RuntimeError("serial not initialized, call init() first")
     return _comm.run(timeout)
 
+def set_zero(timeout: float = 5.0) -> bool:
+    """转盘零点设置 (阻塞式): 将当前位置存为零点并写入 flash.
+
+    先手动把转盘转到 slot 0, 再调用本函数.
+    """
+    if _comm is None:
+        raise RuntimeError("serial not initialized, call init() first")
+    return _comm.set_zero(timeout)
+
 def turnto(yaw_deg: float, timeout: float = 20.0) -> bool:
     if _comm is None:
         raise RuntimeError("serial not initialized, call init() first")
@@ -721,6 +758,21 @@ def _self_check() -> None:
     assert abs(pose[0] - 0.5) < 1e-6 and abs(pose[1] + 0.25) < 1e-6
     assert abs(pose[2] - 90.0) < 0.01, f"theta 应转为 90°, got {pose[2]}"
     assert c.pose_age() < 0.5
+
+    # 4.5b POSE 角度归一: 下位机上报累加角 (540°/720°) 必须卷绕到 (-180,180]
+    for b in pack_frame(TYPE_POSE, struct.pack("<fff", 0.0, 0.0, math.radians(540.0))):
+        c._feed_byte(b)
+    pose = c.get_pose()
+    assert pose is not None
+    assert abs(abs(pose[2]) - 180.0) < 0.01, f"540° 应卷绕为 ±180°, got {pose[2]}"
+    for b in pack_frame(TYPE_POSE, struct.pack("<fff", 0.0, 0.0, math.radians(720.0))):
+        c._feed_byte(b)
+    pose = c.get_pose()
+    assert abs(pose[2] - 0.0) < 0.01, f"720° 应卷绕为 0°, got {pose[2]}"
+    for b in pack_frame(TYPE_POSE, struct.pack("<fff", 0.0, 0.0, math.radians(-450.0))):
+        c._feed_byte(b)
+    pose = c.get_pose()
+    assert abs(pose[2] - (-90.0)) < 0.01, f"-450° 应卷绕为 -90°, got {pose[2]}"
 
     # 5. wait_nav_response 语义: 只计调用之后到达的新响应
     def _later_feed():
