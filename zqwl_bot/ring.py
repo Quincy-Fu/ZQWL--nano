@@ -40,15 +40,18 @@ CONFIG = {
     # The detected contour must represent this exact physical circle.
     "inner_circle_diameter_mm": 50.0,
     "black_v_max": 100,
-    "search_radius_fraction": 0.47,
+    "search_radius_fraction": 1.0,
     "min_contour_area": 60.0,
-    "min_axis_px": 8.0,
+    "min_axis_px": 20.0,
     "max_axis_fraction": 0.90,
     "max_axis_ratio": 3.0,
-    "max_ellipse_error": 0.18,
-    "center_tolerance_px": 8.0,
-    "min_concentric_contours": 4,
+    "max_ellipse_error": 0.25,
+    "center_tolerance_px": 20.0,
+    "min_concentric_contours": 2,
     "max_stroke_pair_ratio": 1.20,
+    "morph_close_size": 3,
+    "min_arc_coverage": 0.22,
+    "single_candidate_min_coverage": 0.45,
 
     # A result is returned only after a stable sliding window is available.
     "stable_frames": 7,
@@ -73,6 +76,7 @@ class EllipseObservation:
     minor_axis_px: float
     major_angle_deg: float
     fit_error: float
+    support_ratio: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -179,6 +183,24 @@ def _ellipse_fit_error(contour, ellipse: EllipseObservation) -> float:
     return float(np.median(np.abs(radius - 1.0)))
 
 
+def _ellipse_arc_coverage(contour, ellipse: EllipseObservation) -> float:
+    """Fraction of ellipse angle bins supported by contour points."""
+    points = contour.reshape(-1, 2).astype(np.float64)
+    dx = points[:, 0] - ellipse.center_px[0]
+    dy = points[:, 1] - ellipse.center_px[1]
+    angle = math.radians(ellipse.major_angle_deg)
+    c, s = math.cos(angle), math.sin(angle)
+    along = c * dx + s * dy
+    across = -s * dx + c * dy
+    theta = np.arctan2(
+        across / max(ellipse.minor_axis_px * 0.5, 1e-6),
+        along / max(ellipse.major_axis_px * 0.5, 1e-6),
+    )
+    bins = np.floor(((theta + math.pi) / (2.0 * math.pi)) * 36).astype(np.int32)
+    bins = np.clip(bins, 0, 35)
+    return float(len(set(int(v) for v in bins)) / 36.0)
+
+
 def _black_mask(frame):
     height, width = frame.shape[:2]
     reference = (width * 0.5, height * 0.5)
@@ -193,7 +215,12 @@ def _black_mask(frame):
     roi = np.zeros((height, width), dtype=np.uint8)
     cv2.circle(roi, (round(reference[0]), round(reference[1])), search_radius, 255, -1)
     mask = cv2.bitwise_and(mask, roi)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    close_size = max(1, int(CONFIG["morph_close_size"]))
+    if close_size % 2 == 0:
+        close_size += 1
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, np.ones((close_size, close_size), np.uint8)
+    )
     return mask
 
 
@@ -220,6 +247,9 @@ def _ellipse_candidates(frame, mask=None) -> list[EllipseObservation]:
         error = _ellipse_fit_error(contour, ellipse)
         if error > CONFIG["max_ellipse_error"]:
             continue
+        support_ratio = _ellipse_arc_coverage(contour, ellipse)
+        if support_ratio < CONFIG["min_arc_coverage"]:
+            continue
         candidates.append(
             EllipseObservation(
                 center_px=ellipse.center_px,
@@ -227,9 +257,34 @@ def _ellipse_candidates(frame, mask=None) -> list[EllipseObservation]:
                 minor_axis_px=ellipse.minor_axis_px,
                 major_angle_deg=ellipse.major_angle_deg,
                 fit_error=error,
+                support_ratio=support_ratio,
             )
         )
     return candidates
+
+
+def _single_candidate_fallback(
+    candidates: list[EllipseObservation], reference_px: tuple[float, float]
+) -> tuple[EllipseObservation, tuple[float, float], int, float] | None:
+    min_support = max(
+        float(CONFIG["min_arc_coverage"]),
+        float(CONFIG["single_candidate_min_coverage"]),
+    )
+    eligible = [item for item in candidates if item.support_ratio >= min_support]
+    if not eligible:
+        return None
+    candidate = max(
+        eligible,
+        key=lambda item: (
+            item.major_axis_px + item.minor_axis_px,
+            item.support_ratio,
+            -math.dist(item.center_px, reference_px),
+            -item.fit_error,
+        ),
+    )
+    fit_score = max(0.0, 1.0 - candidate.fit_error / CONFIG["max_ellipse_error"])
+    confidence = min(1.0, candidate.support_ratio) * fit_score * 0.35
+    return candidate, candidate.center_px, 1, confidence
 
 
 def _select_concentric_group(
@@ -256,7 +311,7 @@ def _select_concentric_group(
         groups.append((group, center, mean_error))
 
     if not groups:
-        return None
+        return _single_candidate_fallback(candidates, reference_px)
 
     group, center, mean_error = min(
         groups,
@@ -292,7 +347,8 @@ def _select_concentric_group(
             )
     count_score = min(1.0, len(group) / (CONFIG["min_concentric_contours"] + 2.0))
     fit_score = max(0.0, 1.0 - mean_error / CONFIG["max_ellipse_error"])
-    return innermost, center, len(group), count_score * fit_score
+    support_score = statistics.fmean(item.support_ratio for item in group)
+    return innermost, center, len(group), count_score * fit_score * support_score
 
 
 def _ellipse_offset_to_mm(
@@ -328,10 +384,12 @@ def _apply_axis_transform(offset_mm: tuple[float, float]) -> tuple[float, float]
     return bx, by
 
 
-def _measure_frame_with_mask(frame, mask) -> RingOffset | None:
+def _measurement_from_candidates(
+    frame, candidates: list[EllipseObservation]
+) -> RingOffset | None:
     height, width = frame.shape[:2]
     reference = (width * 0.5, height * 0.5)
-    selected = _select_concentric_group(_ellipse_candidates(frame, mask), reference)
+    selected = _select_concentric_group(candidates, reference)
     if selected is None:
         return None
 
@@ -365,6 +423,10 @@ def _measure_frame_with_mask(frame, mask) -> RingOffset | None:
         deadband_mm=float(CONFIG["deadband_mm"]),
         max_correction_mm=float(CONFIG["max_correction_mm"]),
     )
+
+
+def _measure_frame_with_mask(frame, mask) -> RingOffset | None:
+    return _measurement_from_candidates(frame, _ellipse_candidates(frame, mask))
 
 
 def measure_frame(frame) -> RingOffset | None:
@@ -473,6 +535,7 @@ def _put_debug_text(image, text: str, origin: tuple[int, int], color) -> None:
 def _render_debug_frame(
     frame, mask, measurement: RingOffset | None, stable: RingOffset | None,
     buffered_samples: int, required_samples: int, fps: float,
+    candidates: list[EllipseObservation] | None = None,
 ):
     annotated = frame.copy()
     height, width = annotated.shape[:2]
@@ -481,6 +544,19 @@ def _render_debug_frame(
     cv2.drawMarker(
         annotated, reference, (255, 255, 0), cv2.MARKER_CROSS, 28, 2, cv2.LINE_AA
     )
+
+    for candidate in candidates or []:
+        candidate_center = (
+            round(candidate.center_px[0]), round(candidate.center_px[1])
+        )
+        candidate_axes = (
+            max(1, round(candidate.major_axis_px * 0.5)),
+            max(1, round(candidate.minor_axis_px * 0.5)),
+        )
+        cv2.ellipse(
+            annotated, candidate_center, candidate_axes,
+            candidate.major_angle_deg, 0, 360, (255, 120, 0), 1, cv2.LINE_AA,
+        )
 
     shown = stable or measurement
     if stable is not None:
@@ -508,7 +584,11 @@ def _render_debug_frame(
         )
         cv2.line(annotated, reference, center, status_color, 2, cv2.LINE_AA)
 
-    lines = [status, f"FPS {fps:.1f}"]
+    best_arc = max((item.support_ratio for item in candidates or []), default=0.0)
+    lines = [
+        status,
+        f"FPS {fps:.1f} candidates={len(candidates or [])} best_arc={best_arc:.2f}",
+    ]
     if shown is not None:
         lines.extend([
             f"pixel du={shown.pixel_offset_px[0]:+.1f} dv={shown.pixel_offset_px[1]:+.1f}",
@@ -527,6 +607,69 @@ def _render_debug_frame(
     return np.hstack((annotated, mask_view))
 
 
+def _create_debug_trackbars(window: str) -> None:
+    noop = lambda _value: None
+    cv2.createTrackbar("V Max", window, int(CONFIG["black_v_max"]), 255, noop)
+    cv2.createTrackbar("Close", window, int(CONFIG["morph_close_size"]), 15, noop)
+    cv2.createTrackbar("Min Axis", window, int(CONFIG["min_axis_px"]), 200, noop)
+    cv2.createTrackbar(
+        "Center Tol", window, int(CONFIG["center_tolerance_px"]), 100, noop
+    )
+    cv2.createTrackbar(
+        "Fit Err x100", window, round(CONFIG["max_ellipse_error"] * 100), 100, noop
+    )
+    cv2.createTrackbar(
+        "Min Contours", window, int(CONFIG["min_concentric_contours"]), 12, noop
+    )
+    cv2.createTrackbar(
+        "ROI Percent", window, round(CONFIG["search_radius_fraction"] * 100), 100, noop
+    )
+    cv2.createTrackbar(
+        "Min Arc %", window, round(CONFIG["min_arc_coverage"] * 100), 100, noop
+    )
+    cv2.createTrackbar(
+        "Single Arc %", window,
+        round(CONFIG["single_candidate_min_coverage"] * 100), 100, noop,
+    )
+
+
+def _read_debug_trackbars(window: str) -> None:
+    CONFIG["black_v_max"] = max(1, cv2.getTrackbarPos("V Max", window))
+    close_size = max(1, cv2.getTrackbarPos("Close", window))
+    if close_size % 2 == 0:
+        close_size += 1
+    CONFIG["morph_close_size"] = close_size
+    CONFIG["min_axis_px"] = max(1, cv2.getTrackbarPos("Min Axis", window))
+    CONFIG["center_tolerance_px"] = max(
+        1, cv2.getTrackbarPos("Center Tol", window)
+    )
+    CONFIG["max_ellipse_error"] = max(
+        0.01, cv2.getTrackbarPos("Fit Err x100", window) / 100.0
+    )
+    CONFIG["min_concentric_contours"] = max(
+        1, cv2.getTrackbarPos("Min Contours", window)
+    )
+    CONFIG["search_radius_fraction"] = max(
+        0.10, cv2.getTrackbarPos("ROI Percent", window) / 100.0
+    )
+    CONFIG["min_arc_coverage"] = max(
+        0.05, cv2.getTrackbarPos("Min Arc %", window) / 100.0
+    )
+    CONFIG["single_candidate_min_coverage"] = max(
+        0.05, cv2.getTrackbarPos("Single Arc %", window) / 100.0
+    )
+
+
+def _debug_tuning_values() -> dict:
+    keys = (
+        "black_v_max", "morph_close_size", "min_axis_px",
+        "center_tolerance_px", "max_ellipse_error",
+        "min_concentric_contours", "search_radius_fraction",
+        "min_arc_coverage", "single_candidate_min_coverage",
+    )
+    return {key: CONFIG[key] for key in keys}
+
+
 def debug_view() -> None:
     """Show live detection and threshold views until q/Esc or window close."""
     _require_vision_dependencies()
@@ -537,17 +680,20 @@ def debug_view() -> None:
     fps = 0.0
     previous_tick = time.monotonic()
 
-    print("Ring debug controls: q/Esc=quit, p=print measurement, r=reset stability")
+    print("Ring debug controls: q/Esc=quit, p=print values, r=reset stability")
     try:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        _create_debug_trackbars(window)
         while True:
+            _read_debug_trackbars(window)
             ok, frame = cap.read()
             if not ok:
                 time.sleep(float(CONFIG["frame_interval_s"]))
                 continue
 
             mask = _black_mask(frame)
-            measurement = _measure_frame_with_mask(frame, mask)
+            candidates = _ellipse_candidates(frame, mask)
+            measurement = _measurement_from_candidates(frame, candidates)
             if measurement is None:
                 recent.clear()
             else:
@@ -563,13 +709,15 @@ def debug_view() -> None:
             previous_tick = now
 
             view = _render_debug_frame(
-                frame, mask, measurement, stable, len(recent), required, fps
+                frame, mask, measurement, stable, len(recent), required, fps,
+                candidates,
             )
             cv2.imshow(window, view)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
             if key == ord("p"):
+                print("Ring tuning:", _debug_tuning_values())
                 print(stable or measurement or "Ring: no measurement")
             elif key == ord("r"):
                 recent.clear()

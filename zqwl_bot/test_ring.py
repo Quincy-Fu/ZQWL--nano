@@ -124,6 +124,19 @@ class RingGeometryTests(unittest.TestCase):
             (innermost.major_axis_px, innermost.minor_axis_px), (100.0, 80.0)
         )
 
+    def test_single_arc_fallback_prefers_large_ring_over_inner_text(self):
+        candidates = [
+            ring.EllipseObservation((320.0, 240.0), 60.0, 40.0, 0.0, 0.01, 1.0),
+            ring.EllipseObservation((350.0, 220.0), 140.0, 80.0, 25.0, 0.02, 0.55),
+        ]
+        selected = ring._select_concentric_group(candidates, (320.0, 240.0))
+        self.assertIsNotNone(selected)
+        innermost, center, count, confidence = selected
+        self.assertEqual(innermost.major_axis_px, 140.0)
+        self.assertEqual(center, (350.0, 220.0))
+        self.assertEqual(count, 1)
+        self.assertLess(confidence, 0.35)
+
     @unittest.skipIf(ring.cv2 is None or ring.np is None, "OpenCV is unavailable")
     def test_synthetic_outlined_ellipse_is_detected_at_centerline_scale(self):
         image = ring.np.full((480, 640, 3), 255, ring.np.uint8)
@@ -141,9 +154,30 @@ class RingGeometryTests(unittest.TestCase):
 
         mask = ring._black_mask(image)
         rendered = ring._render_debug_frame(
-            image, mask, result, result, 7, 7, 30.0
+            image, mask, result, result, 7, 7, 30.0,
+            ring._ellipse_candidates(image, mask),
         )
         self.assertEqual(rendered.shape, (480, 1280, 3))
+
+    @unittest.skipIf(ring.cv2 is None or ring.np is None, "OpenCV is unavailable")
+    def test_partial_arc_is_completed_when_enough_ring_is_visible(self):
+        image = ring.np.full((480, 640, 3), 255, ring.np.uint8)
+        ring.cv2.ellipse(image, (350, 220), (70, 40), 25, 200, 360, (0, 0, 0), 3)
+
+        result = ring.measure_frame(image)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.concentric_contours, 1)
+        self.assertAlmostEqual(result.center_px[0], 350.0, delta=2.0)
+        self.assertAlmostEqual(result.center_px[1], 220.0, delta=2.0)
+        self.assertAlmostEqual(result.inner_axes_px[0], 140.0, delta=3.0)
+        self.assertAlmostEqual(result.inner_axes_px[1], 80.0, delta=4.0)
+
+    @unittest.skipIf(ring.cv2 is None or ring.np is None, "OpenCV is unavailable")
+    def test_short_arc_is_rejected_as_underconstrained(self):
+        image = ring.np.full((480, 640, 3), 255, ring.np.uint8)
+        ring.cv2.ellipse(image, (350, 220), (70, 40), 25, 200, 290, (0, 0, 0), 3)
+
+        self.assertIsNone(ring.measure_frame(image))
 
 
 if __name__ == "__main__":
