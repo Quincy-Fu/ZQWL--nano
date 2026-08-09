@@ -14,7 +14,8 @@ from collections import Counter
 
 
 CONFIG = {
-    "usb_device": 1,
+    # The USB camera can enumerate as /dev/video0 or /dev/video1.
+    "usb_devices": (0, 1),
     "width": 640,
     "height": 480,
     "fps": 30,
@@ -44,21 +45,30 @@ DEFAULT_HSV = {
 # ============== 摄像头 ==============
 class USBCamera:
     def __init__(self, device=0, width=640, height=480, fps=30):
-        self.device = device
+        if isinstance(device, (tuple, list)):
+            self.devices = tuple(dict.fromkeys(int(item) for item in device))
+        else:
+            self.devices = (int(device),)
         self.width = width
         self.height = height
         self.fps = fps
         self.cap = None
 
     def start(self):
-        self.cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Block: USB 摄像头 (device {self.device}) 打开失败")
+        for device in self.devices:
+            cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            cap.set(cv2.CAP_PROP_FPS, self.fps)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if cap.isOpened():
+                self.cap = cap
+                self.device = device
+                return
+            cap.release()
+        attempted = ", ".join(str(device) for device in self.devices)
+        raise RuntimeError(f"Block: USB 摄像头打开失败 (tried devices {attempted})")
 
     def read(self):
         if self.cap is None:
@@ -187,7 +197,7 @@ def recognize(frames: int = 3, timeout: float = 5.0) -> str:
     frames=3, timeout=5.0: 3 帧 5 秒众数 (静止用)
     """
     thresholds = _get_thresholds()
-    cap = USBCamera(CONFIG["usb_device"], CONFIG["width"],
+    cap = USBCamera(CONFIG["usb_devices"], CONFIG["width"],
                     CONFIG["height"], CONFIG["fps"])
     cap.start()
     try:

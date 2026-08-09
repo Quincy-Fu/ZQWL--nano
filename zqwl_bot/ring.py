@@ -32,18 +32,22 @@ except ImportError:  # Pure geometry helpers remain testable without OpenCV.
 
 
 CONFIG = {
-    "usb_device": 0,
+    # USB enumeration may change between boots when the CSI camera is present.
+    # Try both device indices in priority order.
+    "usb_devices": (0, 1),
     "width": 640,
     "height": 480,
     "fps": 30,
 
-    # The detected contour must represent this exact physical circle.
+    # Known printed ring diameters, ordered from inner to outer.
     "inner_circle_diameter_mm": 50.0,
+    "ring_diameters_mm": (50.0, 90.0, 130.0, 170.0, 210.0),
+    "max_diameter_match_error": 0.12,
     "black_v_max": 100,
     "search_radius_fraction": 1.0,
     "min_contour_area": 60.0,
     "min_axis_px": 20.0,
-    "max_axis_fraction": 0.90,
+    "max_axis_fraction": 2.20,
     "max_axis_ratio": 3.0,
     "max_ellipse_error": 0.25,
     "center_tolerance_px": 20.0,
@@ -52,6 +56,8 @@ CONFIG = {
     "morph_close_size": 3,
     "min_arc_coverage": 0.22,
     "single_candidate_min_coverage": 0.45,
+    "single_arc_max_coverage": 0.85,
+    "single_arc_min_axis_fraction": 0.25,
 
     # A result is returned only after a stable sliding window is available.
     "stable_frames": 7,
@@ -80,6 +86,16 @@ class EllipseObservation:
 
 
 @dataclass(frozen=True)
+class RingSelection:
+    ellipse: EllipseObservation
+    center_px: tuple[float, float]
+    contour_count: int
+    confidence: float
+    diameter_mm: float
+    diameter_index: int
+
+
+@dataclass(frozen=True)
 class RingOffset:
     center_px: tuple[float, float]
     reference_px: tuple[float, float]
@@ -95,6 +111,8 @@ class RingOffset:
     direction_calibrated: bool
     deadband_mm: float
     max_correction_mm: float
+    selected_diameter_mm: float = 50.0
+    selected_ring_index: int = 0
 
     @property
     def aligned(self) -> bool:
@@ -135,19 +153,33 @@ def _require_vision_dependencies() -> None:
         raise RuntimeError("Ring: OpenCV and NumPy are required for camera detection")
 
 
+def _configured_ring_diameters_mm() -> tuple[float, ...]:
+    raw = CONFIG.get("ring_diameters_mm") or (CONFIG["inner_circle_diameter_mm"],)
+    diameters = tuple(float(value) for value in raw)
+    if not diameters or any(value <= 0 or not math.isfinite(value) for value in diameters):
+        raise ValueError("CONFIG['ring_diameters_mm'] must contain positive numbers")
+    return tuple(sorted(diameters))
+
+
 def _open_usb():
     _require_vision_dependencies()
-    cap = cv2.VideoCapture(CONFIG["usb_device"], cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CONFIG["width"])
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CONFIG["height"])
-    cap.set(cv2.CAP_PROP_FPS, CONFIG["fps"])
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    if not cap.isOpened():
-        raise RuntimeError(
-            f"Ring: USB camera (device {CONFIG['usb_device']}) open failed"
-        )
-    return cap
+    devices = tuple(dict.fromkeys(int(item) for item in CONFIG["usb_devices"]))
+    if not devices:
+        raise ValueError("CONFIG['usb_devices'] must contain at least one device index")
+
+    for device in devices:
+        cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CONFIG["width"])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CONFIG["height"])
+        cap.set(cv2.CAP_PROP_FPS, CONFIG["fps"])
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if cap.isOpened():
+            return cap
+        cap.release()
+
+    attempted = ", ".join(str(device) for device in devices)
+    raise RuntimeError(f"Ring: USB camera open failed (tried devices {attempted})")
 
 
 def _normalise_ellipse(raw_ellipse) -> EllipseObservation:
@@ -264,13 +296,22 @@ def _ellipse_candidates(frame, mask=None) -> list[EllipseObservation]:
 
 
 def _single_candidate_fallback(
-    candidates: list[EllipseObservation], reference_px: tuple[float, float]
-) -> tuple[EllipseObservation, tuple[float, float], int, float] | None:
+    candidates: list[EllipseObservation], reference_px: tuple[float, float],
+    frame_shape: tuple[int, int] | None = None,
+) -> RingSelection | None:
     min_support = max(
         float(CONFIG["min_arc_coverage"]),
         float(CONFIG["single_candidate_min_coverage"]),
     )
-    eligible = [item for item in candidates if item.support_ratio >= min_support]
+    max_support = float(CONFIG["single_arc_max_coverage"])
+    eligible = [
+        item for item in candidates
+        if min_support <= item.support_ratio <= max_support
+    ]
+    if frame_shape is not None:
+        height, width = frame_shape[:2]
+        min_axis = min(height, width) * float(CONFIG["single_arc_min_axis_fraction"])
+        eligible = [item for item in eligible if item.major_axis_px >= min_axis]
     if not eligible:
         return None
     candidate = max(
@@ -284,12 +325,128 @@ def _single_candidate_fallback(
     )
     fit_score = max(0.0, 1.0 - candidate.fit_error / CONFIG["max_ellipse_error"])
     confidence = min(1.0, candidate.support_ratio) * fit_score * 0.35
-    return candidate, candidate.center_px, 1, confidence
+    diameters = _configured_ring_diameters_mm()
+    diameter_index = len(diameters) - 1
+    return RingSelection(
+        ellipse=candidate,
+        center_px=candidate.center_px,
+        contour_count=1,
+        confidence=confidence,
+        diameter_mm=diameters[diameter_index],
+        diameter_index=diameter_index,
+    )
+
+
+def _stroke_centerline_rings(
+    ordered: list[EllipseObservation],
+) -> list[EllipseObservation]:
+    rings = []
+    index = 0
+    pair_limit = float(CONFIG["max_stroke_pair_ratio"])
+    while index < len(ordered):
+        current = ordered[index]
+        if index + 1 < len(ordered):
+            next_edge = ordered[index + 1]
+            is_stroke_pair = (
+                next_edge.major_axis_px / current.major_axis_px <= pair_limit
+                and next_edge.minor_axis_px / current.minor_axis_px <= pair_limit
+            )
+            if is_stroke_pair:
+                rings.append(
+                    EllipseObservation(
+                        center_px=(
+                            (current.center_px[0] + next_edge.center_px[0]) * 0.5,
+                            (current.center_px[1] + next_edge.center_px[1]) * 0.5,
+                        ),
+                        major_axis_px=(
+                            current.major_axis_px + next_edge.major_axis_px
+                        ) * 0.5,
+                        minor_axis_px=(
+                            current.minor_axis_px + next_edge.minor_axis_px
+                        ) * 0.5,
+                        major_angle_deg=_mean_axis_angle_deg(
+                            [current.major_angle_deg, next_edge.major_angle_deg]
+                        ),
+                        fit_error=(current.fit_error + next_edge.fit_error) * 0.5,
+                        support_ratio=max(
+                            current.support_ratio, next_edge.support_ratio
+                        ),
+                    )
+                )
+                index += 2
+                continue
+        rings.append(current)
+        index += 1
+    return rings
+
+
+def _ring_model_match(
+    rings: list[EllipseObservation],
+    frame_shape: tuple[int, int] | None = None,
+) -> tuple[EllipseObservation, float, int, float] | None:
+    if not rings:
+        return None
+
+    diameters = _configured_ring_diameters_mm()
+    max_single_support = float(CONFIG["single_arc_max_coverage"])
+    arc_like = [item for item in rings if item.support_ratio <= max_single_support]
+    if len(rings) == 1:
+        if not arc_like:
+            return None
+        if frame_shape is not None:
+            height, width = frame_shape[:2]
+            min_axis = min(height, width) * float(CONFIG["single_arc_min_axis_fraction"])
+            if rings[0].major_axis_px < min_axis:
+                return None
+        diameter_index = len(diameters) - 1
+        return rings[0], diameters[diameter_index], diameter_index, 1.0
+    if len(diameters) == 1:
+        if arc_like:
+            selected = max(arc_like, key=lambda item: item.major_axis_px + item.minor_axis_px)
+            return selected, diameters[0], 0, 0.60
+        return rings[0], diameters[0], 0, 1.0
+
+    sizes = [(item.major_axis_px + item.minor_axis_px) * 0.5 for item in rings]
+    best = None
+    limit = min(len(rings), len(diameters))
+    for count in range(2, limit + 1):
+        for ring_start in range(0, len(rings) - count + 1):
+            pixel_subset = sizes[ring_start:ring_start + count]
+            for diameter_start in range(0, len(diameters) - count + 1):
+                diameter_subset = diameters[diameter_start:diameter_start + count]
+                errors = []
+                for offset in range(1, count):
+                    pixel_ratio = pixel_subset[offset] / pixel_subset[0]
+                    diameter_ratio = diameter_subset[offset] / diameter_subset[0]
+                    errors.append(abs(pixel_ratio - diameter_ratio) / diameter_ratio)
+                match_error = max(errors)
+                score = (count, -match_error, ring_start, diameter_start)
+                if best is None or score > best[0]:
+                    best = (score, match_error, ring_start, diameter_start, count)
+
+    if best is None:
+        return rings[0], diameters[0], 0, 0.5
+
+    _score, match_error, ring_start, diameter_start, count = best
+    if match_error > CONFIG["max_diameter_match_error"]:
+        if arc_like and len(arc_like) < len(rings):
+            selected = max(
+                arc_like, key=lambda item: item.major_axis_px + item.minor_axis_px
+            )
+            return selected, diameters[0], 0, 0.35
+        return rings[0], diameters[0], 0, 0.5
+
+    selected_offset = count - 1
+    selected_ring = rings[ring_start + selected_offset]
+    selected_index = diameter_start + selected_offset
+    match_score = max(0.0, 1.0 - match_error / CONFIG["max_diameter_match_error"])
+    return selected_ring, diameters[selected_index], selected_index, match_score
 
 
 def _select_concentric_group(
-    candidates: list[EllipseObservation], reference_px: tuple[float, float]
-) -> tuple[EllipseObservation, tuple[float, float], int, float] | None:
+    candidates: list[EllipseObservation], reference_px: tuple[float, float],
+    frame_shape: tuple[int, int] | None = None,
+) -> RingSelection | None:
     if not candidates:
         return None
 
@@ -311,7 +468,7 @@ def _select_concentric_group(
         groups.append((group, center, mean_error))
 
     if not groups:
-        return _single_candidate_fallback(candidates, reference_px)
+        return _single_candidate_fallback(candidates, reference_px, frame_shape)
 
     group, center, mean_error = min(
         groups,
@@ -322,33 +479,21 @@ def _select_concentric_group(
         ),
     )
     ordered = sorted(group, key=lambda item: item.major_axis_px + item.minor_axis_px)
-    innermost = ordered[0]
-    if len(ordered) > 1:
-        next_edge = ordered[1]
-        pair_limit = float(CONFIG["max_stroke_pair_ratio"])
-        is_stroke_pair = (
-            next_edge.major_axis_px / innermost.major_axis_px <= pair_limit
-            and next_edge.minor_axis_px / innermost.minor_axis_px <= pair_limit
-        )
-        if is_stroke_pair:
-            # An outlined circle produces an inner and outer contour. Their
-            # mean is the printed centre-line diameter specified as 50 mm.
-            innermost = EllipseObservation(
-                center_px=(
-                    (innermost.center_px[0] + next_edge.center_px[0]) * 0.5,
-                    (innermost.center_px[1] + next_edge.center_px[1]) * 0.5,
-                ),
-                major_axis_px=(innermost.major_axis_px + next_edge.major_axis_px) * 0.5,
-                minor_axis_px=(innermost.minor_axis_px + next_edge.minor_axis_px) * 0.5,
-                major_angle_deg=_mean_axis_angle_deg(
-                    [innermost.major_angle_deg, next_edge.major_angle_deg]
-                ),
-                fit_error=(innermost.fit_error + next_edge.fit_error) * 0.5,
-            )
+    model_match = _ring_model_match(_stroke_centerline_rings(ordered), frame_shape)
+    if model_match is None:
+        return None
+    selected_ring, diameter_mm, diameter_index, match_score = model_match
     count_score = min(1.0, len(group) / (CONFIG["min_concentric_contours"] + 2.0))
     fit_score = max(0.0, 1.0 - mean_error / CONFIG["max_ellipse_error"])
     support_score = statistics.fmean(item.support_ratio for item in group)
-    return innermost, center, len(group), count_score * fit_score * support_score
+    return RingSelection(
+        ellipse=selected_ring,
+        center_px=center,
+        contour_count=len(group),
+        confidence=count_score * fit_score * support_score * match_score,
+        diameter_mm=diameter_mm,
+        diameter_index=diameter_index,
+    )
 
 
 def _ellipse_offset_to_mm(
@@ -389,13 +534,14 @@ def _measurement_from_candidates(
 ) -> RingOffset | None:
     height, width = frame.shape[:2]
     reference = (width * 0.5, height * 0.5)
-    selected = _select_concentric_group(candidates, reference)
+    selected = _select_concentric_group(candidates, reference, frame.shape[:2])
     if selected is None:
         return None
 
-    ellipse, center, contour_count, confidence = selected
+    ellipse = selected.ellipse
+    center = selected.center_px
     pixel_offset = (center[0] - reference[0], center[1] - reference[1])
-    diameter = float(CONFIG["inner_circle_diameter_mm"])
+    diameter = selected.diameter_mm
     image_offset = _ellipse_offset_to_mm(
         pixel_offset,
         ellipse.major_axis_px,
@@ -416,12 +562,14 @@ def _measurement_from_candidates(
             diameter / ellipse.major_axis_px,
             diameter / ellipse.minor_axis_px,
         ),
-        concentric_contours=contour_count,
-        confidence=confidence,
+        concentric_contours=selected.contour_count,
+        confidence=selected.confidence,
         samples=1,
         direction_calibrated=bool(CONFIG["direction_calibrated"]),
         deadband_mm=float(CONFIG["deadband_mm"]),
         max_correction_mm=float(CONFIG["max_correction_mm"]),
+        selected_diameter_mm=diameter,
+        selected_ring_index=selected.diameter_index,
     )
 
 
@@ -485,6 +633,12 @@ def _aggregate_measurements(items: list[RingOffset]) -> RingOffset | None:
         direction_calibrated=all(item.direction_calibrated for item in items),
         deadband_mm=float(CONFIG["deadband_mm"]),
         max_correction_mm=float(CONFIG["max_correction_mm"]),
+        selected_diameter_mm=statistics.median(
+            item.selected_diameter_mm for item in items
+        ),
+        selected_ring_index=round(
+            statistics.median(item.selected_ring_index for item in items)
+        ),
     )
 
 
@@ -592,7 +746,8 @@ def _render_debug_frame(
     if shown is not None:
         lines.extend([
             f"pixel du={shown.pixel_offset_px[0]:+.1f} dv={shown.pixel_offset_px[1]:+.1f}",
-            f"inner axes={shown.inner_axes_px[0]:.1f} x {shown.inner_axes_px[1]:.1f} px",
+            f"ring axes={shown.inner_axes_px[0]:.1f} x {shown.inner_axes_px[1]:.1f} px",
+            f"ring idx={shown.selected_ring_index} dia={shown.selected_diameter_mm:.1f} mm",
             f"scale={shown.scale_mm_per_px[0]:.4f}, {shown.scale_mm_per_px[1]:.4f} mm/px",
             f"image mm={shown.image_offset_mm[0]:+.1f}, {shown.image_offset_mm[1]:+.1f}",
             f"body mm={shown.body_offset_mm[0]:+.1f}, {shown.body_offset_mm[1]:+.1f}",
@@ -666,6 +821,9 @@ def _debug_tuning_values() -> dict:
         "center_tolerance_px", "max_ellipse_error",
         "min_concentric_contours", "search_radius_fraction",
         "min_arc_coverage", "single_candidate_min_coverage",
+        "ring_diameters_mm",
+        "max_diameter_match_error", "single_arc_max_coverage",
+        "single_arc_min_axis_fraction",
     )
     return {key: CONFIG[key] for key in keys}
 

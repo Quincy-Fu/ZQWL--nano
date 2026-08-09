@@ -10,6 +10,7 @@ QR1 - 左侧二维码识别
 import os
 import time
 import logging
+import threading
 import cv2
 import numpy as np
 
@@ -144,9 +145,24 @@ class CSICamera:
         finally:
             buf.unmap(info)
 
-    def stop(self):
-        if self.pipe:
-            self.pipe.set_state(Gst.State.NULL)
+    def stop(self, async_stop: bool = False):
+        pipe = self.pipe
+        self.pipe = None
+        self.sink = None
+        if not pipe:
+            return
+
+        def _stop_pipe():
+            t0 = time.monotonic()
+            pipe.set_state(Gst.State.NULL)
+            dt = time.monotonic() - t0
+            log.info("[QR1 timing] CSI stop %.3fs", dt)
+            print(f"[QR1 timing] CSI stop {dt:.3f}s", flush=True)
+
+        if async_stop:
+            threading.Thread(target=_stop_pipe, name="qr1-csi-stop", daemon=True).start()
+        else:
+            _stop_pipe()
 
 
 def _is_valid(data: str) -> bool:
@@ -176,6 +192,7 @@ def recognize(timeout: float = 3.0) -> str:
     返回: "1" 到 "16" 字符串
     """
     cam = CSICamera()
+    t_start = time.monotonic()
     cam.start()
     detector = QRDetector(MODEL_DIR)
     log.info("[QR1] 开补光灯 3")
@@ -194,6 +211,9 @@ def recognize(timeout: float = 3.0) -> str:
                 log.info(f"  [QR1] 扫到: '{data}' (尝试 {attempts} 次)")
                 if _is_valid(data):
                     log.info(f"  [QR1] 确认: {data} -> {TASK1_PLANS[data]}")
+                    dt = time.monotonic() - t_start
+                    log.info("[QR1 timing] detected in %.3fs", dt)
+                    print(f"[QR1 timing] detected in {dt:.3f}s", flush=True)
                     return data
                 else:
                     log.info(f"  [QR1] '{data}' 不在 1-16 范围, 跳过")
@@ -203,8 +223,15 @@ def recognize(timeout: float = 3.0) -> str:
             time.sleep(0.05)
         raise RuntimeError(f"QR1: {timeout}s 内未识别到合法二维码 (1-16)")
     finally:
+        t_cleanup = time.monotonic()
         _set_light(3, False)
-        cam.stop()
+        dt_light = time.monotonic() - t_cleanup
+        log.info("[QR1 timing] light off %.3fs", dt_light)
+        print(f"[QR1 timing] light off {dt_light:.3f}s", flush=True)
+        cam.stop(async_stop=True)
+        dt_cleanup = time.monotonic() - t_cleanup
+        log.info("[QR1 timing] return after cleanup %.3fs", dt_cleanup)
+        print(f"[QR1 timing] return after cleanup {dt_cleanup:.3f}s", flush=True)
 
 
 def recognize_color_order(timeout: float = 3.0) -> list:

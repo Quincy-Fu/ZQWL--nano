@@ -2,6 +2,7 @@
 
 import math
 import unittest
+from unittest import mock
 
 import ring
 
@@ -38,6 +39,40 @@ class RingGeometryTests(unittest.TestCase):
     def assertPairAlmostEqual(self, actual, expected):
         self.assertAlmostEqual(actual[0], expected[0], places=6)
         self.assertAlmostEqual(actual[1], expected[1], places=6)
+
+    def test_configured_ring_diameters_match_printed_target(self):
+        self.assertEqual(
+            ring._configured_ring_diameters_mm(),
+            (50.0, 90.0, 130.0, 170.0, 210.0),
+        )
+
+    def test_usb_camera_falls_back_from_device_zero_to_one(self):
+        failed = mock.Mock()
+        failed.isOpened.return_value = False
+        opened = mock.Mock()
+        opened.isOpened.return_value = True
+        ring.CONFIG["usb_devices"] = (0, 1)
+        fake_cv2 = mock.Mock()
+        fake_cv2.CAP_V4L2 = 200
+        fake_cv2.CAP_PROP_FOURCC = 6
+        fake_cv2.CAP_PROP_FRAME_WIDTH = 3
+        fake_cv2.CAP_PROP_FRAME_HEIGHT = 4
+        fake_cv2.CAP_PROP_FPS = 5
+        fake_cv2.CAP_PROP_BUFFERSIZE = 38
+        fake_cv2.VideoCapture.side_effect = [failed, opened]
+
+        with (
+            mock.patch.object(ring, "cv2", fake_cv2),
+            mock.patch.object(ring, "np", mock.Mock()),
+        ):
+            result = ring._open_usb()
+
+        self.assertIs(result, opened)
+        self.assertEqual(
+            [call.args[0] for call in fake_cv2.VideoCapture.call_args_list],
+            [0, 1],
+        )
+        failed.release.assert_called_once_with()
 
     def test_circle_uses_dynamic_50_mm_scale(self):
         offset = ring._ellipse_offset_to_mm((20.0, -10.0), 100.0, 100.0, 0.0, 50.0)
@@ -106,12 +141,12 @@ class RingGeometryTests(unittest.TestCase):
         ]
         selected = ring._select_concentric_group(candidates, (320.0, 240.0))
         self.assertIsNotNone(selected)
-        innermost, center, count, _confidence = selected
-        self.assertEqual(innermost.major_axis_px, 40.0)
-        self.assertEqual(center, (321.0, 239.0))
-        self.assertEqual(count, 4)
+        self.assertEqual(selected.ellipse.major_axis_px, 40.0)
+        self.assertEqual(selected.center_px, (321.0, 239.0))
+        self.assertEqual(selected.contour_count, 4)
 
     def test_outlined_inner_circle_uses_mean_of_both_stroke_edges(self):
+        ring.CONFIG["ring_diameters_mm"] = (50.0,)
         candidates = [
             ring.EllipseObservation((320.0, 240.0), 96.0, 76.0, 20.0, 0.01),
             ring.EllipseObservation((320.0, 240.0), 104.0, 84.0, 20.0, 0.01),
@@ -119,23 +154,67 @@ class RingGeometryTests(unittest.TestCase):
             ring.EllipseObservation((320.0, 240.0), 190.0, 152.0, 20.0, 0.01),
         ]
         selected = ring._select_concentric_group(candidates, (320.0, 240.0))
-        innermost = selected[0]
         self.assertPairAlmostEqual(
-            (innermost.major_axis_px, innermost.minor_axis_px), (100.0, 80.0)
+            (selected.ellipse.major_axis_px, selected.ellipse.minor_axis_px),
+            (100.0, 80.0),
         )
 
-    def test_single_arc_fallback_prefers_large_ring_over_inner_text(self):
+    def test_printed_diameter_model_selects_outer_ring(self):
+        candidates = [
+            ring.EllipseObservation(
+                (320.0, 240.0), diameter * 2.0, diameter * 1.6, 20.0, 0.01
+            )
+            for diameter in (50.0, 90.0, 130.0, 170.0, 210.0)
+        ]
+        selected = ring._select_concentric_group(candidates, (320.0, 240.0))
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.diameter_mm, 210.0)
+        self.assertEqual(selected.diameter_index, 4)
+        self.assertEqual(selected.ellipse.major_axis_px, 420.0)
+
+    def test_diameter_model_rejects_inner_text_candidate(self):
+        ring.CONFIG["ring_diameters_mm"] = (50.0, 100.0)
+        candidates = [
+            ring.EllipseObservation((320.0, 240.0), 40.0, 32.0, 0.0, 0.01, 1.0),
+            ring.EllipseObservation((320.0, 240.0), 100.0, 80.0, 0.0, 0.01, 1.0),
+            ring.EllipseObservation((320.0, 240.0), 200.0, 160.0, 0.0, 0.01, 1.0),
+        ]
+        selected = ring._select_concentric_group(candidates, (320.0, 240.0))
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.ellipse.major_axis_px, 200.0)
+        self.assertEqual(selected.diameter_mm, 100.0)
+        self.assertEqual(selected.diameter_index, 1)
+
+    def test_single_arc_fallback_uses_outermost_diameter(self):
+        ring.CONFIG["ring_diameters_mm"] = (50.0, 100.0, 150.0)
         candidates = [
             ring.EllipseObservation((320.0, 240.0), 60.0, 40.0, 0.0, 0.01, 1.0),
             ring.EllipseObservation((350.0, 220.0), 140.0, 80.0, 25.0, 0.02, 0.55),
         ]
         selected = ring._select_concentric_group(candidates, (320.0, 240.0))
         self.assertIsNotNone(selected)
-        innermost, center, count, confidence = selected
-        self.assertEqual(innermost.major_axis_px, 140.0)
-        self.assertEqual(center, (350.0, 220.0))
-        self.assertEqual(count, 1)
-        self.assertLess(confidence, 0.35)
+        self.assertEqual(selected.ellipse.major_axis_px, 140.0)
+        self.assertEqual(selected.center_px, (350.0, 220.0))
+        self.assertEqual(selected.contour_count, 1)
+        self.assertEqual(selected.diameter_mm, 150.0)
+        self.assertLess(selected.confidence, 0.35)
+
+    def test_single_complete_candidate_is_rejected_as_text_like(self):
+        ring.CONFIG["ring_diameters_mm"] = (50.0, 100.0, 150.0)
+        self.assertIsNone(ring._ring_model_match([
+            ring.EllipseObservation((320.0, 240.0), 200.0, 160.0, 0.0, 0.01, 1.0),
+        ]))
+
+    @unittest.skipIf(ring.cv2 is None or ring.np is None, "OpenCV is unavailable")
+    def test_complete_inner_text_does_not_override_partial_ring(self):
+        image = ring.np.full((480, 640, 3), 255, ring.np.uint8)
+        ring.cv2.ellipse(image, (320, 240), (45, 65), 0, 0, 360, (0, 0, 0), 6)
+        ring.cv2.ellipse(image, (320, 240), (140, 140), 0, 205, 295, (0, 0, 0), 3)
+
+        result = ring.measure_frame(image)
+        self.assertIsNotNone(result)
+        self.assertGreater(result.inner_axes_px[0], 240.0)
+        self.assertLess(result.confidence, 0.35)
 
     @unittest.skipIf(ring.cv2 is None or ring.np is None, "OpenCV is unavailable")
     def test_synthetic_outlined_ellipse_is_detected_at_centerline_scale(self):

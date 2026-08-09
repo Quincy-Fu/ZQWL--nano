@@ -5,7 +5,16 @@ import time
 
 if __name__ == "__main__":
     detect_cameras()
-    cap = cv2.VideoCapture(1,cv2.CAP_V4L2)
+    cap = None
+    for device in (0, 1):
+        candidate = cv2.VideoCapture(device, cv2.CAP_V4L2)
+        if candidate.isOpened():
+            cap = candidate
+            print(f"USB camera opened at device {device}")
+            break
+        candidate.release()
+    if cap is None:
+        raise RuntimeError("USB camera open failed (tried devices 0, 1)")
 
     fourcc = cv2.VideoWriter_fourcc(*'MJPG')
     cap.set(cv2.CAP_PROP_FOURCC, fourcc)

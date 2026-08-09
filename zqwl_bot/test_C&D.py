@@ -51,6 +51,14 @@ def _update_cur(x, y):
     _CUR_X, _CUR_Y = x, y
 
 
+def _timed(label, func, *args, **kwargs):
+    t0 = time.monotonic()
+    print(f"[TIMING] {label} start", flush=True)
+    result = func(*args, **kwargs)
+    print(f"[TIMING] {label} done {time.monotonic() - t0:.3f}s -> {result}", flush=True)
+    return result
+
+
 def go_to(x, y, x_first=False):
     """走到 (x,y)。若两轴差距都大于 SPLIT_THRESHOLD，则拆成两段直走。
     x_first=False: 先 Y 后 X (默认); x_first=True: 先 X 后 Y。
@@ -63,19 +71,19 @@ def go_to(x, y, x_first=False):
         if x_first:
             # 先 X 后 Y
             print(f"    -> 拆段: ({x:.4f}, {_CUR_Y:.4f}) -> ({x:.4f}, {y:.4f})")
-            ok = comm.goto(x, _CUR_Y, timeout=40.0)
+            ok = _timed(f"GOTO segment 1 ({x:.4f}, {_CUR_Y:.4f})", comm.goto, x, _CUR_Y, timeout=40.0)
             if not ok:
                 return ok
-            ok = comm.goto(x, y, timeout=40.0)
+            ok = _timed(f"GOTO segment 2 ({x:.4f}, {y:.4f})", comm.goto, x, y, timeout=40.0)
         else:
             # 先 Y 后 X
             print(f"    -> 拆段: ({_CUR_X:.4f}, {y:.4f}) -> ({x:.4f}, {y:.4f})")
-            ok = comm.goto(_CUR_X, y, timeout=40.0)
+            ok = _timed(f"GOTO segment 1 ({_CUR_X:.4f}, {y:.4f})", comm.goto, _CUR_X, y, timeout=40.0)
             if not ok:
                 return ok
-            ok = comm.goto(x, y, timeout=40.0)
+            ok = _timed(f"GOTO segment 2 ({x:.4f}, {y:.4f})", comm.goto, x, y, timeout=40.0)
     else:
-        ok = comm.goto(x, y, timeout=40.0)
+        ok = _timed(f"GOTO direct ({x:.4f}, {y:.4f})", comm.goto, x, y, timeout=40.0)
     if ok:
         _CUR_X, _CUR_Y = x, y
     return ok
@@ -83,11 +91,11 @@ def go_to(x, y, x_first=False):
 def turn_to(deg):
     """车体坐标 0=前, -90=左, +90=右. comm.turnto 直接接这角度."""
     print(f"  TURNTO {deg:.1f}° (车体)")
-    return comm.turnto(deg, timeout=30.0)
+    return _timed(f"TURNTO {deg:.1f}", comm.turnto, deg, timeout=30.0)
 
 def rotate(pos):
     print(f"  ROTATE {pos}")
-    return comm.rotate(pos, timeout=12.0)
+    return _timed(f"ROTATE {pos}", comm.rotate, pos, timeout=12.0)
 
 
 def arc_with_waypoints(r, dir_, sweep_deg, on_waypoints):
@@ -122,7 +130,7 @@ def place_and_backup(x, y, rotate_pos, heading=HEADING_D, backup=BACKUP_M):
 
 def arm(state):
     print(f"  ARM {state}")
-    return comm.arm(state, timeout=6.0)
+    return _timed(f"ARM {state}", comm.arm, state, timeout=6.0)
 
 def run_task_c():
     print("\n=== 阶段 C: 走弧 + 颜色识别 ===")
@@ -132,7 +140,7 @@ def run_task_c():
     go_to(-0.66158, 0.29568)
 
     # 15. QR1
-    seq1 = qr1.recognize()
+    seq1 = _timed("QR1 recognize", qr1.recognize)
     color_seq = qr1.TASK1_PLANS[seq1]
     print(f"  QR1: {seq1} -> {color_seq}")
 
