@@ -17,6 +17,7 @@ import qr1, qr2, ring, block
 ARC_SPEED_MM_S = 200
 WAYPOINT_DELAY_S = 1.0
 AFTER_RECOGNIZE_DELAY_S = 1.0
+VISION_MAX_CORRECTIONS = 3
 ALPHA_TO_POS = {"A": 0, "B": 1, "C": 2}
 
 # TODO: 编号 1-5 对应的颜色
@@ -84,9 +85,33 @@ def arc_with_waypoints(r, dir_, sweep_deg, on_waypoints):
 def place_at_ring(x, y, rotate_pos):
     """粗移到 (x,y) → ring 检测圆心 → 闭环 → 调转盘 → 放物"""
     go_to(x, y)
-    centers = ring.detect_centers()  # TODO: 确认接口
-    cx, cy = min(centers, key=lambda c: (c[0]-x)**2 + (c[1]-y)**2)
-    go_to(cx, cy)  # 精确走到圆心
+    corrected = False
+    for attempt in range(VISION_MAX_CORRECTIONS + 1):
+        measurement = ring.detect_offset()
+        print(
+            f"  RING pixel={measurement.pixel_offset_px} "
+            f"body_mm={measurement.body_offset_mm} "
+            f"scale={measurement.scale_mm_per_px}"
+        )
+        if measurement.aligned:
+            if not corrected:
+                # Already aligned: only synchronize odometry to the known ring.
+                comm.send_sync_pose(x, y)
+                if not comm.wait_for(comm.TYPE_CMD_SYNC_RESP, 5.0):
+                    raise RuntimeError("ring pose sync failed")
+            break
+        if attempt == VISION_MAX_CORRECTIONS:
+            raise RuntimeError("ring alignment did not converge")
+
+        pose = comm.get_pose(max_age=1.0)
+        if pose is None:
+            raise RuntimeError("ring alignment requires a fresh STM32 pose")
+        dx_mm, dy_mm = measurement.world_correction_mm(pose[2])
+        if not comm.vision_correct(dx_mm, dy_mm, x, y, timeout=5.0):
+            raise RuntimeError(
+                f"ring correction failed: dx={dx_mm:.2f}mm dy={dy_mm:.2f}mm"
+            )
+        corrected = True
     rotate(rotate_pos)
     # TODO: 实际抓放动作 (无机械臂, 放物逻辑待加)
 

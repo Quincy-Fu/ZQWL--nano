@@ -13,6 +13,8 @@ import logging
 import cv2
 import numpy as np
 
+import comm
+
 import gi
 gi.require_version("Gst", "1.0")
 gi.require_version("GstApp", "1.0")
@@ -159,7 +161,16 @@ def _is_valid(data: str) -> bool:
         return False
 
 
-def recognize(timeout: float = 15.0) -> str:
+def _set_light(light_id: int, on: bool) -> None:
+    """设置补光灯, comm 未初始化时不报错。"""
+    try:
+        comm.send_light(light_id, on)
+    except RuntimeError:
+        # 单独运行 qr1.py 时 comm 未初始化, 忽略
+        pass
+
+
+def recognize(timeout: float = 3.0) -> str:
     """识别数字 1-16, 扫到合法内容立刻返回. 超时抛 RuntimeError.
 
     返回: "1" 到 "16" 字符串
@@ -167,6 +178,8 @@ def recognize(timeout: float = 15.0) -> str:
     cam = CSICamera()
     cam.start()
     detector = QRDetector(MODEL_DIR)
+    log.info("[QR1] 开补光灯 3")
+    _set_light(3, True)
     try:
         t0 = time.time()
         attempts = 0
@@ -190,10 +203,11 @@ def recognize(timeout: float = 15.0) -> str:
             time.sleep(0.05)
         raise RuntimeError(f"QR1: {timeout}s 内未识别到合法二维码 (1-16)")
     finally:
+        _set_light(3, False)
         cam.stop()
 
 
-def recognize_color_order(timeout: float = 15.0) -> list:
+def recognize_color_order(timeout: float = 3.0) -> list:
     """直接返回 5 元素颜色顺序列表, 例如 ['黑', '白', '红', '绿', '蓝']."""
     key = recognize(timeout)
     return TASK1_PLANS[key]
@@ -205,6 +219,8 @@ def recognize_with_preview(timeout: float = 30.0) -> str:
     cam.start()
     detector = QRDetector(MODEL_DIR)
     cv2.namedWindow("QR1 Preview", cv2.WINDOW_NORMAL)
+    log.info("[QR1] 开补光灯 3")
+    _set_light(3, True)
     try:
         t0 = time.time()
         attempts = 0
@@ -241,6 +257,7 @@ def recognize_with_preview(timeout: float = 30.0) -> str:
             time.sleep(0.05)
         raise RuntimeError(f"QR1: {timeout}s 内未识别")
     finally:
+        _set_light(3, False)
         cam.stop()
         cv2.destroyAllWindows()
 

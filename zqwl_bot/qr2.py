@@ -13,6 +13,8 @@ import logging
 import cv2
 import numpy as np
 
+import comm
+
 import gi
 gi.require_version("Gst", "1.0")
 gi.require_version("GstApp", "1.0")
@@ -142,11 +144,22 @@ def _is_valid_num(data: str) -> bool:
     return data in QR2_NUM_TO_LETTERS
 
 
-def recognize(timeout: float = 15.0) -> str:
+def _set_light(light_id: int, on: bool) -> None:
+    """设置补光灯, comm 未初始化时不报错。"""
+    try:
+        comm.send_light(light_id, on)
+    except RuntimeError:
+        # 单独运行 qr2.py 时 comm 未初始化, 忽略
+        pass
+
+
+def recognize(timeout: float = 3.0) -> str:
     """识别数字 1-6, 查表返回 3 字母顺序 ('CAB' 这种). 超时抛 RuntimeError."""
     cam = CSICamera()
     cam.start()
     detector = QRDetector(MODEL_DIR)
+    log.info("[QR2] 开补光灯 3")
+    _set_light(3, True)
     try:
         t0 = time.time()
         attempts = 0
@@ -171,6 +184,7 @@ def recognize(timeout: float = 15.0) -> str:
             time.sleep(0.05)
         raise RuntimeError(f"QR2: {timeout}s 内未识别到合法二维码 (1-6)")
     finally:
+        _set_light(3, False)
         cam.stop()
 
 
@@ -180,6 +194,8 @@ def recognize_with_preview(timeout: float = 30.0) -> str:
     cam.start()
     detector = QRDetector(MODEL_DIR)
     cv2.namedWindow("QR2 Preview", cv2.WINDOW_NORMAL)
+    log.info("[QR2] 开补光灯 3")
+    _set_light(3, True)
     try:
         t0 = time.time()
         attempts = 0
@@ -216,6 +232,7 @@ def recognize_with_preview(timeout: float = 30.0) -> str:
             time.sleep(0.05)
         raise RuntimeError(f"QR2: {timeout}s 内未识别")
     finally:
+        _set_light(3, False)
         cam.stop()
         cv2.destroyAllWindows()
 

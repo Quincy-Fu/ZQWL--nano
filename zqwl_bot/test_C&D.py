@@ -17,6 +17,10 @@ ARC_SPEED_MM_S = 200
 AFTER_RECOGNIZE_DELAY_S = 1.0
 HEADING_D = 180          # 阶段 D 放物车头朝向 (车体坐标)
 BACKUP_M = 0.05
+SPLIT_THRESHOLD = 0.03  # m, 差距小于此值不拆段
+
+# 当前位置跟踪 (从 HOME 开始)
+_CUR_X, _CUR_Y = 0.0, 0.0
 
 TARGETS = [
     (-0.63203, 1.45514),
@@ -42,9 +46,39 @@ def arc_sweep(start, end, center, ccw):
 
 
 # ============== 串口高层 (直接传) ==============
-def go_to(x, y):
+def _update_cur(x, y):
+    global _CUR_X, _CUR_Y
+    _CUR_X, _CUR_Y = x, y
+
+
+def go_to(x, y, x_first=False):
+    """走到 (x,y)。若两轴差距都大于 SPLIT_THRESHOLD，则拆成两段直走。
+    x_first=False: 先 Y 后 X (默认); x_first=True: 先 X 后 Y。
+    """
+    global _CUR_X, _CUR_Y
     print(f"  GOTO ({x:.4f}, {y:.4f})")
-    return comm.goto(x, y, timeout=40.0)
+    dx = abs(x - _CUR_X)
+    dy = abs(y - _CUR_Y)
+    if dx > SPLIT_THRESHOLD and dy > SPLIT_THRESHOLD:
+        if x_first:
+            # 先 X 后 Y
+            print(f"    -> 拆段: ({x:.4f}, {_CUR_Y:.4f}) -> ({x:.4f}, {y:.4f})")
+            ok = comm.goto(x, _CUR_Y, timeout=40.0)
+            if not ok:
+                return ok
+            ok = comm.goto(x, y, timeout=40.0)
+        else:
+            # 先 Y 后 X
+            print(f"    -> 拆段: ({_CUR_X:.4f}, {y:.4f}) -> ({x:.4f}, {y:.4f})")
+            ok = comm.goto(_CUR_X, y, timeout=40.0)
+            if not ok:
+                return ok
+            ok = comm.goto(x, y, timeout=40.0)
+    else:
+        ok = comm.goto(x, y, timeout=40.0)
+    if ok:
+        _CUR_X, _CUR_Y = x, y
+    return ok
 
 def turn_to(deg):
     """车体坐标 0=前, -90=左, +90=右. comm.turnto 直接接这角度."""
@@ -75,14 +109,16 @@ def arc_with_waypoints(r, dir_, sweep_deg, on_waypoints):
 
 
 def place_and_backup(x, y, rotate_pos, heading=HEADING_D, backup=BACKUP_M):
+    global _CUR_X, _CUR_Y
     turn_to(heading)
-    comm.goto(x, y, timeout=40.0)
+    go_to(x, y)
     comm.rotate(rotate_pos, timeout=12.0)
     rad = math.radians(heading)
     bx = x - backup * math.sin(rad)
     by = y - backup * math.cos(rad)
     print(f"  后移到 ({bx:.4f}, {by:.4f})")
     comm.goto(bx, by, timeout=10.0)
+    _CUR_X, _CUR_Y = bx, by
 
 def arm(state):
     print(f"  ARM {state}")
@@ -136,12 +172,18 @@ def run_task_c():
         time.sleep(AFTER_RECOGNIZE_DELAY_S)
         rotate(idx + 1)
 
+    # 走圆弧前开补光灯 4 (非阻塞, 稍作停顿后继续)
+    print("  LIGHT 4 ON")
+    comm.send_light(4, True)
+    time.sleep(0.05)
+
     arc_with_waypoints(r, 1, sweep_c, [
         (wp_times_c[0], lambda: on_wp_c(0)),
         (wp_times_c[1], lambda: on_wp_c(1)),
         (wp_times_c[2], lambda: on_wp_c(2)),
         (wp_times_c[3], lambda: on_wp_c(3)),
     ])
+    _update_cur(end_c[0], end_c[1])
 
     color_at_pos[4] = block.recognize(frames=1, timeout=0.3)
     color_to_pos = {c: i for i, c in enumerate(color_at_pos) if c}
@@ -159,7 +201,11 @@ def run_task_c():
         place_and_backup(tx, ty, pos)
 
     print("\n=== 回 HOME ===")
-    go_to(0, 0)
+    # 回 HOME 同时把机械臂归零 (非阻塞发送, 小间隔避免连续发包)
+    print("  ARM 0")
+    comm.send_arm(0)
+    time.sleep(0.05)
+    go_to(0, 0, x_first=True)
 
 
 def main():

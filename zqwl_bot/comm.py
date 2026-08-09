@@ -55,6 +55,10 @@ TYPE_CMD_VISION_NUDGE_RESP  = 0x28   # MCU->PC: payload 1B status (1=executed)
 TYPE_CMD_SET_ZERO        = 0x29   # PC->MCU: payload 空
 TYPE_CMD_SET_ZERO_RESP   = 0x2A   # MCU->PC: payload 1B status (1=saved)
 
+# 视觉校正 (弧后视觉闭环: fine_move + sync_pose 原子组合)
+TYPE_CMD_VISION_CORRECT       = 0x2B   # PC->MCU: payload 16B = dx_mm(f32)+dy_mm(f32)+target_x(f32)+target_y(f32)
+TYPE_CMD_VISION_CORRECT_RESP  = 0x2C   # MCU->PC: payload 1B status (1=修正成功且坐标已重置)
+
 # 视觉微调方向码
 NUDGE_STOP     = 0   # 立即停止+电磁锁死
 NUDGE_FORWARD  = 1   # 体坐标系前进 (+Y)
@@ -70,6 +74,7 @@ _NAV_RESP_TYPES = frozenset({
     TYPE_ROTATE_RESP, TYPE_ARM_RESP, TYPE_LIGHT_RESP,
     TYPE_CMD_VISION_NUDGE_RESP,
     TYPE_CMD_SET_ZERO_RESP,
+    TYPE_CMD_VISION_CORRECT_RESP,
 })
 
 FRAME_OVERHEAD = 2 + 1 + 1 + 2  # header + type + len + crc16
@@ -246,6 +251,17 @@ class SerialComm:
             raise ValueError(f"nudge direction must be 0-4, got {direction}")
         self._send_nav(TYPE_CMD_VISION_NUDGE, struct.pack("<B", direction))
 
+    def send_vision_correct(self, dx_mm: float, dy_mm: float,
+                            target_x: float, target_y: float) -> None:
+        """发送视觉校正命令 (fine_move + sync_pose 原子组合, 16B payload).
+
+        dx_mm/dy_mm: 视觉检测到的偏移(mm), MCU 据此物理修正位置.
+        target_x/target_y: 修正成功后 MCU 把 odom 重置到此绝对坐标(米).
+        """
+        self._check_finite(dx_mm, dy_mm, target_x, target_y)
+        self._send_nav(TYPE_CMD_VISION_CORRECT,
+                       struct.pack("<ffff", dx_mm, dy_mm, target_x, target_y))
+
     # --- 导航响应接收 ---
 
     def wait_nav_response(self, timeout: float = 30.0) -> tuple[int, int] | None:
@@ -384,6 +400,21 @@ class SerialComm:
         """
         self.send_vision_nudge(direction)
         return self.wait_for(TYPE_CMD_VISION_NUDGE_RESP, timeout)
+
+    def vision_correct(self, dx_mm: float, dy_mm: float,
+                       target_x: float, target_y: float,
+                       timeout: float = 5.0) -> bool:
+        """视觉校正 (弧后视觉闭环, fine_move + sync_pose 原子组合, 阻塞式).
+
+        dx_mm/dy_mm: 视觉检测到的偏移(mm), MCU 物理修正此偏移.
+        target_x/target_y: 修正成功后 odom 重置到此坐标(米), 消除累积漂移.
+        MCU 先 MoveToAccurateTimed 走完偏移, 成功后 Move_InitPose 重置坐标.
+
+        Returns:
+            True = 修正成功且坐标已重置; 超时/fine_move 失败返回 False.
+        """
+        self.send_vision_correct(dx_mm, dy_mm, target_x, target_y)
+        return self.wait_for(TYPE_CMD_VISION_CORRECT_RESP, timeout)
 
     def run(self, timeout: float = 5.0) -> bool:
         """启动命令 (模拟按下启动按键).
@@ -637,6 +668,12 @@ def send_vision_nudge(direction: int) -> None:
         raise RuntimeError("serial not initialized")
     _comm.send_vision_nudge(direction)
 
+def send_vision_correct(dx_mm: float, dy_mm: float,
+                        target_x: float, target_y: float) -> None:
+    if _comm is None:
+        raise RuntimeError("serial not initialized")
+    _comm.send_vision_correct(dx_mm, dy_mm, target_x, target_y)
+
 def wait_nav_response(timeout: float = 30.0) -> tuple[int, int] | None:
     if _comm is None:
         return None
@@ -706,6 +743,13 @@ def vision_nudge(direction: int, timeout: float = 3.0) -> bool:
     if _comm is None:
         raise RuntimeError("serial not initialized, call init() first")
     return _comm.vision_nudge(direction, timeout)
+
+def vision_correct(dx_mm: float, dy_mm: float,
+                   target_x: float, target_y: float,
+                   timeout: float = 5.0) -> bool:
+    if _comm is None:
+        raise RuntimeError("serial not initialized, call init() first")
+    return _comm.vision_correct(dx_mm, dy_mm, target_x, target_y, timeout)
 
 
 # --- 自检 ---
@@ -798,6 +842,7 @@ def _self_check() -> None:
             TYPE_ARM:         TYPE_ARM_RESP,
             TYPE_LIGHT:       TYPE_LIGHT_RESP,
             TYPE_CMD_VISION_NUDGE: TYPE_CMD_VISION_NUDGE_RESP,
+            TYPE_CMD_VISION_CORRECT: TYPE_CMD_VISION_CORRECT_RESP,
         }
 
         def __init__(self, comm):
@@ -965,6 +1010,22 @@ def _self_check() -> None:
     assert c._ser.written[-1] == pack_frame(TYPE_CMD_VISION_NUDGE, struct.pack("<B", NUDGE_FORWARD))
     assert c.vision_nudge(NUDGE_STOP)
     assert c._ser.written[-1] == pack_frame(TYPE_CMD_VISION_NUDGE, struct.pack("<B", NUDGE_STOP))
+
+    # 6.20 高层 vision_correct: 16B payload (4×f32: dx_mm/dy_mm/target_x/target_y) + RESP 确认
+    assert c.vision_correct(30.0, -15.0, 0.5, 0.3)
+    assert c._ser.written[-1] == pack_frame(
+        TYPE_CMD_VISION_CORRECT, struct.pack("<ffff", 30.0, -15.0, 0.5, 0.3))
+    # status=0 → fine_move 失败, 不重置坐标
+    c._ser.status = 0
+    assert not c.vision_correct(10.0, 10.0, 0.0, 0.0)
+    c._ser.status = 1
+    # NaN/inf 防护
+    for badv in (float('nan'), float('inf')):
+        try:
+            c.send_vision_correct(badv, 0.0, 0.0, 0.0)
+            assert False, "NaN/inf must raise"
+        except ValueError:
+            pass
 
     print("self-check OK")
 
