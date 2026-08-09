@@ -44,6 +44,7 @@ CONFIG = {
     "ring_diameters_mm": (50.0, 90.0, 130.0, 170.0, 210.0),
     "max_diameter_match_error": 0.12,
     "black_v_max": 100,
+    "black_s_max": 255,
     "search_radius_fraction": 1.0,
     "min_contour_area": 60.0,
     "min_axis_px": 20.0,
@@ -53,6 +54,7 @@ CONFIG = {
     "center_tolerance_px": 20.0,
     "min_concentric_contours": 2,
     "max_stroke_pair_ratio": 1.20,
+    "morph_open_size": 1,
     "morph_close_size": 3,
     "min_arc_coverage": 0.22,
     "single_candidate_min_coverage": 0.45,
@@ -242,11 +244,18 @@ def _black_mask(frame):
     mask = cv2.inRange(
         hsv,
         np.array([0, 0, 0], dtype=np.uint8),
-        np.array([180, 255, CONFIG["black_v_max"]], dtype=np.uint8),
+        np.array([180, CONFIG["black_s_max"], CONFIG["black_v_max"]], dtype=np.uint8),
     )
     roi = np.zeros((height, width), dtype=np.uint8)
     cv2.circle(roi, (round(reference[0]), round(reference[1])), search_radius, 255, -1)
     mask = cv2.bitwise_and(mask, roi)
+    open_size = max(1, int(CONFIG["morph_open_size"]))
+    if open_size % 2 == 0:
+        open_size += 1
+    if open_size > 1:
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_OPEN, np.ones((open_size, open_size), np.uint8)
+        )
     close_size = max(1, int(CONFIG["morph_close_size"]))
     if close_size % 2 == 0:
         close_size += 1
@@ -765,7 +774,10 @@ def _render_debug_frame(
 def _create_debug_trackbars(window: str) -> None:
     noop = lambda _value: None
     cv2.createTrackbar("V Max", window, int(CONFIG["black_v_max"]), 255, noop)
+    cv2.createTrackbar("S Max", window, int(CONFIG["black_s_max"]), 255, noop)
+    cv2.createTrackbar("Open", window, int(CONFIG["morph_open_size"]), 15, noop)
     cv2.createTrackbar("Close", window, int(CONFIG["morph_close_size"]), 15, noop)
+    cv2.createTrackbar("Min Area", window, int(CONFIG["min_contour_area"]), 2000, noop)
     cv2.createTrackbar("Min Axis", window, int(CONFIG["min_axis_px"]), 200, noop)
     cv2.createTrackbar(
         "Center Tol", window, int(CONFIG["center_tolerance_px"]), 100, noop
@@ -790,10 +802,16 @@ def _create_debug_trackbars(window: str) -> None:
 
 def _read_debug_trackbars(window: str) -> None:
     CONFIG["black_v_max"] = max(1, cv2.getTrackbarPos("V Max", window))
+    CONFIG["black_s_max"] = max(1, cv2.getTrackbarPos("S Max", window))
+    open_size = max(1, cv2.getTrackbarPos("Open", window))
+    if open_size % 2 == 0:
+        open_size += 1
+    CONFIG["morph_open_size"] = open_size
     close_size = max(1, cv2.getTrackbarPos("Close", window))
     if close_size % 2 == 0:
         close_size += 1
     CONFIG["morph_close_size"] = close_size
+    CONFIG["min_contour_area"] = max(1, cv2.getTrackbarPos("Min Area", window))
     CONFIG["min_axis_px"] = max(1, cv2.getTrackbarPos("Min Axis", window))
     CONFIG["center_tolerance_px"] = max(
         1, cv2.getTrackbarPos("Center Tol", window)
@@ -817,7 +835,8 @@ def _read_debug_trackbars(window: str) -> None:
 
 def _debug_tuning_values() -> dict:
     keys = (
-        "black_v_max", "morph_close_size", "min_axis_px",
+        "black_v_max", "black_s_max", "morph_open_size",
+        "morph_close_size", "min_contour_area", "min_axis_px",
         "center_tolerance_px", "max_ellipse_error",
         "min_concentric_contours", "search_radius_fraction",
         "min_arc_coverage", "single_candidate_min_coverage",

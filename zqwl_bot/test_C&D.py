@@ -214,6 +214,7 @@ def run_task_c():
     comm.send_arm(0)
     time.sleep(0.05)
     go_to(0, 0, x_first=True)
+    turn_to(0)
 
 
 def main():
