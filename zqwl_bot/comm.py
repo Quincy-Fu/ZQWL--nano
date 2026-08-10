@@ -47,6 +47,15 @@ TYPE_CMD_SYNC_RESP    = 0x1B
 TYPE_CMD_ARC          = 0x1C
 TYPE_CMD_ARC_RESP     = 0x1D
 
+# 连续路径跟踪: BEGIN装载参数, POINT装载路径点, EXEC触发执行
+TYPE_CMD_PATH_BEGIN    = 0x22   # payload: speed(f32)+count(u8)
+TYPE_CMD_PATH_POINT    = 0x23   # payload: x(f32)+y(f32)+target_theta(f32)+mode(u8)+pad(3B)
+TYPE_CMD_PATH_EXEC     = 0x24   # payload 空
+TYPE_CMD_PATH_RESP     = 0x25   # payload 1B status
+
+PATH_MODE_NORMAL = 0  # 普通通过点: 不停, 进入通过半径后切下一段
+PATH_MODE_KEY    = 1  # 关键点: 接近时减速; 作为终点时要求位置+角度到位
+
 # 视觉微调 (到位后视觉闭环方向微调, 体坐标系)
 TYPE_CMD_VISION_NUDGE       = 0x27   # PC->MCU: payload 1B direction
 TYPE_CMD_VISION_NUDGE_RESP  = 0x28   # MCU->PC: payload 1B status (1=executed)
@@ -55,9 +64,13 @@ TYPE_CMD_VISION_NUDGE_RESP  = 0x28   # MCU->PC: payload 1B status (1=executed)
 TYPE_CMD_SET_ZERO        = 0x29   # PC->MCU: payload 空
 TYPE_CMD_SET_ZERO_RESP   = 0x2A   # MCU->PC: payload 1B status (1=saved)
 
-# 视觉校正 (弧后视觉闭环: fine_move + sync_pose 原子组合)
-TYPE_CMD_VISION_CORRECT       = 0x2B   # PC->MCU: payload 16B = dx_mm(f32)+dy_mm(f32)+target_x(f32)+target_y(f32)
-TYPE_CMD_VISION_CORRECT_RESP  = 0x2C   # MCU->PC: payload 1B status (1=修正成功且坐标已重置)
+# 视觉校正 (弧后视觉闭环: field-frame fine_move + sync_pose 原子组合)
+TYPE_CMD_VISION_CORRECT       = 0x2B   # PC->MCU: 16B = field dx_mm + field dy_mm + target_x_m + target_y_m
+TYPE_CMD_VISION_CORRECT_RESP  = 0x2C   # MCU->PC: payload 1B status (1=到位且坐标已重置)
+
+# IMU 零偏校准 (车必须静止; 下位机转发 IMU 0x70 校准命令)
+TYPE_CMD_IMU_CALIB       = 0x2D   # PC->MCU: payload 空
+TYPE_CMD_IMU_CALIB_RESP  = 0x2E   # MCU->PC: payload 1B status (1=IMU帧恢复)
 
 # 视觉微调方向码
 NUDGE_STOP     = 0   # 立即停止+电磁锁死
@@ -70,11 +83,12 @@ NUDGE_RIGHT    = 4   # 体坐标系右移 (+X)
 _NAV_RESP_TYPES = frozenset({
     TYPE_CMD_GOTO_RESP, TYPE_CMD_TOX_RESP, TYPE_CMD_TOY_RESP,
     TYPE_CMD_TURNTO_RESP, TYPE_CMD_FINE_RESP, TYPE_CMD_SYNC_RESP,
-    TYPE_CMD_ARC_RESP, TYPE_RUN_RESP,
+    TYPE_CMD_ARC_RESP, TYPE_CMD_PATH_RESP, TYPE_RUN_RESP,
     TYPE_ROTATE_RESP, TYPE_ARM_RESP, TYPE_LIGHT_RESP,
     TYPE_CMD_VISION_NUDGE_RESP,
     TYPE_CMD_SET_ZERO_RESP,
     TYPE_CMD_VISION_CORRECT_RESP,
+    TYPE_CMD_IMU_CALIB_RESP,
 })
 
 FRAME_OVERHEAD = 2 + 1 + 1 + 2  # header + type + len + crc16
@@ -164,6 +178,12 @@ class SerialComm:
             raise RuntimeError("serial not started")
         self._send_nav(TYPE_CMD_SET_ZERO, b"")
 
+    def send_imu_calib(self) -> None:
+        """Send IMU zero-bias calibration command. Keep the robot fully stationary."""
+        if not self._ser:
+            raise RuntimeError("serial not started")
+        self._send_nav(TYPE_CMD_IMU_CALIB, b"")
+
     def send_light(self, light_id: int, on: bool) -> None:
         if not self._ser:
             raise RuntimeError("serial not started")
@@ -240,6 +260,30 @@ class SerialComm:
         self._check_finite(x, y)
         self._send_nav(TYPE_CMD_SYNC_POSE, struct.pack("<ff", x, y))
 
+    def send_path_begin(self, speed: float, count: int) -> None:
+        """开始装载连续路径。count 是下位机将收到的总点数。"""
+        self._check_finite(speed)
+        if not (2 <= int(count) <= 255):
+            raise ValueError(f"path count must be 2..255, got {count}")
+        if speed <= 0.0:
+            raise ValueError(f"path speed must be > 0, got {speed}")
+        self._send_nav(TYPE_CMD_PATH_BEGIN, struct.pack("<fB", float(speed), int(count)))
+
+    def send_path_point(self, x: float, y: float,
+                        target_theta: float = 0.0,
+                        mode: int = PATH_MODE_NORMAL) -> None:
+        """追加一个路径点。mode=0普通通过点, mode=1关键点。"""
+        self._check_finite(x, y, target_theta)
+        if mode not in (PATH_MODE_NORMAL, PATH_MODE_KEY):
+            raise ValueError(f"path mode must be 0 or 1, got {mode}")
+        self._send_nav(TYPE_CMD_PATH_POINT,
+                       struct.pack("<fffBxxx", float(x), float(y),
+                                   float(target_theta), int(mode)))
+
+    def send_path_exec(self) -> None:
+        """触发执行已装载的连续路径。"""
+        self._send_nav(TYPE_CMD_PATH_EXEC, b"")
+
     def send_vision_nudge(self, direction: int) -> None:
         """发送视觉微调命令 (体坐标系方向, 1B payload).
 
@@ -255,7 +299,7 @@ class SerialComm:
                             target_x: float, target_y: float) -> None:
         """发送视觉校正命令 (fine_move + sync_pose 原子组合, 16B payload).
 
-        dx_mm/dy_mm: 视觉检测到的偏移(mm), MCU 据此物理修正位置.
+        dx_mm/dy_mm: 场坐标修正量(mm), +X=右, +Y=前; MCU 据此物理修正位置.
         target_x/target_y: 修正成功后 MCU 把 odom 重置到此绝对坐标(米).
         """
         self._check_finite(dx_mm, dy_mm, target_x, target_y)
@@ -385,6 +429,67 @@ class SerialComm:
         self.send_arc(radius, dir, sweep_deg, speed)
         return self.wait_for(TYPE_CMD_ARC_RESP, timeout)
 
+    @staticmethod
+    def _normalize_path_point(point) -> tuple[float, float, float, int]:
+        """把 (x,y)、(x,y,yaw) 或 (x,y,yaw,mode) 统一成路径点。"""
+        if len(point) == 2:
+            x, y = point
+            return float(x), float(y), 0.0, PATH_MODE_NORMAL
+        if len(point) == 3:
+            x, y, yaw = point
+            return float(x), float(y), float(yaw), PATH_MODE_NORMAL
+        if len(point) == 4:
+            x, y, yaw, mode = point
+            return float(x), float(y), float(yaw), int(mode)
+        raise ValueError("path point must be (x,y), (x,y,yaw), or (x,y,yaw,mode)")
+
+    def path(self, points, speed: float = 0.30,
+             timeout: float | None = None,
+             prepend_current: bool = True,
+             final_yaw: float | None = None) -> bool:
+        """连续路径跟踪。普通点不停, 终点可用 final_yaw 强制角度到位。
+
+        points: 目标点序列, 每点可为 (x,y)、(x,y,yaw) 或 (x,y,yaw,mode)。
+        prepend_current=True 时自动把最新位姿作为 p[0], 避免下位机把第一个目标点当起点。
+        final_yaw 不为 None 时, 最后一个点强制改为 PATH_MODE_KEY。
+        """
+        self._check_finite(speed)
+        if speed <= 0.0:
+            raise ValueError(f"path speed must be > 0, got {speed}")
+
+        pts = [self._normalize_path_point(p) for p in points]
+        if not pts:
+            raise ValueError("path requires at least one target point")
+
+        if final_yaw is not None:
+            self._check_finite(final_yaw)
+            x, y, _, _ = pts[-1]
+            pts[-1] = (x, y, float(final_yaw), PATH_MODE_KEY)
+
+        if prepend_current:
+            pose = self.get_pose(max_age=1.0)
+            if pose is None:
+                raise RuntimeError("no fresh pose; cannot prepend current path start")
+            px, py, pyaw = pose
+            pts.insert(0, (px, py, pyaw, PATH_MODE_NORMAL))
+
+        if len(pts) < 2:
+            raise ValueError("path needs at least two points after start insertion")
+        if len(pts) > 255:
+            raise ValueError(f"path supports at most 255 points, got {len(pts)}")
+
+        total_len = 0.0
+        for (x0, y0, _, _), (x1, y1, _, _) in zip(pts, pts[1:]):
+            total_len += math.hypot(x1 - x0, y1 - y0)
+        if timeout is None:
+            timeout = max(15.0, total_len / speed * 3.0 + 5.0)
+
+        self.send_path_begin(speed, len(pts))
+        for x, y, yaw, mode in pts:
+            self.send_path_point(x, y, yaw, mode)
+        self.send_path_exec()
+        return self.wait_for(TYPE_CMD_PATH_RESP, timeout)
+
     def vision_nudge(self, direction: int, timeout: float = 3.0) -> bool:
         """视觉微调 (体坐标系方向, 非阻塞运动).
 
@@ -406,7 +511,7 @@ class SerialComm:
                        timeout: float = 5.0) -> bool:
         """视觉校正 (弧后视觉闭环, fine_move + sync_pose 原子组合, 阻塞式).
 
-        dx_mm/dy_mm: 视觉检测到的偏移(mm), MCU 物理修正此偏移.
+        dx_mm/dy_mm: 场坐标修正量(mm), +X=右, +Y=前; MCU 物理修正此偏移.
         target_x/target_y: 修正成功后 odom 重置到此坐标(米), 消除累积漂移.
         MCU 先 MoveToAccurateTimed 走完偏移, 成功后 Move_InitPose 重置坐标.
 
@@ -440,6 +545,11 @@ class SerialComm:
         """
         self.send_set_zero()
         return self.wait_for(TYPE_CMD_SET_ZERO_RESP, timeout)
+
+    def imu_calib(self, timeout: float = 12.0) -> bool:
+        """IMU zero-bias calibration. Keep the robot stationary until this returns."""
+        self.send_imu_calib()
+        return self.wait_for(TYPE_CMD_IMU_CALIB_RESP, timeout)
 
     def rotate(self, pos: int, timeout: float = 10.0) -> bool:
         """转盘切槽位 (0-4), 阻塞等待 TYPE_ROTATE_RESP.
@@ -663,6 +773,23 @@ def send_sync_pose(x: float, y: float) -> None:
         raise RuntimeError("serial not initialized")
     _comm.send_sync_pose(x, y)
 
+def send_path_begin(speed: float, count: int) -> None:
+    if _comm is None:
+        raise RuntimeError("serial not initialized")
+    _comm.send_path_begin(speed, count)
+
+def send_path_point(x: float, y: float,
+                    target_theta: float = 0.0,
+                    mode: int = PATH_MODE_NORMAL) -> None:
+    if _comm is None:
+        raise RuntimeError("serial not initialized")
+    _comm.send_path_point(x, y, target_theta, mode)
+
+def send_path_exec() -> None:
+    if _comm is None:
+        raise RuntimeError("serial not initialized")
+    _comm.send_path_exec()
+
 def send_vision_nudge(direction: int) -> None:
     if _comm is None:
         raise RuntimeError("serial not initialized")
@@ -673,6 +800,11 @@ def send_vision_correct(dx_mm: float, dy_mm: float,
     if _comm is None:
         raise RuntimeError("serial not initialized")
     _comm.send_vision_correct(dx_mm, dy_mm, target_x, target_y)
+
+def send_imu_calib() -> None:
+    if _comm is None:
+        raise RuntimeError("serial not initialized, call init() first")
+    _comm.send_imu_calib()
 
 def wait_nav_response(timeout: float = 30.0) -> tuple[int, int] | None:
     if _comm is None:
@@ -705,6 +837,14 @@ def arc(radius: float, dir: int, sweep_deg: float,
         raise RuntimeError("serial not initialized, call init() first")
     return _comm.arc(radius, dir, sweep_deg, speed, timeout)
 
+def path(points, speed: float = 0.30,
+         timeout: float | None = None,
+         prepend_current: bool = True,
+         final_yaw: float | None = None) -> bool:
+    if _comm is None:
+        raise RuntimeError("serial not initialized, call init() first")
+    return _comm.path(points, speed, timeout, prepend_current, final_yaw)
+
 def run(timeout: float = 5.0) -> bool:
     if _comm is None:
         raise RuntimeError("serial not initialized, call init() first")
@@ -718,6 +858,12 @@ def set_zero(timeout: float = 5.0) -> bool:
     if _comm is None:
         raise RuntimeError("serial not initialized, call init() first")
     return _comm.set_zero(timeout)
+
+def imu_calib(timeout: float = 12.0) -> bool:
+    """IMU 零偏校准: 车必须静止，等待下位机完成并确认 IMU 帧恢复。"""
+    if _comm is None:
+        raise RuntimeError("serial not initialized, call init() first")
+    return _comm.imu_calib(timeout)
 
 def turnto(yaw_deg: float, timeout: float = 20.0) -> bool:
     if _comm is None:
@@ -837,12 +983,14 @@ def _self_check() -> None:
             TYPE_CMD_TOY:     TYPE_CMD_TOY_RESP,
             TYPE_CMD_TURNTO:  TYPE_CMD_TURNTO_RESP,
             TYPE_CMD_ARC:     TYPE_CMD_ARC_RESP,
+            TYPE_CMD_PATH_EXEC: TYPE_CMD_PATH_RESP,
             TYPE_RUN:         TYPE_RUN_RESP,
             TYPE_ROTATE:      TYPE_ROTATE_RESP,
             TYPE_ARM:         TYPE_ARM_RESP,
             TYPE_LIGHT:       TYPE_LIGHT_RESP,
             TYPE_CMD_VISION_NUDGE: TYPE_CMD_VISION_NUDGE_RESP,
             TYPE_CMD_VISION_CORRECT: TYPE_CMD_VISION_CORRECT_RESP,
+            TYPE_CMD_IMU_CALIB: TYPE_CMD_IMU_CALIB_RESP,
         }
 
         def __init__(self, comm):
@@ -902,6 +1050,25 @@ def _self_check() -> None:
     assert c.arc(0.3, -1, 180.0, speed=0.08)
     assert c._ser.written[-1] == pack_frame(
         TYPE_CMD_ARC, struct.pack("<ffff", 0.3, -1.0, 180.0, 0.08))
+
+    # 6.7.1 连续路径底层帧: BEGIN 5B, POINT 16B, EXEC 空payload
+    c.send_path_begin(0.3, 3)
+    assert c._ser.written[-1] == pack_frame(TYPE_CMD_PATH_BEGIN, struct.pack("<fB", 0.3, 3))
+    c.send_path_point(0.1, 0.2, 90.0, PATH_MODE_KEY)
+    assert c._ser.written[-1] == pack_frame(
+        TYPE_CMD_PATH_POINT, struct.pack("<fffBxxx", 0.1, 0.2, 90.0, PATH_MODE_KEY))
+    c.send_path_exec()
+    assert c._ser.written[-1] == pack_frame(TYPE_CMD_PATH_EXEC, b"")
+
+    # 6.7.2 高层 path: 自动插入当前位姿作为起点, final_yaw 强制终点关键点
+    n = len(c._ser.written)
+    assert c.path([(0.2, 0.0), (0.4, 0.0)], speed=0.3, timeout=0.1, final_yaw=90.0)
+    assert len(c._ser.written) == n + 5
+    assert c._ser.written[n] == pack_frame(TYPE_CMD_PATH_BEGIN, struct.pack("<fB", 0.3, 3))
+    assert c._ser.written[n + 1][2] == TYPE_CMD_PATH_POINT
+    assert c._ser.written[n + 3] == pack_frame(
+        TYPE_CMD_PATH_POINT, struct.pack("<fffBxxx", 0.4, 0.0, 90.0, PATH_MODE_KEY))
+    assert c._ser.written[n + 4] == pack_frame(TYPE_CMD_PATH_EXEC, b"")
 
     # 6.8 run → 空 payload 帧 AA 55 06 00 + 收到 RUN_RESP
     assert c.run()
@@ -1026,6 +1193,10 @@ def _self_check() -> None:
             assert False, "NaN/inf must raise"
         except ValueError:
             pass
+
+    # 6.21 IMU 零偏校准: 空 payload + IMU_CALIB_RESP 确认
+    assert c.imu_calib(timeout=0.1)
+    assert c._ser.written[-1] == pack_frame(TYPE_CMD_IMU_CALIB, b"")
 
     print("self-check OK")
 

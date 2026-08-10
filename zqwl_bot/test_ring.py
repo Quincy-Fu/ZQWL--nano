@@ -61,15 +61,13 @@ class RingGeometryTests(unittest.TestCase):
         fake_cv2.CAP_PROP_BUFFERSIZE = 38
         fake_cv2.VideoCapture.side_effect = [failed, opened]
 
-        with (
-            mock.patch.object(ring, "cv2", fake_cv2),
-            mock.patch.object(ring, "np", mock.Mock()),
-        ):
-            result = ring._open_usb()
+        with mock.patch.object(ring, "cv2", fake_cv2):
+            with mock.patch.object(ring, "np", mock.Mock()):
+                result = ring._open_usb()
 
         self.assertIs(result, opened)
         self.assertEqual(
-            [call.args[0] for call in fake_cv2.VideoCapture.call_args_list],
+            [item.args[0] for item in fake_cv2.VideoCapture.call_args_list],
             [0, 1],
         )
         failed.release.assert_called_once_with()
@@ -219,17 +217,22 @@ class RingGeometryTests(unittest.TestCase):
     @unittest.skipIf(ring.cv2 is None or ring.np is None, "OpenCV is unavailable")
     def test_synthetic_outlined_ellipse_is_detected_at_centerline_scale(self):
         image = ring.np.full((480, 640, 3), 255, ring.np.uint8)
-        center = (350, 220)
-        for factor in (1.0, 1.45, 1.9, 2.35):
-            axes = (round(70 * factor), round(40 * factor))
+        center = (320, 240)
+        # The major/minor axes follow the configured 50/90/130/170/210 mm
+        # diameter ratios.  The outer ring remains fully inside the frame.
+        for diameter, minor_diameter in zip(
+            (50, 90, 130, 170, 210), (30, 54, 78, 102, 126)
+        ):
+            axes = (round(diameter * 0.5), round(minor_diameter * 0.5))
             ring.cv2.ellipse(image, center, axes, 25, 0, 360, (0, 0, 0), 3)
 
         result = ring.measure_frame(image)
         self.assertIsNotNone(result)
-        self.assertAlmostEqual(result.center_px[0], 350.0, delta=0.2)
-        self.assertAlmostEqual(result.center_px[1], 220.0, delta=0.2)
-        self.assertAlmostEqual(result.inner_axes_px[0], 140.0, delta=1.0)
-        self.assertAlmostEqual(result.inner_axes_px[1], 80.0, delta=1.0)
+        self.assertAlmostEqual(result.center_px[0], 320.0, delta=0.2)
+        self.assertAlmostEqual(result.center_px[1], 240.0, delta=0.2)
+        self.assertAlmostEqual(result.inner_axes_px[0], 210.0, delta=2.0)
+        self.assertAlmostEqual(result.inner_axes_px[1], 126.0, delta=2.0)
+        self.assertEqual(result.selected_diameter_mm, 210.0)
 
         mask = ring._black_mask(image)
         rendered = ring._render_debug_frame(
