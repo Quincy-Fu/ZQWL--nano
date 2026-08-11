@@ -22,6 +22,9 @@
     p                  打印当前位姿 (下位机50Hz上报)
     n <f|b|l|r|s>      视觉微调 (体坐标系, 慢速) 例: n f
                        f=前进 b=后退 l=左 r=右 s=停止+锁死
+    fm <dx> <dy>       诊断: 发送 FINE_MOVE 偏移(mm) 例: fm 30 0
+    vc <dx> <dy> [x y] 诊断: 发送 VISION_CORRECT 偏移(mm), 可选同步坐标(m)
+                       例: vc 30 0        或 vc 30 0 0.5 0.3
     all                综合测试 (全部子系统按安全顺序跑一遍, 最后回原点)
     h                  显示帮助
     q                  退出
@@ -133,6 +136,31 @@ def do_nudge(sub: str):
     return timed(f"NUDGE {name}", lambda: comm.vision_nudge(code, 3.0))
 
 
+def do_fine_move(dx_mm: float, dy_mm: float):
+    """诊断 0x18: 只做物理偏移，不同步坐标。"""
+    def run():
+        comm.send_fine_move(dx_mm, dy_mm)
+        return comm.wait_for(comm.TYPE_CMD_FINE_RESP, 5.0)
+    return timed(f"FINE_MOVE dx={dx_mm:.1f}mm dy={dy_mm:.1f}mm", run)
+
+
+def do_vision_correct(dx_mm: float, dy_mm: float,
+                      target_x: float | None = None,
+                      target_y: float | None = None):
+    """诊断 0x2B: 物理偏移成功后同步坐标。"""
+    if target_x is None or target_y is None:
+        pose = comm.get_pose(max_age=1.0)
+        if pose is None:
+            print("  !! 没有新鲜 POSE，vc 需要显式给 x y，例如: vc 30 0 0 0")
+            return False
+        target_x, target_y = pose[0], pose[1]
+        print(f"  .. 未指定同步坐标，使用当前 POSE: x={target_x:.4f}m y={target_y:.4f}m")
+    return timed(
+        f"VISION_CORRECT dx={dx_mm:.1f}mm dy={dy_mm:.1f}mm sync=({target_x:.3f},{target_y:.3f})",
+        lambda: comm.vision_correct(dx_mm, dy_mm, target_x, target_y, timeout=5.0),
+    )
+
+
 def do_all() -> bool:
     steps = [
         ("第1步: 坐标重置",            lambda: do_sync(0.0, 0.0)),
@@ -177,6 +205,8 @@ HELP = """命令:
     s <x> <y>          重置坐标
     p                  打印当前位姿
     n <f|b|l|r|s>      视觉微调 (f=前 b=后 l=左 r=右 s=停止+锁死)
+    fm <dx> <dy>       诊断 FINE_MOVE 偏移(mm), 例: fm 30 0
+    vc <dx> <dy> [x y] 诊断 VISION_CORRECT 偏移(mm), 可选同步坐标(m)
     all                综合测试
     q                  退出"""
 
@@ -268,6 +298,20 @@ def main():
                         print("用法: n <f|b|l|r|s>  (f=前进 b=后退 l=左 r=右 s=停止+锁死)")
                         continue
                     do_nudge(parts[1])
+                elif cmd == "fm":
+                    if len(parts) < 3:
+                        print("用法: fm <dx_mm> <dy_mm>  例: fm 30 0")
+                        continue
+                    do_fine_move(float(parts[1]), float(parts[2]))
+                elif cmd == "vc":
+                    if len(parts) not in (3, 5):
+                        print("用法: vc <dx_mm> <dy_mm> [target_x_m target_y_m]  例: vc 30 0 或 vc 30 0 0.5 0.3")
+                        continue
+                    if len(parts) == 5:
+                        do_vision_correct(float(parts[1]), float(parts[2]),
+                                          float(parts[3]), float(parts[4]))
+                    else:
+                        do_vision_correct(float(parts[1]), float(parts[2]))
                 elif cmd == "all":
                     do_all()
                 else:

@@ -17,6 +17,7 @@ MCU 侧内置了:
     {"cmd": "turnto", "yaw": 90.0}
     {"cmd": "goto", "x": 1.0, "y": 0.5}
     {"cmd": "arc", "r": 0.5, "dir": 1, "sweep": 180.0}   # dir: 1=右转 -1=左转, sweep=扫过角度°, 可选 "v": 速度m/s
+    {"cmd": "path", "points": [(0.2, 0.0), (0.4, 0.2)], "speed": 0.3, "final_yaw": 90.0}
     {"cmd": "sync", "x": 0.0, "y": 0.0}
     {"cmd": "fine", "dx": 5.0, "dy": -3.0}
     可选字段: "vision": True (段后暂停视觉纠偏), "label": "段1: HOME→(0,295)"
@@ -115,9 +116,9 @@ class PathRunner:
             label = cmd.get("label", f"seg {i}")
             log.info("[%d/%d] %s", i + 1, len(commands), label)
 
-            # 选择超时: arc 段给更多时间
+            # 选择超时: arc/path 段给更多时间
             timeout = self._seg_timeout
-            if cmd["cmd"] == "arc":
+            if cmd["cmd"] in ("arc", "path"):
                 timeout = max(timeout, 60.0)
 
             ok = self._execute_one(cmd, timeout)
@@ -179,6 +180,12 @@ class PathRunner:
             elif c == "arc":
                 self._ser.send_arc(cmd["r"], cmd["dir"], cmd["sweep"],
                                    cmd.get("v"))
+            elif c == "path":
+                return self._ser.path(cmd["points"],
+                                      speed=cmd.get("speed", 0.30),
+                                      timeout=cmd.get("timeout"),
+                                      prepend_current=cmd.get("prepend_current", True),
+                                      final_yaw=cmd.get("final_yaw"))
             elif c == "sync":
                 self._ser.send_sync_pose(cmd["x"], cmd["y"])
             elif c == "fine":
@@ -268,6 +275,9 @@ class _FakeSerial:
     def send_goto(self, x, y):  self.sent.append(("goto", x, y))
     def send_arc(self, r, dir_, sweep, speed=None):
         self.sent.append(("arc", r, dir_, sweep, speed))
+    def path(self, points, speed=0.30, timeout=None, prepend_current=True, final_yaw=None):
+        self.sent.append(("path", points, speed, timeout, prepend_current, final_yaw))
+        return self._ok
     def send_sync_pose(self, x, y):
         self.sent.append(("sync", x, y))
     def send_fine_move(self, dx, dy):
@@ -299,7 +309,7 @@ def _self_check() -> None:
     assert fake.sent[0] == ("tox", 0.295)
     assert fake.sent[1] == ("toy", -0.662)
     assert fake.sent[2] == ("turnto", 90.0)
-    print("  [1/4] basic command sequence OK")
+    print("  [1/5] basic command sequence OK")
 
     # 2. 圆弧命令 (新语义: 半径/方向/扫角)
     fake.sent.clear()
@@ -308,7 +318,19 @@ def _self_check() -> None:
     assert ok
     assert fake.sent[0][0] == "arc"
     assert abs(fake.sent[0][1] - 0.949) < 0.001
-    print("  [2/4] arc command OK")
+    print("  [2/5] arc command OK")
+
+    # 2.1 连续路径命令: 交给 comm.path() 一次性装载并等待 PATH_RESP
+    fake.sent.clear()
+    path_cmd = {"cmd": "path", "points": [(0.2, 0.0), (0.4, 0.2)],
+                "speed": 0.3, "final_yaw": 90.0, "label": "path1"}
+    ok = runner.run([path_cmd])
+    assert ok
+    assert fake.sent[0][0] == "path"
+    assert fake.sent[0][1] == path_cmd["points"]
+    assert abs(fake.sent[0][2] - 0.3) < 0.001
+    assert fake.sent[0][5] == 90.0
+    print("  [3/5] continuous path command OK")
 
     # 3. 超时处理
     fake2 = _FakeSerial(always_ok=False)  # 永远返回 None (模拟超时)
@@ -318,7 +340,7 @@ def _self_check() -> None:
     runner2.on(EV_TIMEOUT, lambda **kw: None)
     ok = runner2.run([{"cmd": "tox", "x": 1.0}])
     assert not ok, "run should fail on timeout"
-    print("  [3/4] timeout handling OK")
+    print("  [4/5] timeout handling OK")
 
     # 4. 取消 (run 完成后 cancel, 验证 idle 状态)
     fake3 = _FakeSerial(always_ok=True)
@@ -328,9 +350,9 @@ def _self_check() -> None:
     assert ok, "first run should succeed"
     runner3.cancel()  # cancel after completion
     assert runner3.is_idle(), "should be idle after cancel"
-    print("  [4/4] cancel/idle OK")
+    print("  [5/5] cancel/idle OK")
 
-    print("self-check OK — all 4 tests passed")
+    print("self-check OK — all 5 tests passed")
 
 
 if __name__ == "__main__":

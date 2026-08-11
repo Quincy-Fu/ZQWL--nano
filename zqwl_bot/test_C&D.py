@@ -13,10 +13,10 @@ import qr1, block
 
 # ============== 配置 ==============
 ARC_SPEED_MM_S = 200
+PATH_SPEED_M_S = 0.30
 AFTER_RECOGNIZE_DELAY_S = 1.0
 HEADING_D = 180
 BACKUP_M = 0.05
-SPLIT_THRESHOLD = 0.03
 
 _CUR_X, _CUR_Y = 0.0, 0.0
 
@@ -56,33 +56,28 @@ def _timed(label, func, *args, **kwargs):
     return result
 
 
-def go_to(x, y, x_first=False):
+def path_to(x, y, final_yaw=None, speed=PATH_SPEED_M_S):
+    """连续路径走到终点；中间不拆段、不停顿，终点可要求角度。"""
     global _CUR_X, _CUR_Y
-    print(f"  GOTO ({x:.4f}, {y:.4f})")
-    dx = abs(x - _CUR_X)
-    dy = abs(y - _CUR_Y)
-    if dx > SPLIT_THRESHOLD and dy > SPLIT_THRESHOLD:
-        if x_first:
-            print(f"    -> 拆段: ({x:.4f}, {_CUR_Y:.4f}) -> ({x:.4f}, {y:.4f})")
-            ok = _timed(f"GOTO seg1 ({x:.4f}, {_CUR_Y:.4f})", comm.goto, x, _CUR_Y, timeout=40.0)
-            if not ok:
-                return ok
-            ok = _timed(f"GOTO seg2 ({x:.4f}, {y:.4f})", comm.goto, x, y, timeout=40.0)
-        else:
-            print(f"    -> 拆段: ({_CUR_X:.4f}, {y:.4f}) -> ({x:.4f}, {y:.4f})")
-            ok = _timed(f"GOTO seg1 ({_CUR_X:.4f}, {y:.4f})", comm.goto, _CUR_X, y, timeout=40.0)
-            if not ok:
-                return ok
-            ok = _timed(f"GOTO seg2 ({x:.4f}, {y:.4f})", comm.goto, x, y, timeout=40.0)
+    if final_yaw is None:
+        print(f"  PATH ({_CUR_X:.4f}, {_CUR_Y:.4f}) -> ({x:.4f}, {y:.4f})")
+        label = f"PATH ({x:.4f}, {y:.4f})"
     else:
-        ok = _timed(f"GOTO direct ({x:.4f}, {y:.4f})", comm.goto, x, y, timeout=40.0)
+        print(
+            f"  PATH ({_CUR_X:.4f}, {_CUR_Y:.4f}) -> "
+            f"({x:.4f}, {y:.4f}), final_yaw={final_yaw:.1f}°"
+        )
+        label = f"PATH ({x:.4f}, {y:.4f}) yaw={final_yaw:.1f}"
+    ok = _timed(
+        label,
+        comm.path,
+        [(x, y)],
+        speed=speed,
+        final_yaw=final_yaw,
+    )
     if ok:
         _update_cur(x, y)
     return ok
-
-def turn_to(deg):
-    print(f"  TURNTO {deg:.1f}° (车体)")
-    return _timed(f"TURNTO {deg:.1f}", comm.turnto, deg, timeout=30.0)
 
 def rotate(pos):
     print(f"  ROTATE {pos}")
@@ -107,16 +102,13 @@ def arc_with_waypoints(r, dir_, sweep_deg, on_waypoints):
 
 
 def place_and_backup(x, y, rotate_pos, heading=HEADING_D, backup=BACKUP_M):
-    global _CUR_X, _CUR_Y
-    turn_to(heading)
-    go_to(x, y)
-    comm.rotate(rotate_pos, timeout=12.0)
+    path_to(x, y, final_yaw=heading)
+    rotate(rotate_pos)
     rad = math.radians(heading)
     bx = x - backup * math.sin(rad)
     by = y - backup * math.cos(rad)
     print(f"  后移到 ({bx:.4f}, {by:.4f})")
-    comm.goto(bx, by, timeout=10.0)
-    _CUR_X, _CUR_Y = bx, by
+    path_to(bx, by, final_yaw=heading)
 
 def arm(state):
     print(f"  ARM {state}")
@@ -126,17 +118,15 @@ def run_task_c():
     print("\n=== 阶段 C: 走弧 + 颜色识别 ===")
 
     # 14
-    turn_to(90)
-    go_to(-0.66158, 0.29568)
+    path_to(-0.66158, 0.29568, final_yaw=90)
 
     # 15. QR1
     seq1 = _timed("QR1 recognize", qr1.recognize)
     color_seq = qr1.TASK1_PLANS[seq1]
     print(f"  QR1: {seq1} -> {color_seq}")
 
-    # 16. ★ 恢复原版 go_to(-0.6, 0.2), 不要改成 -0.66158
-    go_to(-0.6, 0.2)
-    turn_to(-89)
+    # 16. 恢复原版起点 (-0.6, 0.2)，但用连续 path 到位并转向
+    path_to(-0.6, 0.2, final_yaw=-89)
     arm(1)
 
     # 17
@@ -206,8 +196,7 @@ def run_task_c():
     print("  ARM 0")
     comm.send_arm(0)
     time.sleep(0.05)
-    go_to(0, 0, x_first=True)
-    turn_to(0)
+    path_to(0, 0, final_yaw=0)
 
 
 def main():

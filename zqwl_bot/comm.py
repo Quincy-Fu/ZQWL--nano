@@ -415,7 +415,7 @@ class SerialComm:
         """圆弧 (新语义, 从当前位姿出发, 圆心由 MCU 自动算).
 
         radius: 半径 m; dir: +1=右转 / -1=左转; sweep_deg: 扫过角度(度).
-        speed: 可选线速度 m/s (缺省 0.10). 车头始终沿切线朝前, 不会原地打转.
+        speed: 可选线速度 m/s; None 时使用下位机 MOVE_ARC_SPEED. 车头始终沿切线朝前, 不会原地打转.
         例: 机器人在 (0,0) 朝向0, arc(0.5, +1, 180) → 右转半圆到 (1,0), 朝向180.
         timeout=None 时按弧长自动估算 (2.5倍裕量 + 15s 基底).
 
@@ -423,7 +423,7 @@ class SerialComm:
             True = 圆弧走完; 超时/失败返回 False.
         """
         if timeout is None:
-            v = speed if speed is not None else 0.10
+            v = speed if speed is not None else 0.30
             arclen = abs(sweep_deg) * math.pi / 180.0 * radius
             timeout = arclen / v * 2.5 + 15.0
         self.send_arc(radius, dir, sweep_deg, speed)
