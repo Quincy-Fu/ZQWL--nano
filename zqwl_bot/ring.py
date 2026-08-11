@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""黑色圆环识别 + 一次性对齐 (自愈版: comm 死了自动重启)"""
+"""
+ring.py - 黑色圆环识别 + 3步对齐 (模块化, 给 main 控制器用)
+
+main 里用法:
+    import comm
+    import ring
+    comm.init("/dev/ttyCH341USB0", 115200)
+    ring.align_to_ring()          # 3 步: 对准 → +100mm → 退后 500px
+    ring.close()                  # 退出时
+"""
+
 import cv2
 import numpy as np
 import time
@@ -20,8 +30,8 @@ CONFIG = {
     "min_eccentricity": 0.4,
     "min_contour_points": 5,
 
-    "ring_actual_radius_m": 0.025,
-    "calib_step": 0.005,
+    "ring_actual_radius_m": 0.075,
+    "calib_step": 0.0,
 
     "detect_frames": 5,
     "detect_min_hits": 2,
@@ -30,16 +40,20 @@ CONFIG = {
     "consistency_max_diff": 80,
     "last_known_max_age_s": 3.0,
 
-    "dead_zone_px": 10,
+    "dead_zone_px": 0,
     "correct_timeout_s": 20.0,
 
     "pre_cmd_sleep_s": 0.3,
     "comm_port": "/dev/ttyCH341USB0",
     "comm_baud": 115200,
 
-    # 自愈参数
-    "recover_pose_age_max": 1.0,     # POSE 帧超过这秒数没更新就认为死了
-    "recover_max_retry": 3,          # 自愈重试次数
+    "recover_pose_age_max": 1.0,
+    "recover_max_retry": 3,
+
+    "step1_to_step2_pause_s": 2.0,
+    "post_align_offset_y_mm": 100,
+    "step2_to_step3_pause_s": 2.0,
+    "step3_back_offset_px": 500,
 }
 
 
@@ -196,9 +210,8 @@ def detect():
     return result
 
 
-# ============ ★ 自愈: comm 死了自动重启 ============
+# ============ 自愈 ============
 def _is_comm_alive():
-    """检查 comm 是否活着: POSE 帧有更新 + 能拿到"""
     try:
         pose = comm.get_pose(max_age=CONFIG["recover_pose_age_max"])
         return pose is not None
@@ -207,29 +220,16 @@ def _is_comm_alive():
 
 
 def _recover_comm(verbose=True):
-    """
-    ★ 自动恢复 comm:
-    1. comm.shutdown() 关
-    2. 等 0.5s
-    3. comm.init() 重开
-    4. 等 1s
-    5. comm.run() 发启动脉冲 (PD15 500ms) - 等于按物理 RUN 键
-    6. 等 1s
-    7. 检查 POSE 帧是否恢复
-    """
     if verbose:
         print("  [recover] 关闭 comm...")
-
     try:
         comm.shutdown()
-    except Exception as e:
-        if verbose:
-            print(f"  [recover] shutdown err: {e}")
+    except:
+        pass
     time.sleep(0.5)
 
     if verbose:
         print("  [recover] 重开 comm...")
-
     try:
         comm.init(CONFIG["comm_port"], CONFIG["comm_baud"])
     except Exception as e:
@@ -240,95 +240,92 @@ def _recover_comm(verbose=True):
 
     if verbose:
         print("  [recover] 发启动脉冲...")
-
     try:
         comm.run(5.0)
-    except Exception as e:
-        if verbose:
-            print(f"  [recover] run err: {e}")
+    except:
+        pass
     time.sleep(1.0)
-
-    if verbose:
-        print("  [recover] 检查 POSE 帧...")
 
     for i in range(5):
         if _is_comm_alive():
             if verbose:
-                print(f"  [recover] 恢复成功 (尝试 {i+1}/5)")
+                print(f"  [recover] 恢复成功 ({i+1}/5)")
             return True
         time.sleep(0.3)
 
-    if verbose:
-        print("  [recover] 失败, POSE 帧没恢复")
     return False
 
 
 def ensure_comm_alive(verbose=True):
-    """确保 comm 活着, 死了就自动恢复"""
     if _is_comm_alive():
         return True
-
     if verbose:
         print("  [comm 死了, 自动恢复]")
-
     for attempt in range(CONFIG["recover_max_retry"]):
         if verbose:
-            print(f"  [恢复尝试 {attempt+1}/{CONFIG['recover_max_retry']}]")
+            print(f"  [恢复 {attempt+1}/{CONFIG['recover_max_retry']}]")
         if _recover_comm(verbose=verbose):
             return True
         time.sleep(1.0)
-
     return False
 
 
-# ============ safe_goto 带重试 ============
 def _safe_goto(target_x, target_y, timeout=20.0, max_retry=2):
-    """comm.goto 带重试, 失败时尝试 comm 重连"""
     for attempt in range(max_retry):
         try:
             ok = comm.goto(target_x, target_y, timeout=timeout)
             if ok:
                 return True
         except Exception as e:
-            print(f"  [goto attempt {attempt+1}] err: {e}")
+            print(f"  [goto {attempt+1}] err: {e}")
         time.sleep(0.3)
 
-    # 失败, 自动恢复
-    print("  [goto] 失败, 自动恢复 comm...")
     if not ensure_comm_alive(verbose=True):
         return False
     time.sleep(0.5)
 
     try:
-        ok = comm.goto(target_x, target_y, timeout=timeout)
-        return ok
+        return comm.goto(target_x, target_y, timeout=timeout)
     except Exception as e:
         print(f"  [goto] 恢复后仍失败: {e}")
         return False
 
 
-# ============ 对齐 ============
-def align_to_ring(verbose=True):
-    # ★ 1. 自检 comm, 死了自动恢复
-    if not ensure_comm_alive(verbose=verbose):
+def _wait(seconds, label, verbose=True):
+    if verbose:
+        print(f"  === {label} (等 {seconds}s) ===")
+    for i in range(int(seconds)):
+        time.sleep(1.0)
         if verbose:
-            print("  [FAIL] comm 没救活, 放弃")
+            remaining = int(seconds) - i - 1
+            print(f"  等待中... 剩余 {remaining} 秒")
+
+
+# ============ ★ 公共 API: 3 步对齐 ============
+def align_to_ring(verbose=True):
+    """
+    3 步对齐流程:
+      1. 检测圆环, 一次性 goto 对准画面中心
+      2. 等 2 秒, y +100mm
+      3. 等 2 秒, 退后 500 像素
+
+    返回 True=全部成功, False=某步失败
+    """
+    if not ensure_comm_alive(verbose=verbose):
         return False
 
-    # 发命令前等
     time.sleep(CONFIG["pre_cmd_sleep_s"])
 
-    # ★ 2. 找圆环, 失败也试着重连
     result = detect()
     if result is None:
         if verbose:
-            print("  [圆环没找到, 试着重连再找]")
+            print("  [圆环没找到, 试着重连]")
         if not ensure_comm_alive(verbose=False):
             return False
         result = detect()
         if result is None:
             if verbose:
-                print("  [FAIL] 重连后还没找到圆环")
+                print("  [FAIL] 没找到圆环")
             return False
 
     h, w = CONFIG["height"], CONFIG["width"]
@@ -343,136 +340,85 @@ def align_to_ring(verbose=True):
         print(f"  ring radius = {r_px} px")
         print(f"  像素偏差    = dx {dx_px:+d} px, dy {dy_px:+d} px")
 
-    if abs(dx_px) < CONFIG["dead_zone_px"] and \
-       abs(dy_px) < CONFIG["dead_zone_px"]:
-        if verbose:
-            print(f"  [OK] 已在死区内 ({CONFIG['dead_zone_px']}px), 不动")
-        return True
-
     if r_px <= 0:
         return False
 
     k_m_per_px = CONFIG["ring_actual_radius_m"] / r_px
     k_mm_per_px = k_m_per_px * 1000
 
-    # ★ x 取反, y 不取反
+    # === 步骤 1: 对准 ===
     dx_mm = -dx_px * k_mm_per_px
     dy_mm = dy_px * k_mm_per_px
     dx_m = dx_mm / 1000.0
-    dy_m = dy_mm / 1000.0
-
-    if verbose:
-        print(f"  标定系数    = {k_mm_per_px:.3f} mm/px "
-              f"(calib={CONFIG['ring_actual_radius_m']*1000:.1f}mm)")
-        print(f"  实际移动    = dx {dx_mm:+.1f} mm, dy {dy_mm:+.1f} mm")
+    dy_m_align = dy_mm / 1000.0
 
     pose = comm.get_pose(max_age=1.0)
     if pose is None:
         if verbose:
-            print("  [FAIL] 没拿到当前位姿 (comm 又死了?)")
+            print("  [FAIL] 没拿到位姿")
         return False
 
     x_now, y_now, _ = pose
-    target_x = x_now + dx_m
-    target_y = y_now + dy_m
+    target_x_align = x_now + dx_m
+    target_y_align = y_now + dy_m_align
 
     if verbose:
-        print(f"  当前位置    = ({x_now:.3f}, {y_now:.3f}) m")
-        print(f"  目标位置    = ({target_x:.3f}, {target_y:.3f}) m")
+        print(f"\n  === 步骤 1: 对准 ===")
+        print(f"  标定系数    = {k_mm_per_px:.3f} mm/px (calib=75mm)")
+        print(f"  移动        = dx {dx_mm:+.1f} mm, dy {dy_mm:+.1f} mm")
+        print(f"  目标位置    = ({target_x_align:.3f}, {target_y_align:.3f}) m")
 
-    ok = _safe_goto(target_x, target_y, timeout=CONFIG["correct_timeout_s"])
+    ok = _safe_goto(target_x_align, target_y_align,
+                    timeout=CONFIG["correct_timeout_s"])
+    if not ok:
+        if verbose:
+            print("  [step 1] FAIL")
+        return False
     if verbose:
-        print(f"  [align] {'OK' if ok else 'FAIL'}")
+        print(f"  [step 1] OK")
+
+    # === 等 1→2 ===
+    _wait(CONFIG["step1_to_step2_pause_s"], "步骤1→2 等待", verbose)
+
+    # === 步骤 2: y +100mm ===
+    target_y_step2 = target_y_align + CONFIG["post_align_offset_y_mm"] / 1000.0
+
+    if verbose:
+        print(f"\n  === 步骤 2: y +{CONFIG['post_align_offset_y_mm']}mm ===")
+        print(f"  目标位置    = ({target_x_align:.3f}, {target_y_step2:.3f}) m")
+
+    time.sleep(CONFIG["pre_cmd_sleep_s"])
+    ok = _safe_goto(target_x_align, target_y_step2,
+                    timeout=CONFIG["correct_timeout_s"])
+    if not ok:
+        if verbose:
+            print("  [step 2] FAIL")
+        return False
+    if verbose:
+        print(f"  [step 2] OK")
+
+    # === 等 2→3 ===
+    _wait(CONFIG["step2_to_step3_pause_s"], "步骤2→3 等待", verbose)
+
+    # === 步骤 3: 退后 500 像素 ===
+    back_offset_mm = CONFIG["step3_back_offset_px"] * k_mm_per_px
+    target_y_step3 = target_y_step2 - back_offset_mm / 1000.0
+
+    if verbose:
+        print(f"\n  === 步骤 3: 退后 {CONFIG['step3_back_offset_px']} 像素 ===")
+        print(f"  {CONFIG['step3_back_offset_px']}px 实际  = {back_offset_mm:.1f} mm")
+        print(f"  目标位置    = ({target_x_align:.3f}, {target_y_step3:.3f}) m")
+
+    time.sleep(CONFIG["pre_cmd_sleep_s"])
+    ok = _safe_goto(target_x_align, target_y_step3,
+                    timeout=CONFIG["correct_timeout_s"])
+    if verbose:
+        print(f"  [step 3] {'OK' if ok else 'FAIL'}")
     return ok
 
 
-# ============ 重连（手动） ============
-def reconnect():
-    print("[manual reconnect]")
-    _recover_comm(verbose=True)
-
-
 def close():
+    """关闭摄像头 (main 退出时调用)"""
     if _cam_cache["cam"] is not None:
         _cam_cache["cam"].stop()
         _cam_cache["cam"] = None
-
-
-# ============ 主循环 ============
-def main():
-    print("=" * 50)
-    print("Black ring one-shot align (auto-recover)")
-    print("=" * 50)
-    print("q=quit  a=align  +/-=calib  r=manual reconnect")
-
-    comm.init(CONFIG["comm_port"], CONFIG["comm_baud"])
-    time.sleep(1.0)
-
-    cam = _get_cam()
-    cv2.namedWindow("Ring", cv2.WINDOW_NORMAL)
-
-    try:
-        while True:
-            frame = cam.read()
-            if frame is None:
-                continue
-
-            result = find_ring_center(frame)
-            display = frame.copy()
-            h, w = frame.shape[:2]
-
-            cv2.line(display, (w//2 - 30, h//2), (w//2 + 30, h//2),
-                    (0, 255, 255), 1)
-            cv2.line(display, (w//2, h//2 - 30), (w//2, h//2 + 30),
-                    (0, 255, 255), 1)
-
-            if result:
-                cx, cy, r, area, major, minor, ecc = result
-                cv2.ellipse(display, (cx, cy), (major // 2, minor // 2),
-                           0, 0, 360, (0, 255, 0), 2)
-                cv2.circle(display, (cx, cy), 3, (0, 0, 255), -1)
-                dx = cx - w // 2
-                dy = cy - h // 2
-                cv2.putText(display,
-                           f"({cx},{cy}) r={r}  dx={dx:+d} dy={dy:+d}",
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                           (0, 255, 0), 2)
-            else:
-                cv2.putText(display, "NO RING", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-            cv2.putText(display, "q=quit  a=align  +/-=calib  r=reconnect",
-                       (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                       (255, 255, 0), 1)
-
-            cv2.imshow("Ring", display)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('a'):
-                print("\n[align one-shot]")
-                align_to_ring(verbose=True)
-                print()
-            elif key in (ord('+'), ord('=')):
-                CONFIG["ring_actual_radius_m"] += CONFIG["calib_step"]
-                print(f"  calib radius = {CONFIG['ring_actual_radius_m']*1000:.1f}mm")
-            elif key in (ord('-'), ord('_')):
-                CONFIG["ring_actual_radius_m"] = max(0.005,
-                    CONFIG["ring_actual_radius_m"] - CONFIG["calib_step"])
-                print(f"  calib radius = {CONFIG['ring_actual_radius_m']*1000:.1f}mm")
-            elif key == ord('r'):
-                reconnect()
-
-    except KeyboardInterrupt:
-        pass
-    finally:
-        close()
-        cv2.destroyAllWindows()
-        try:
-            comm.shutdown()
-        except:
-            pass
-
-
-if __name__ == "__main__":
-    main()

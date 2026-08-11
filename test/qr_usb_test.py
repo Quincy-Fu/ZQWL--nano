@@ -13,7 +13,7 @@ if __name__ == "__main__":
     detect_cameras()
 
     cap = None
-    for device in (0, 1):
+    for device in (0,1):
         candidate = cv2.VideoCapture(device, cv2.CAP_V4L2)
         if candidate.isOpened():
             cap = candidate
