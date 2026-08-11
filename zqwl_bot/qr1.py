@@ -186,7 +186,7 @@ def _set_light(light_id: int, on: bool) -> None:
         pass
 
 
-def recognize(timeout: float = 3.0) -> str:
+def recognize(timeout: float = 10.0) -> str:
     """识别数字 1-16, 扫到合法内容立刻返回. 超时抛 RuntimeError.
 
     返回: "1" 到 "16" 字符串

@@ -156,7 +156,7 @@ def run_task_c():
     start_c = (-0.66158, 0.12996)
     end_c = (-0.63203, 2.02231)
     center_c = (-0.575, 1.055)
-    r = 0.924
+    r = 0.930
 
     sweep_c = arc_sweep(start_c, end_c, center_c, ccw=False)  # 顺时针
     print(f"  走顺时针圆弧, sweep={sweep_c:.1f}°")

@@ -1,917 +1,478 @@
-"""USB camera based concentric-ring localization.
-
-The innermost circle is a 50 mm reference.  Its fitted ellipse provides a
-per-frame local pixel-to-millimetre scale, so camera height changes do not
-require a fixed ``px_per_mm`` value.  This module only measures offsets; it
-does not send motion commands.
-
-Coordinate layers:
-    pixel_offset_px: image coordinates, +u right and +v down
-    image_offset_mm: perspective-scaled image coordinates
-    body_offset_mm:  image_offset_mm after the configurable camera-to-body map
-
-Keep ``direction_calibrated`` false until the body-axis signs/swaps have been
-verified on the real vehicle.  ``RingOffset.body_correction_mm()`` deliberately
-refuses to return a command while that flag is false.
-"""
-
-from __future__ import annotations
-
-import math
-import statistics
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""黑色圆环识别 + 一次性对齐 (自愈版: comm 死了自动重启)"""
+import cv2
+import numpy as np
 import time
-from collections import deque
-from dataclasses import dataclass
-
-try:
-    import cv2
-    import numpy as np
-except ImportError:  # Pure geometry helpers remain testable without OpenCV.
-    cv2 = None
-    np = None
+import comm
 
 
 CONFIG = {
-    # USB enumeration may change between boots when the CSI camera is present.
-    # Try both device indices in priority order.
-    "usb_devices": (0, 1),
+    "usb_device": 1,
     "width": 640,
     "height": 480,
     "fps": 30,
 
-    # Known printed ring diameters, ordered from inner to outer.
-    "inner_circle_diameter_mm": 50.0,
-    "ring_diameters_mm": (50.0, 90.0, 130.0, 170.0, 210.0),
-    "max_diameter_match_error": 0.12,
-    "black_v_max": 100,
-    "black_s_max": 255,
-    "search_radius_fraction": 1.0,
-    "min_contour_area": 60.0,
-    "min_axis_px": 20.0,
-    "max_axis_fraction": 2.20,
-    "max_axis_ratio": 3.0,
-    "max_ellipse_error": 0.25,
-    "center_tolerance_px": 20.0,
-    "min_concentric_contours": 2,
-    "max_stroke_pair_ratio": 1.20,
-    "morph_open_size": 1,
-    "morph_close_size": 3,
-    "min_arc_coverage": 0.22,
-    "single_candidate_min_coverage": 0.45,
-    "single_arc_max_coverage": 0.85,
-    "single_arc_min_axis_fraction": 0.25,
+    "black_thresh": 140,
+    "min_area": 2000,
+    "max_area": 200000,
+    "min_circularity": 0.6,
+    "min_eccentricity": 0.4,
+    "min_contour_points": 5,
 
-    # A result is returned only after a stable sliding window is available.
-    "stable_frames": 7,
-    "max_center_mad_px": 2.5,
-    "max_scale_rel_mad": 0.08,
-    "frame_interval_s": 0.03,
+    "ring_actual_radius_m": 0.025,
+    "calib_step": 0.005,
 
-    # Applied after perspective scaling. Test and update this 2x2 matrix.
-    # Default: image-right -> body +X, image-down -> body +Y.
-    "camera_to_body": ((1.0, 0.0), (0.0, 1.0)),
-    "direction_calibrated": False,
-    "deadband_mm": 2.0,
-    "max_correction_mm": 150.0,
-    "debug_window_name": "Ring Debug",
+    "detect_frames": 5,
+    "detect_min_hits": 2,
+    "detect_timeout_s": 1.5,
+    "otsu_smooth_n": 3,
+    "consistency_max_diff": 80,
+    "last_known_max_age_s": 3.0,
+
+    "dead_zone_px": 10,
+    "correct_timeout_s": 20.0,
+
+    "pre_cmd_sleep_s": 0.3,
+    "comm_port": "/dev/ttyCH341USB0",
+    "comm_baud": 115200,
+
+    # 自愈参数
+    "recover_pose_age_max": 1.0,     # POSE 帧超过这秒数没更新就认为死了
+    "recover_max_retry": 3,          # 自愈重试次数
 }
 
 
-@dataclass(frozen=True)
-class EllipseObservation:
-    center_px: tuple[float, float]
-    major_axis_px: float
-    minor_axis_px: float
-    major_angle_deg: float
-    fit_error: float
-    support_ratio: float = 1.0
+# ============ 摄像头 ============
+class USBCamera:
+    def __init__(self, device=1, width=640, height=480, fps=30):
+        self.device = device
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.cap = None
 
+    def start(self):
+        self.cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if not self.cap.isOpened():
+            raise RuntimeError("无法打开USB摄像头")
 
-@dataclass(frozen=True)
-class RingSelection:
-    ellipse: EllipseObservation
-    center_px: tuple[float, float]
-    contour_count: int
-    confidence: float
-    diameter_mm: float
-    diameter_index: int
-
-
-@dataclass(frozen=True)
-class RingOffset:
-    center_px: tuple[float, float]
-    reference_px: tuple[float, float]
-    pixel_offset_px: tuple[float, float]
-    image_offset_mm: tuple[float, float]
-    body_offset_mm: tuple[float, float]
-    inner_axes_px: tuple[float, float]
-    major_angle_deg: float
-    scale_mm_per_px: tuple[float, float]
-    concentric_contours: int
-    confidence: float
-    samples: int
-    direction_calibrated: bool
-    deadband_mm: float
-    max_correction_mm: float
-    selected_diameter_mm: float = 50.0
-    selected_ring_index: int = 0
-
-    @property
-    def aligned(self) -> bool:
-        return math.hypot(*self.body_offset_mm) <= self.deadband_mm
-
-    def body_correction_mm(self) -> tuple[float, float]:
-        """Return a safe-to-send body offset after direction calibration."""
-        if not self.direction_calibrated:
-            raise RuntimeError(
-                "Ring: direction is not calibrated; set CONFIG['camera_to_body'] "
-                "and CONFIG['direction_calibrated'] first"
-            )
-        if math.hypot(*self.body_offset_mm) > self.max_correction_mm:
-            raise RuntimeError(
-                f"Ring: correction {self.body_offset_mm!r} mm exceeds "
-                f"{self.max_correction_mm:.1f} mm safety limit"
-            )
-        return self.body_offset_mm
-
-    def world_correction_mm(self, yaw_deg: float) -> tuple[float, float]:
-        """Convert the calibrated body offset to the STM32 field frame.
-
-        The project convention is +X right, +Y forward, yaw clockwise from
-        forward.  STM32 ``fine_move``/``vision_correct`` consume field-frame
-        dx/dy, not body-frame dx/dy.
-        """
-        bx, by = self.body_correction_mm()
-        yaw = float(yaw_deg)
-        if not math.isfinite(yaw):
-            raise ValueError("yaw_deg must be finite")
-        angle = math.radians(yaw)
-        c, s = math.cos(angle), math.sin(angle)
-        return c * bx + s * by, -s * bx + c * by
-
-
-def _require_vision_dependencies() -> None:
-    if cv2 is None or np is None:
-        raise RuntimeError("Ring: OpenCV and NumPy are required for camera detection")
-
-
-def _configured_ring_diameters_mm() -> tuple[float, ...]:
-    raw = CONFIG.get("ring_diameters_mm") or (CONFIG["inner_circle_diameter_mm"],)
-    diameters = tuple(float(value) for value in raw)
-    if not diameters or any(value <= 0 or not math.isfinite(value) for value in diameters):
-        raise ValueError("CONFIG['ring_diameters_mm'] must contain positive numbers")
-    return tuple(sorted(diameters))
-
-
-def _open_usb():
-    _require_vision_dependencies()
-    devices = tuple(dict.fromkeys(int(item) for item in CONFIG["usb_devices"]))
-    if not devices:
-        raise ValueError("CONFIG['usb_devices'] must contain at least one device index")
-
-    for device in devices:
-        cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CONFIG["width"])
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CONFIG["height"])
-        cap.set(cv2.CAP_PROP_FPS, CONFIG["fps"])
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if cap.isOpened():
-            return cap
-        cap.release()
-
-    attempted = ", ".join(str(device) for device in devices)
-    raise RuntimeError(f"Ring: USB camera open failed (tried devices {attempted})")
-
-
-def _normalise_ellipse(raw_ellipse) -> EllipseObservation:
-    (cx, cy), (axis_a, axis_b), angle = raw_ellipse
-    if axis_a >= axis_b:
-        major, minor = float(axis_a), float(axis_b)
-        major_angle = float(angle) % 180.0
-    else:
-        major, minor = float(axis_b), float(axis_a)
-        major_angle = (float(angle) + 90.0) % 180.0
-    return EllipseObservation(
-        center_px=(float(cx), float(cy)),
-        major_axis_px=major,
-        minor_axis_px=minor,
-        major_angle_deg=major_angle,
-        fit_error=0.0,
-    )
-
-
-def _ellipse_fit_error(contour, ellipse: EllipseObservation) -> float:
-    """Median normalized radial error between a contour and its fitted ellipse."""
-    points = contour.reshape(-1, 2).astype(np.float64)
-    dx = points[:, 0] - ellipse.center_px[0]
-    dy = points[:, 1] - ellipse.center_px[1]
-    angle = math.radians(ellipse.major_angle_deg)
-    c, s = math.cos(angle), math.sin(angle)
-    along = c * dx + s * dy
-    across = -s * dx + c * dy
-    radius = np.sqrt(
-        (along / (ellipse.major_axis_px * 0.5)) ** 2
-        + (across / (ellipse.minor_axis_px * 0.5)) ** 2
-    )
-    return float(np.median(np.abs(radius - 1.0)))
-
-
-def _ellipse_arc_coverage(contour, ellipse: EllipseObservation) -> float:
-    """Fraction of ellipse angle bins supported by contour points."""
-    points = contour.reshape(-1, 2).astype(np.float64)
-    dx = points[:, 0] - ellipse.center_px[0]
-    dy = points[:, 1] - ellipse.center_px[1]
-    angle = math.radians(ellipse.major_angle_deg)
-    c, s = math.cos(angle), math.sin(angle)
-    along = c * dx + s * dy
-    across = -s * dx + c * dy
-    theta = np.arctan2(
-        across / max(ellipse.minor_axis_px * 0.5, 1e-6),
-        along / max(ellipse.major_axis_px * 0.5, 1e-6),
-    )
-    bins = np.floor(((theta + math.pi) / (2.0 * math.pi)) * 36).astype(np.int32)
-    bins = np.clip(bins, 0, 35)
-    return float(len(set(int(v) for v in bins)) / 36.0)
-
-
-def _black_mask(frame):
-    height, width = frame.shape[:2]
-    reference = (width * 0.5, height * 0.5)
-    search_radius = int(min(width, height) * CONFIG["search_radius_fraction"])
-
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(
-        hsv,
-        np.array([0, 0, 0], dtype=np.uint8),
-        np.array([180, CONFIG["black_s_max"], CONFIG["black_v_max"]], dtype=np.uint8),
-    )
-    roi = np.zeros((height, width), dtype=np.uint8)
-    cv2.circle(roi, (round(reference[0]), round(reference[1])), search_radius, 255, -1)
-    mask = cv2.bitwise_and(mask, roi)
-    open_size = max(1, int(CONFIG["morph_open_size"]))
-    if open_size % 2 == 0:
-        open_size += 1
-    if open_size > 1:
-        mask = cv2.morphologyEx(
-            mask, cv2.MORPH_OPEN, np.ones((open_size, open_size), np.uint8)
-        )
-    close_size = max(1, int(CONFIG["morph_close_size"]))
-    if close_size % 2 == 0:
-        close_size += 1
-    mask = cv2.morphologyEx(
-        mask, cv2.MORPH_CLOSE, np.ones((close_size, close_size), np.uint8)
-    )
-    return mask
-
-
-def _ellipse_candidates(frame, mask=None) -> list[EllipseObservation]:
-    height, width = frame.shape[:2]
-    if mask is None:
-        mask = _black_mask(frame)
-
-    found = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-    contours = found[-2]
-    candidates = []
-    max_axis = min(width, height) * CONFIG["max_axis_fraction"]
-
-    for contour in contours:
-        if len(contour) < 5 or cv2.contourArea(contour) < CONFIG["min_contour_area"]:
-            continue
-        ellipse = _normalise_ellipse(cv2.fitEllipse(contour))
-        if ellipse.minor_axis_px < CONFIG["min_axis_px"]:
-            continue
-        if ellipse.major_axis_px > max_axis:
-            continue
-        if ellipse.major_axis_px / ellipse.minor_axis_px > CONFIG["max_axis_ratio"]:
-            continue
-        error = _ellipse_fit_error(contour, ellipse)
-        if error > CONFIG["max_ellipse_error"]:
-            continue
-        support_ratio = _ellipse_arc_coverage(contour, ellipse)
-        if support_ratio < CONFIG["min_arc_coverage"]:
-            continue
-        candidates.append(
-            EllipseObservation(
-                center_px=ellipse.center_px,
-                major_axis_px=ellipse.major_axis_px,
-                minor_axis_px=ellipse.minor_axis_px,
-                major_angle_deg=ellipse.major_angle_deg,
-                fit_error=error,
-                support_ratio=support_ratio,
-            )
-        )
-    return candidates
-
-
-def _single_candidate_fallback(
-    candidates: list[EllipseObservation], reference_px: tuple[float, float],
-    frame_shape: tuple[int, int] | None = None,
-) -> RingSelection | None:
-    min_support = max(
-        float(CONFIG["min_arc_coverage"]),
-        float(CONFIG["single_candidate_min_coverage"]),
-    )
-    max_support = float(CONFIG["single_arc_max_coverage"])
-    eligible = [
-        item for item in candidates
-        if min_support <= item.support_ratio <= max_support
-    ]
-    if frame_shape is not None:
-        height, width = frame_shape[:2]
-        min_axis = min(height, width) * float(CONFIG["single_arc_min_axis_fraction"])
-        eligible = [item for item in eligible if item.major_axis_px >= min_axis]
-    if not eligible:
-        return None
-    candidate = max(
-        eligible,
-        key=lambda item: (
-            item.major_axis_px + item.minor_axis_px,
-            item.support_ratio,
-            -math.dist(item.center_px, reference_px),
-            -item.fit_error,
-        ),
-    )
-    fit_score = max(0.0, 1.0 - candidate.fit_error / CONFIG["max_ellipse_error"])
-    confidence = min(1.0, candidate.support_ratio) * fit_score * 0.35
-    diameters = _configured_ring_diameters_mm()
-    diameter_index = len(diameters) - 1
-    return RingSelection(
-        ellipse=candidate,
-        center_px=candidate.center_px,
-        contour_count=1,
-        confidence=confidence,
-        diameter_mm=diameters[diameter_index],
-        diameter_index=diameter_index,
-    )
-
-
-def _stroke_centerline_rings(
-    ordered: list[EllipseObservation],
-) -> list[EllipseObservation]:
-    rings = []
-    index = 0
-    pair_limit = float(CONFIG["max_stroke_pair_ratio"])
-    while index < len(ordered):
-        current = ordered[index]
-        if index + 1 < len(ordered):
-            next_edge = ordered[index + 1]
-            is_stroke_pair = (
-                next_edge.major_axis_px / current.major_axis_px <= pair_limit
-                and next_edge.minor_axis_px / current.minor_axis_px <= pair_limit
-            )
-            if is_stroke_pair:
-                rings.append(
-                    EllipseObservation(
-                        center_px=(
-                            (current.center_px[0] + next_edge.center_px[0]) * 0.5,
-                            (current.center_px[1] + next_edge.center_px[1]) * 0.5,
-                        ),
-                        major_axis_px=(
-                            current.major_axis_px + next_edge.major_axis_px
-                        ) * 0.5,
-                        minor_axis_px=(
-                            current.minor_axis_px + next_edge.minor_axis_px
-                        ) * 0.5,
-                        major_angle_deg=_mean_axis_angle_deg(
-                            [current.major_angle_deg, next_edge.major_angle_deg]
-                        ),
-                        fit_error=(current.fit_error + next_edge.fit_error) * 0.5,
-                        support_ratio=max(
-                            current.support_ratio, next_edge.support_ratio
-                        ),
-                    )
-                )
-                index += 2
-                continue
-        rings.append(current)
-        index += 1
-    return rings
-
-
-def _ring_model_match(
-    rings: list[EllipseObservation],
-    frame_shape: tuple[int, int] | None = None,
-) -> tuple[EllipseObservation, float, int, float] | None:
-    if not rings:
-        return None
-
-    diameters = _configured_ring_diameters_mm()
-    max_single_support = float(CONFIG["single_arc_max_coverage"])
-    arc_like = [item for item in rings if item.support_ratio <= max_single_support]
-    if len(rings) == 1:
-        if not arc_like:
+    def read(self):
+        if self.cap is None:
             return None
-        if frame_shape is not None:
-            height, width = frame_shape[:2]
-            min_axis = min(height, width) * float(CONFIG["single_arc_min_axis_fraction"])
-            if rings[0].major_axis_px < min_axis:
-                return None
-        diameter_index = len(diameters) - 1
-        return rings[0], diameters[diameter_index], diameter_index, 1.0
-    if len(diameters) == 1:
-        if arc_like:
-            selected = max(arc_like, key=lambda item: item.major_axis_px + item.minor_axis_px)
-            return selected, diameters[0], 0, 0.60
-        return rings[0], diameters[0], 0, 1.0
+        ret, frame = self.cap.read()
+        return frame if ret else None
 
-    sizes = [(item.major_axis_px + item.minor_axis_px) * 0.5 for item in rings]
+    def stop(self):
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+
+
+# ============ 圆环检测 ============
+def find_ring_center(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, dark = cv2.threshold(blur, CONFIG["black_thresh"], 255,
+                            cv2.THRESH_BINARY_INV)
+
+    kernel = np.ones((5, 5), np.uint8)
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, kernel)
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
     best = None
-    limit = min(len(rings), len(diameters))
-    for count in range(2, limit + 1):
-        for ring_start in range(0, len(rings) - count + 1):
-            pixel_subset = sizes[ring_start:ring_start + count]
-            for diameter_start in range(0, len(diameters) - count + 1):
-                diameter_subset = diameters[diameter_start:diameter_start + count]
-                errors = []
-                for offset in range(1, count):
-                    pixel_ratio = pixel_subset[offset] / pixel_subset[0]
-                    diameter_ratio = diameter_subset[offset] / diameter_subset[0]
-                    errors.append(abs(pixel_ratio - diameter_ratio) / diameter_ratio)
-                match_error = max(errors)
-                score = (count, -match_error, ring_start, diameter_start)
-                if best is None or score > best[0]:
-                    best = (score, match_error, ring_start, diameter_start, count)
-
-    if best is None:
-        return rings[0], diameters[0], 0, 0.5
-
-    _score, match_error, ring_start, diameter_start, count = best
-    if match_error > CONFIG["max_diameter_match_error"]:
-        if arc_like and len(arc_like) < len(rings):
-            selected = max(
-                arc_like, key=lambda item: item.major_axis_px + item.minor_axis_px
-            )
-            return selected, diameters[0], 0, 0.35
-        return rings[0], diameters[0], 0, 0.5
-
-    selected_offset = count - 1
-    selected_ring = rings[ring_start + selected_offset]
-    selected_index = diameter_start + selected_offset
-    match_score = max(0.0, 1.0 - match_error / CONFIG["max_diameter_match_error"])
-    return selected_ring, diameters[selected_index], selected_index, match_score
-
-
-def _select_concentric_group(
-    candidates: list[EllipseObservation], reference_px: tuple[float, float],
-    frame_shape: tuple[int, int] | None = None,
-) -> RingSelection | None:
-    if not candidates:
-        return None
-
-    tolerance = float(CONFIG["center_tolerance_px"])
-    groups = []
-    for seed in candidates:
-        group = [
-            item
-            for item in candidates
-            if math.dist(seed.center_px, item.center_px) <= tolerance
-        ]
-        if len(group) < CONFIG["min_concentric_contours"]:
+    best_score = 0
+    for cnt in contours:
+        if len(cnt) < CONFIG["min_contour_points"]:
             continue
-        center = (
-            statistics.median(item.center_px[0] for item in group),
-            statistics.median(item.center_px[1] for item in group),
-        )
-        mean_error = statistics.fmean(item.fit_error for item in group)
-        groups.append((group, center, mean_error))
 
-    if not groups:
-        return _single_candidate_fallback(candidates, reference_px, frame_shape)
+        area = cv2.contourArea(cnt)
+        if area < CONFIG["min_area"] or area > CONFIG["max_area"]:
+            continue
 
-    group, center, mean_error = min(
-        groups,
-        key=lambda item: (
-            -len(item[0]),
-            math.dist(item[1], reference_px),
-            item[2],
-        ),
-    )
-    ordered = sorted(group, key=lambda item: item.major_axis_px + item.minor_axis_px)
-    model_match = _ring_model_match(_stroke_centerline_rings(ordered), frame_shape)
-    if model_match is None:
-        return None
-    selected_ring, diameter_mm, diameter_index, match_score = model_match
-    count_score = min(1.0, len(group) / (CONFIG["min_concentric_contours"] + 2.0))
-    fit_score = max(0.0, 1.0 - mean_error / CONFIG["max_ellipse_error"])
-    support_score = statistics.fmean(item.support_ratio for item in group)
-    return RingSelection(
-        ellipse=selected_ring,
-        center_px=center,
-        contour_count=len(group),
-        confidence=count_score * fit_score * support_score * match_score,
-        diameter_mm=diameter_mm,
-        diameter_index=diameter_index,
-    )
+        perim = cv2.arcLength(cnt, True)
+        if perim == 0:
+            continue
+        circularity = 4 * np.pi * area / (perim * perim)
+        if circularity < CONFIG["min_circularity"]:
+            continue
 
-
-def _ellipse_offset_to_mm(
-    pixel_offset: tuple[float, float],
-    major_axis_px: float,
-    minor_axis_px: float,
-    major_angle_deg: float,
-    diameter_mm: float,
-) -> tuple[float, float]:
-    """Undo the ellipse's local perspective stretch in image coordinates."""
-    if major_axis_px <= 0 or minor_axis_px <= 0 or diameter_mm <= 0:
-        raise ValueError("ellipse axes and physical diameter must be positive")
-    du, dv = pixel_offset
-    angle = math.radians(major_angle_deg)
-    c, s = math.cos(angle), math.sin(angle)
-
-    along = c * du + s * dv
-    across = -s * du + c * dv
-    along_mm = along * diameter_mm / major_axis_px
-    across_mm = across * diameter_mm / minor_axis_px
-    return c * along_mm - s * across_mm, s * along_mm + c * across_mm
-
-
-def _apply_axis_transform(offset_mm: tuple[float, float]) -> tuple[float, float]:
-    matrix = CONFIG["camera_to_body"]
-    if len(matrix) != 2 or any(len(row) != 2 for row in matrix):
-        raise ValueError("CONFIG['camera_to_body'] must be a 2x2 matrix")
-    x, y = offset_mm
-    bx = float(matrix[0][0]) * x + float(matrix[0][1]) * y
-    by = float(matrix[1][0]) * x + float(matrix[1][1]) * y
-    if not math.isfinite(bx) or not math.isfinite(by):
-        raise ValueError("CONFIG['camera_to_body'] produced a non-finite offset")
-    return bx, by
-
-
-def _measurement_from_candidates(
-    frame, candidates: list[EllipseObservation]
-) -> RingOffset | None:
-    height, width = frame.shape[:2]
-    reference = (width * 0.5, height * 0.5)
-    selected = _select_concentric_group(candidates, reference, frame.shape[:2])
-    if selected is None:
-        return None
-
-    ellipse = selected.ellipse
-    center = selected.center_px
-    pixel_offset = (center[0] - reference[0], center[1] - reference[1])
-    diameter = selected.diameter_mm
-    image_offset = _ellipse_offset_to_mm(
-        pixel_offset,
-        ellipse.major_axis_px,
-        ellipse.minor_axis_px,
-        ellipse.major_angle_deg,
-        diameter,
-    )
-    body_offset = _apply_axis_transform(image_offset)
-    return RingOffset(
-        center_px=center,
-        reference_px=reference,
-        pixel_offset_px=pixel_offset,
-        image_offset_mm=image_offset,
-        body_offset_mm=body_offset,
-        inner_axes_px=(ellipse.major_axis_px, ellipse.minor_axis_px),
-        major_angle_deg=ellipse.major_angle_deg,
-        scale_mm_per_px=(
-            diameter / ellipse.major_axis_px,
-            diameter / ellipse.minor_axis_px,
-        ),
-        concentric_contours=selected.contour_count,
-        confidence=selected.confidence,
-        samples=1,
-        direction_calibrated=bool(CONFIG["direction_calibrated"]),
-        deadband_mm=float(CONFIG["deadband_mm"]),
-        max_correction_mm=float(CONFIG["max_correction_mm"]),
-        selected_diameter_mm=diameter,
-        selected_ring_index=selected.diameter_index,
-    )
-
-
-def _measure_frame_with_mask(frame, mask) -> RingOffset | None:
-    return _measurement_from_candidates(frame, _ellipse_candidates(frame, mask))
-
-
-def measure_frame(frame) -> RingOffset | None:
-    """Measure one frame; return None when no trustworthy ring is present."""
-    _require_vision_dependencies()
-    if frame is None or not hasattr(frame, "shape") or len(frame.shape) < 2:
-        raise ValueError("frame must be a valid image")
-    return _measure_frame_with_mask(frame, _black_mask(frame))
-
-
-def _relative_mad(values: list[float]) -> float:
-    middle = statistics.median(values)
-    if middle <= 0:
-        return math.inf
-    return statistics.median(abs(value - middle) for value in values) / middle
-
-
-def _mean_axis_angle_deg(angles: list[float]) -> float:
-    """Circular mean for ellipse-axis angles, whose period is 180 degrees."""
-    sin_sum = statistics.fmean(math.sin(math.radians(2.0 * a)) for a in angles)
-    cos_sum = statistics.fmean(math.cos(math.radians(2.0 * a)) for a in angles)
-    return (math.degrees(math.atan2(sin_sum, cos_sum)) * 0.5) % 180.0
-
-
-def _aggregate_measurements(items: list[RingOffset]) -> RingOffset | None:
-    if not items:
-        return None
-
-    center_x = [item.center_px[0] for item in items]
-    center_y = [item.center_px[1] for item in items]
-    mad_x = statistics.median(abs(v - statistics.median(center_x)) for v in center_x)
-    mad_y = statistics.median(abs(v - statistics.median(center_y)) for v in center_y)
-    major_scales = [item.scale_mm_per_px[0] for item in items]
-    minor_scales = [item.scale_mm_per_px[1] for item in items]
-    if max(mad_x, mad_y) > CONFIG["max_center_mad_px"]:
-        return None
-    if max(_relative_mad(major_scales), _relative_mad(minor_scales)) > CONFIG["max_scale_rel_mad"]:
-        return None
-
-    def pair_median(attr: str) -> tuple[float, float]:
-        pairs = [getattr(item, attr) for item in items]
-        return statistics.median(v[0] for v in pairs), statistics.median(v[1] for v in pairs)
-
-    return RingOffset(
-        center_px=(statistics.median(center_x), statistics.median(center_y)),
-        reference_px=pair_median("reference_px"),
-        pixel_offset_px=pair_median("pixel_offset_px"),
-        image_offset_mm=pair_median("image_offset_mm"),
-        body_offset_mm=pair_median("body_offset_mm"),
-        inner_axes_px=pair_median("inner_axes_px"),
-        major_angle_deg=_mean_axis_angle_deg([item.major_angle_deg for item in items]),
-        scale_mm_per_px=(statistics.median(major_scales), statistics.median(minor_scales)),
-        concentric_contours=round(statistics.median(item.concentric_contours for item in items)),
-        confidence=statistics.median(item.confidence for item in items),
-        samples=len(items),
-        direction_calibrated=all(item.direction_calibrated for item in items),
-        deadband_mm=float(CONFIG["deadband_mm"]),
-        max_correction_mm=float(CONFIG["max_correction_mm"]),
-        selected_diameter_mm=statistics.median(
-            item.selected_diameter_mm for item in items
-        ),
-        selected_ring_index=round(
-            statistics.median(item.selected_ring_index for item in items)
-        ),
-    )
-
-
-def detect_offset(timeout: float = 10.0, stable_frames: int | None = None) -> RingOffset:
-    """Open the USB camera and return a stable ring offset measurement."""
-    sample_count = int(CONFIG["stable_frames"] if stable_frames is None else stable_frames)
-    if not math.isfinite(timeout) or timeout <= 0 or sample_count <= 0:
-        raise ValueError("timeout and stable_frames must be positive")
-
-    cap = _open_usb()
-    recent: deque[RingOffset] = deque(maxlen=sample_count)
-    deadline = time.monotonic() + timeout
-    try:
-        while time.monotonic() < deadline:
-            ok, frame = cap.read()
-            if not ok:
-                time.sleep(float(CONFIG["frame_interval_s"]))
-                continue
-            measurement = measure_frame(frame)
-            if measurement is None:
-                recent.clear()
-            else:
-                recent.append(measurement)
-                if len(recent) == sample_count:
-                    stable = _aggregate_measurements(list(recent))
-                    if stable is not None:
-                        return stable
-            time.sleep(float(CONFIG["frame_interval_s"]))
-    finally:
-        cap.release()
-    raise RuntimeError(f"Ring: no stable concentric ring found within {timeout:.1f}s")
-
-
-def detect_centers(*_args, **_kwargs):
-    """Reject the old ambiguous API instead of returning unsafe coordinates."""
-    raise RuntimeError(
-        "Ring: detect_centers() was removed because it mixed image and map "
-        "coordinates; use detect_offset()"
-    )
-
-
-def _put_debug_text(image, text: str, origin: tuple[int, int], color) -> None:
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    cv2.putText(image, text, origin, font, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
-    cv2.putText(image, text, origin, font, 0.55, color, 1, cv2.LINE_AA)
-
-
-def _render_debug_frame(
-    frame, mask, measurement: RingOffset | None, stable: RingOffset | None,
-    buffered_samples: int, required_samples: int, fps: float,
-    candidates: list[EllipseObservation] | None = None,
-):
-    annotated = frame.copy()
-    height, width = annotated.shape[:2]
-    reference = (round(width * 0.5), round(height * 0.5))
-
-    cv2.drawMarker(
-        annotated, reference, (255, 255, 0), cv2.MARKER_CROSS, 28, 2, cv2.LINE_AA
-    )
-
-    for candidate in candidates or []:
-        candidate_center = (
-            round(candidate.center_px[0]), round(candidate.center_px[1])
-        )
-        candidate_axes = (
-            max(1, round(candidate.major_axis_px * 0.5)),
-            max(1, round(candidate.minor_axis_px * 0.5)),
-        )
-        cv2.ellipse(
-            annotated, candidate_center, candidate_axes,
-            candidate.major_angle_deg, 0, 360, (255, 120, 0), 1, cv2.LINE_AA,
-        )
-
-    shown = stable or measurement
-    if stable is not None:
-        status = f"STABLE {stable.samples}/{required_samples}"
-        status_color = (0, 220, 0)
-    elif measurement is not None:
-        status = f"TRACKING {buffered_samples}/{required_samples}"
-        status_color = (0, 220, 255)
-    else:
-        status = "NO RING"
-        status_color = (0, 0, 255)
-
-    if shown is not None:
-        center = (round(shown.center_px[0]), round(shown.center_px[1]))
-        axes = (
-            max(1, round(shown.inner_axes_px[0] * 0.5)),
-            max(1, round(shown.inner_axes_px[1] * 0.5)),
-        )
-        cv2.ellipse(
-            annotated, center, axes, shown.major_angle_deg,
-            0, 360, status_color, 2, cv2.LINE_AA,
-        )
-        cv2.drawMarker(
-            annotated, center, (0, 0, 255), cv2.MARKER_CROSS, 22, 2, cv2.LINE_AA
-        )
-        cv2.line(annotated, reference, center, status_color, 2, cv2.LINE_AA)
-
-    best_arc = max((item.support_ratio for item in candidates or []), default=0.0)
-    lines = [
-        status,
-        f"FPS {fps:.1f} candidates={len(candidates or [])} best_arc={best_arc:.2f}",
-    ]
-    if shown is not None:
-        lines.extend([
-            f"pixel du={shown.pixel_offset_px[0]:+.1f} dv={shown.pixel_offset_px[1]:+.1f}",
-            f"ring axes={shown.inner_axes_px[0]:.1f} x {shown.inner_axes_px[1]:.1f} px",
-            f"ring idx={shown.selected_ring_index} dia={shown.selected_diameter_mm:.1f} mm",
-            f"scale={shown.scale_mm_per_px[0]:.4f}, {shown.scale_mm_per_px[1]:.4f} mm/px",
-            f"image mm={shown.image_offset_mm[0]:+.1f}, {shown.image_offset_mm[1]:+.1f}",
-            f"body mm={shown.body_offset_mm[0]:+.1f}, {shown.body_offset_mm[1]:+.1f}",
-            f"confidence={shown.confidence:.2f} aligned={shown.aligned}",
-            "direction=READY" if shown.direction_calibrated else "direction=LOCKED",
-        ])
-    for index, line in enumerate(lines):
-        _put_debug_text(annotated, line, (12, 24 + index * 22), status_color)
-
-    mask_view = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    _put_debug_text(mask_view, "BLACK THRESHOLD MASK", (12, 24), (255, 255, 255))
-    return np.hstack((annotated, mask_view))
-
-
-def _create_debug_trackbars(window: str) -> None:
-    noop = lambda _value: None
-    cv2.createTrackbar("V Max", window, int(CONFIG["black_v_max"]), 255, noop)
-    cv2.createTrackbar("S Max", window, int(CONFIG["black_s_max"]), 255, noop)
-    cv2.createTrackbar("Open", window, int(CONFIG["morph_open_size"]), 15, noop)
-    cv2.createTrackbar("Close", window, int(CONFIG["morph_close_size"]), 15, noop)
-    cv2.createTrackbar("Min Area", window, int(CONFIG["min_contour_area"]), 2000, noop)
-    cv2.createTrackbar("Min Axis", window, int(CONFIG["min_axis_px"]), 200, noop)
-    cv2.createTrackbar(
-        "Center Tol", window, int(CONFIG["center_tolerance_px"]), 100, noop
-    )
-    cv2.createTrackbar(
-        "Fit Err x100", window, round(CONFIG["max_ellipse_error"] * 100), 100, noop
-    )
-    cv2.createTrackbar(
-        "Min Contours", window, int(CONFIG["min_concentric_contours"]), 12, noop
-    )
-    cv2.createTrackbar(
-        "ROI Percent", window, round(CONFIG["search_radius_fraction"] * 100), 100, noop
-    )
-    cv2.createTrackbar(
-        "Min Arc %", window, round(CONFIG["min_arc_coverage"] * 100), 100, noop
-    )
-    cv2.createTrackbar(
-        "Single Arc %", window,
-        round(CONFIG["single_candidate_min_coverage"] * 100), 100, noop,
-    )
-
-
-def _read_debug_trackbars(window: str) -> None:
-    CONFIG["black_v_max"] = max(1, cv2.getTrackbarPos("V Max", window))
-    CONFIG["black_s_max"] = max(1, cv2.getTrackbarPos("S Max", window))
-    open_size = max(1, cv2.getTrackbarPos("Open", window))
-    if open_size % 2 == 0:
-        open_size += 1
-    CONFIG["morph_open_size"] = open_size
-    close_size = max(1, cv2.getTrackbarPos("Close", window))
-    if close_size % 2 == 0:
-        close_size += 1
-    CONFIG["morph_close_size"] = close_size
-    CONFIG["min_contour_area"] = max(1, cv2.getTrackbarPos("Min Area", window))
-    CONFIG["min_axis_px"] = max(1, cv2.getTrackbarPos("Min Axis", window))
-    CONFIG["center_tolerance_px"] = max(
-        1, cv2.getTrackbarPos("Center Tol", window)
-    )
-    CONFIG["max_ellipse_error"] = max(
-        0.01, cv2.getTrackbarPos("Fit Err x100", window) / 100.0
-    )
-    CONFIG["min_concentric_contours"] = max(
-        1, cv2.getTrackbarPos("Min Contours", window)
-    )
-    CONFIG["search_radius_fraction"] = max(
-        0.10, cv2.getTrackbarPos("ROI Percent", window) / 100.0
-    )
-    CONFIG["min_arc_coverage"] = max(
-        0.05, cv2.getTrackbarPos("Min Arc %", window) / 100.0
-    )
-    CONFIG["single_candidate_min_coverage"] = max(
-        0.05, cv2.getTrackbarPos("Single Arc %", window) / 100.0
-    )
-
-
-def _debug_tuning_values() -> dict:
-    keys = (
-        "black_v_max", "black_s_max", "morph_open_size",
-        "morph_close_size", "min_contour_area", "min_axis_px",
-        "center_tolerance_px", "max_ellipse_error",
-        "min_concentric_contours", "search_radius_fraction",
-        "min_arc_coverage", "single_candidate_min_coverage",
-        "ring_diameters_mm",
-        "max_diameter_match_error", "single_arc_max_coverage",
-        "single_arc_min_axis_fraction",
-    )
-    return {key: CONFIG[key] for key in keys}
-
-
-def debug_view() -> None:
-    """Show live detection and threshold views until q/Esc or window close."""
-    _require_vision_dependencies()
-    cap = _open_usb()
-    required = int(CONFIG["stable_frames"])
-    recent: deque[RingOffset] = deque(maxlen=required)
-    window = str(CONFIG["debug_window_name"])
-    fps = 0.0
-    previous_tick = time.monotonic()
-
-    print("Ring debug controls: q/Esc=quit, p=print values, r=reset stability")
-    try:
-        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-        _create_debug_trackbars(window)
-        while True:
-            _read_debug_trackbars(window)
-            ok, frame = cap.read()
-            if not ok:
-                time.sleep(float(CONFIG["frame_interval_s"]))
-                continue
-
-            mask = _black_mask(frame)
-            candidates = _ellipse_candidates(frame, mask)
-            measurement = _measurement_from_candidates(frame, candidates)
-            if measurement is None:
-                recent.clear()
-            else:
-                recent.append(measurement)
-            stable = (
-                _aggregate_measurements(list(recent))
-                if len(recent) == required else None
-            )
-
-            now = time.monotonic()
-            instant_fps = 1.0 / max(now - previous_tick, 1e-6)
-            fps = instant_fps if fps == 0.0 else fps * 0.9 + instant_fps * 0.1
-            previous_tick = now
-
-            view = _render_debug_frame(
-                frame, mask, measurement, stable, len(recent), required, fps,
-                candidates,
-            )
-            cv2.imshow(window, view)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
-                break
-            if key == ord("p"):
-                print("Ring tuning:", _debug_tuning_values())
-                print(stable or measurement or "Ring: no measurement")
-            elif key == ord("r"):
-                recent.clear()
-            if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
-                break
-    except cv2.error as exc:
-        raise RuntimeError(
-            "Ring: OpenCV GUI is unavailable; run from the Jetson desktop "
-            "session with DISPLAY configured"
-        ) from exc
-    finally:
-        cap.release()
         try:
-            cv2.destroyWindow(window)
+            ellipse = cv2.fitEllipse(cnt)
         except cv2.error:
+            continue
+
+        (cx, cy), (w, h), angle = ellipse
+        axis_major = max(w, h)
+        axis_minor = min(w, h)
+        if axis_major == 0:
+            continue
+
+        eccentricity = axis_minor / axis_major
+        if eccentricity < CONFIG["min_eccentricity"]:
+            continue
+
+        r_avg = (axis_major + axis_minor) / 2.0
+
+        score = area * eccentricity
+        if score > best_score:
+            best = (int(cx), int(cy), int(r_avg), int(area),
+                   int(axis_major), int(axis_minor), float(eccentricity))
+            best_score = score
+    return best
+
+
+# ============ 摄像头单例 ============
+_cam_cache = {"cam": None}
+_last_known = {"result": None, "time": 0.0}
+
+
+def _get_cam():
+    if _cam_cache["cam"] is None:
+        cam = USBCamera(CONFIG["usb_device"], CONFIG["width"],
+                       CONFIG["height"], CONFIG["fps"])
+        cam.start()
+        _cam_cache["cam"] = cam
+    return _cam_cache["cam"]
+
+
+def detect():
+    cam = _get_cam()
+    hits = []
+    start = time.time()
+    frames = CONFIG["detect_frames"]
+    timeout = CONFIG["detect_timeout_s"]
+
+    while len(hits) < frames and (time.time() - start) < timeout:
+        frame = cam.read()
+        if frame is None:
+            continue
+        result = find_ring_center(frame)
+        if result:
+            hits.append((result[0], result[1], result[2]))
+
+    if len(hits) < CONFIG["detect_min_hits"]:
+        if _last_known["result"] is not None:
+            age = time.time() - _last_known["time"]
+            if age < CONFIG["last_known_max_age_s"]:
+                return _last_known["result"]
+        return None
+
+    xs = sorted([h[0] for h in hits])
+    ys = sorted([h[1] for h in hits])
+    rs = sorted([h[2] for h in hits])
+    n = len(hits)
+    cx = xs[n // 2]
+    cy = ys[n // 2]
+    r = rs[n // 2]
+
+    if len(hits) >= 3:
+        recent_xs = [h[0] for h in hits[-3:]]
+        if max(recent_xs) - min(recent_xs) > CONFIG["consistency_max_diff"]:
+            if _last_known["result"] is not None and \
+               time.time() - _last_known["time"] < CONFIG["last_known_max_age_s"]:
+                return _last_known["result"]
+            return None
+        recent_ys = [h[1] for h in hits[-3:]]
+        if max(recent_ys) - min(recent_ys) > CONFIG["consistency_max_diff"]:
+            if _last_known["result"] is not None and \
+               time.time() - _last_known["time"] < CONFIG["last_known_max_age_s"]:
+                return _last_known["result"]
+            return None
+
+    result = (cx, cy, r)
+    _last_known["result"] = result
+    _last_known["time"] = time.time()
+    return result
+
+
+# ============ ★ 自愈: comm 死了自动重启 ============
+def _is_comm_alive():
+    """检查 comm 是否活着: POSE 帧有更新 + 能拿到"""
+    try:
+        pose = comm.get_pose(max_age=CONFIG["recover_pose_age_max"])
+        return pose is not None
+    except:
+        return False
+
+
+def _recover_comm(verbose=True):
+    """
+    ★ 自动恢复 comm:
+    1. comm.shutdown() 关
+    2. 等 0.5s
+    3. comm.init() 重开
+    4. 等 1s
+    5. comm.run() 发启动脉冲 (PD15 500ms) - 等于按物理 RUN 键
+    6. 等 1s
+    7. 检查 POSE 帧是否恢复
+    """
+    if verbose:
+        print("  [recover] 关闭 comm...")
+
+    try:
+        comm.shutdown()
+    except Exception as e:
+        if verbose:
+            print(f"  [recover] shutdown err: {e}")
+    time.sleep(0.5)
+
+    if verbose:
+        print("  [recover] 重开 comm...")
+
+    try:
+        comm.init(CONFIG["comm_port"], CONFIG["comm_baud"])
+    except Exception as e:
+        if verbose:
+            print(f"  [recover] init err: {e}")
+        return False
+    time.sleep(1.0)
+
+    if verbose:
+        print("  [recover] 发启动脉冲...")
+
+    try:
+        comm.run(5.0)
+    except Exception as e:
+        if verbose:
+            print(f"  [recover] run err: {e}")
+    time.sleep(1.0)
+
+    if verbose:
+        print("  [recover] 检查 POSE 帧...")
+
+    for i in range(5):
+        if _is_comm_alive():
+            if verbose:
+                print(f"  [recover] 恢复成功 (尝试 {i+1}/5)")
+            return True
+        time.sleep(0.3)
+
+    if verbose:
+        print("  [recover] 失败, POSE 帧没恢复")
+    return False
+
+
+def ensure_comm_alive(verbose=True):
+    """确保 comm 活着, 死了就自动恢复"""
+    if _is_comm_alive():
+        return True
+
+    if verbose:
+        print("  [comm 死了, 自动恢复]")
+
+    for attempt in range(CONFIG["recover_max_retry"]):
+        if verbose:
+            print(f"  [恢复尝试 {attempt+1}/{CONFIG['recover_max_retry']}]")
+        if _recover_comm(verbose=verbose):
+            return True
+        time.sleep(1.0)
+
+    return False
+
+
+# ============ safe_goto 带重试 ============
+def _safe_goto(target_x, target_y, timeout=20.0, max_retry=2):
+    """comm.goto 带重试, 失败时尝试 comm 重连"""
+    for attempt in range(max_retry):
+        try:
+            ok = comm.goto(target_x, target_y, timeout=timeout)
+            if ok:
+                return True
+        except Exception as e:
+            print(f"  [goto attempt {attempt+1}] err: {e}")
+        time.sleep(0.3)
+
+    # 失败, 自动恢复
+    print("  [goto] 失败, 自动恢复 comm...")
+    if not ensure_comm_alive(verbose=True):
+        return False
+    time.sleep(0.5)
+
+    try:
+        ok = comm.goto(target_x, target_y, timeout=timeout)
+        return ok
+    except Exception as e:
+        print(f"  [goto] 恢复后仍失败: {e}")
+        return False
+
+
+# ============ 对齐 ============
+def align_to_ring(verbose=True):
+    # ★ 1. 自检 comm, 死了自动恢复
+    if not ensure_comm_alive(verbose=verbose):
+        if verbose:
+            print("  [FAIL] comm 没救活, 放弃")
+        return False
+
+    # 发命令前等
+    time.sleep(CONFIG["pre_cmd_sleep_s"])
+
+    # ★ 2. 找圆环, 失败也试着重连
+    result = detect()
+    if result is None:
+        if verbose:
+            print("  [圆环没找到, 试着重连再找]")
+        if not ensure_comm_alive(verbose=False):
+            return False
+        result = detect()
+        if result is None:
+            if verbose:
+                print("  [FAIL] 重连后还没找到圆环")
+            return False
+
+    h, w = CONFIG["height"], CONFIG["width"]
+    cx_target, cy_target = w // 2, h // 2
+
+    cx, cy, r_px = result
+    dx_px = cx - cx_target
+    dy_px = cy - cy_target
+
+    if verbose:
+        print(f"  ring center = ({cx}, {cy})")
+        print(f"  ring radius = {r_px} px")
+        print(f"  像素偏差    = dx {dx_px:+d} px, dy {dy_px:+d} px")
+
+    if abs(dx_px) < CONFIG["dead_zone_px"] and \
+       abs(dy_px) < CONFIG["dead_zone_px"]:
+        if verbose:
+            print(f"  [OK] 已在死区内 ({CONFIG['dead_zone_px']}px), 不动")
+        return True
+
+    if r_px <= 0:
+        return False
+
+    k_m_per_px = CONFIG["ring_actual_radius_m"] / r_px
+    k_mm_per_px = k_m_per_px * 1000
+
+    # ★ x 取反, y 不取反
+    dx_mm = -dx_px * k_mm_per_px
+    dy_mm = dy_px * k_mm_per_px
+    dx_m = dx_mm / 1000.0
+    dy_m = dy_mm / 1000.0
+
+    if verbose:
+        print(f"  标定系数    = {k_mm_per_px:.3f} mm/px "
+              f"(calib={CONFIG['ring_actual_radius_m']*1000:.1f}mm)")
+        print(f"  实际移动    = dx {dx_mm:+.1f} mm, dy {dy_mm:+.1f} mm")
+
+    pose = comm.get_pose(max_age=1.0)
+    if pose is None:
+        if verbose:
+            print("  [FAIL] 没拿到当前位姿 (comm 又死了?)")
+        return False
+
+    x_now, y_now, _ = pose
+    target_x = x_now + dx_m
+    target_y = y_now + dy_m
+
+    if verbose:
+        print(f"  当前位置    = ({x_now:.3f}, {y_now:.3f}) m")
+        print(f"  目标位置    = ({target_x:.3f}, {target_y:.3f}) m")
+
+    ok = _safe_goto(target_x, target_y, timeout=CONFIG["correct_timeout_s"])
+    if verbose:
+        print(f"  [align] {'OK' if ok else 'FAIL'}")
+    return ok
+
+
+# ============ 重连（手动） ============
+def reconnect():
+    print("[manual reconnect]")
+    _recover_comm(verbose=True)
+
+
+def close():
+    if _cam_cache["cam"] is not None:
+        _cam_cache["cam"].stop()
+        _cam_cache["cam"] = None
+
+
+# ============ 主循环 ============
+def main():
+    print("=" * 50)
+    print("Black ring one-shot align (auto-recover)")
+    print("=" * 50)
+    print("q=quit  a=align  +/-=calib  r=manual reconnect")
+
+    comm.init(CONFIG["comm_port"], CONFIG["comm_baud"])
+    time.sleep(1.0)
+
+    cam = _get_cam()
+    cv2.namedWindow("Ring", cv2.WINDOW_NORMAL)
+
+    try:
+        while True:
+            frame = cam.read()
+            if frame is None:
+                continue
+
+            result = find_ring_center(frame)
+            display = frame.copy()
+            h, w = frame.shape[:2]
+
+            cv2.line(display, (w//2 - 30, h//2), (w//2 + 30, h//2),
+                    (0, 255, 255), 1)
+            cv2.line(display, (w//2, h//2 - 30), (w//2, h//2 + 30),
+                    (0, 255, 255), 1)
+
+            if result:
+                cx, cy, r, area, major, minor, ecc = result
+                cv2.ellipse(display, (cx, cy), (major // 2, minor // 2),
+                           0, 0, 360, (0, 255, 0), 2)
+                cv2.circle(display, (cx, cy), 3, (0, 0, 255), -1)
+                dx = cx - w // 2
+                dy = cy - h // 2
+                cv2.putText(display,
+                           f"({cx},{cy}) r={r}  dx={dx:+d} dy={dy:+d}",
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                           (0, 255, 0), 2)
+            else:
+                cv2.putText(display, "NO RING", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            cv2.putText(display, "q=quit  a=align  +/-=calib  r=reconnect",
+                       (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                       (255, 255, 0), 1)
+
+            cv2.imshow("Ring", display)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('a'):
+                print("\n[align one-shot]")
+                align_to_ring(verbose=True)
+                print()
+            elif key in (ord('+'), ord('=')):
+                CONFIG["ring_actual_radius_m"] += CONFIG["calib_step"]
+                print(f"  calib radius = {CONFIG['ring_actual_radius_m']*1000:.1f}mm")
+            elif key in (ord('-'), ord('_')):
+                CONFIG["ring_actual_radius_m"] = max(0.005,
+                    CONFIG["ring_actual_radius_m"] - CONFIG["calib_step"])
+                print(f"  calib radius = {CONFIG['ring_actual_radius_m']*1000:.1f}mm")
+            elif key == ord('r'):
+                reconnect()
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        close()
+        cv2.destroyAllWindows()
+        try:
+            comm.shutdown()
+        except:
             pass
 
 
 if __name__ == "__main__":
-    debug_view()
+    main()

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-物块识别 - ROI 圆框内 HSV 投票 (5帧众数版)
-- 黑色: V < black_v_max
-- 白色: V 高 + S 低
+物块识别 V23 - ROI 圆框内 HSV 投票
+- 黑色: V<阈值 (固定)
 - 红/绿/蓝: H+S 范围
-- 5 帧投票取众数, 抗单帧噪声
+- 白色: V 高 + S 低
 """
 
 import cv2
@@ -23,12 +22,12 @@ CONFIG = {
     "roi_radius": 200,
 
     "vote_min_pct": 0.25,
+
+    # 黑色: V<60 算黑 (反光黑块暗的部分)
     "black_v_max": 60,
+    # 白色: V>150 + S<80 算白
     "white_v_min": 150,
     "white_s_max": 80,
-
-    "recognize_frames": 3,
-    "recognize_timeout_s": 1,
 }
 
 
@@ -47,7 +46,6 @@ def load_thresholds(path):
     }
 
 
-# ============ 摄像头 ============
 class USBCamera:
     def __init__(self, device=0, width=640, height=480, fps=30):
         self.device = device
@@ -77,26 +75,27 @@ class USBCamera:
             self.cap.release()
 
 
-# ============ 单帧识别 ============
-def _recognize_frame(frame, thresholds, cfg):
-    """单帧识别, 返回颜色字符串或 None"""
+def recognize(frame, cfg, thresholds):
     h, w = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     V = hsv[:, :, 2]
     S = hsv[:, :, 1]
+    H = hsv[:, :, 0]
 
-    # ROI 圆框
+    # ROI 圆框 (画面正中心)
     roi_mask = np.zeros((h, w), dtype=np.uint8)
     cv2.circle(roi_mask, (w // 2, h // 2), cfg["roi_radius"], 255, -1)
+
     roi_total = int(np.sum(roi_mask == 255))
     if roi_total == 0:
-        return None
+        return None, {"pct": {}, "roi_mask": roi_mask}
 
-    # 5 色 mask
-    color_masks = {}
-
+    # === 黑色: V 低于阈值 ===
     black_mask = (V < cfg["black_v_max"]).astype(np.uint8) * 255
-    color_masks["黑"] = cv2.bitwise_and(black_mask, roi_mask)
+    black_mask = cv2.bitwise_and(black_mask, roi_mask)
+
+    # === 红/绿/蓝: H+S ===
+    color_masks = {"黑": black_mask}
 
     red1 = cv2.inRange(hsv, (0, 80, 80), (10, 255, 255))
     red2 = cv2.inRange(hsv, (170, 80, 80), (180, 255, 255))
@@ -108,6 +107,7 @@ def _recognize_frame(frame, thresholds, cfg):
     color_masks["蓝"] = cv2.bitwise_and(
         cv2.inRange(hsv, (95, 80, 80), (135, 255, 255)), roi_mask)
 
+    # === 白色: V 高 + S 低 ===
     white_mask = ((V > cfg["white_v_min"]) & (S < cfg["white_s_max"])).astype(np.uint8) * 255
     color_masks["白"] = cv2.bitwise_and(white_mask, roi_mask)
 
@@ -116,94 +116,33 @@ def _recognize_frame(frame, thresholds, cfg):
         pct[color] = float(np.sum(mask == 255)) / roi_total
 
     best_color = max(pct, key=lambda k: pct[k])
-    if pct[best_color] < cfg["vote_min_pct"]:
-        return None
-    return best_color
+    best_pct = pct[best_color]
+
+    info = {
+        "pct": pct,
+        "best": best_color,
+        "best_pct": best_pct,
+        "roi_mask": roi_mask,
+    }
+
+    if best_pct < cfg["vote_min_pct"]:
+        return None, info
+
+    return best_color, info
 
 
-# ============ 公共 API ============
-_recognizer_cache = {
-    "cam": None,
-    "thresholds": None,
-}
-
-
-def _get_cam(cfg):
-    if _recognizer_cache["cam"] is None:
-        cam = USBCamera(cfg["usb_device"], cfg["width"],
-                       cfg["height"], cfg["fps"])
-        cam.start()
-        _recognizer_cache["cam"] = cam
-    return _recognizer_cache["cam"]
-
-
-def _get_thresholds(cfg):
-    if _recognizer_cache["thresholds"] is None:
-        _recognizer_cache["thresholds"] = load_thresholds(cfg["thresholds_file"])
-    return _recognizer_cache["thresholds"]
-
-
-def recognize(frames=None, timeout=None):
-    """
-    5帧众数识别, 返回颜色字符串 ("黑"/"白"/"红"/"绿"/"蓝") 或 None
-    frames: 读取帧数 (默认 5)
-    timeout: 超时秒数 (默认 1.5)
-    """
-    if frames is None:
-        frames = CONFIG["recognize_frames"]
-    if timeout is None:
-        timeout = CONFIG["recognize_timeout_s"]
-
-    cam = _get_cam(CONFIG)
-    thresholds = _get_thresholds(CONFIG)
-
-    import time
-    start = time.time()
-    votes = {"黑": 0, "白": 0, "红": 0, "绿": 0, "蓝": 0, None: 0}
-    count = 0
-
-    while count < frames and (time.time() - start) < timeout:
-        frame = cam.read()
-        if frame is None:
-            continue
-        color = _recognize_frame(frame, thresholds, CONFIG)
-        votes[color] = votes.get(color, 0) + 1
-        count += 1
-
-    if count == 0:
-        return None
-
-    # 排除 None 票, 找众数
-    color_votes = {c: v for c, v in votes.items() if c is not None}
-    if not color_votes:
-        return None
-
-    winner = max(color_votes, key=color_votes.get)
-    return winner
-
-
-def close():
-    """关闭摄像头"""
-    if _recognizer_cache["cam"] is not None:
-        _recognizer_cache["cam"].stop()
-        _recognizer_cache["cam"] = None
-
-
-# ============ 测试 / 调参模式 ============
 def main():
-    print("=" * 50)
-    print("Block recognize - 5-frame majority")
-    print("=" * 50)
-    print("1-5 slot, SPACE save (5-frame vote), q quit")
+    print("Block V23 - ROI circle, vote")
+    print("1-5 slot, SPACE save, q quit")
 
+    thresholds = load_thresholds(CONFIG["thresholds_file"])
     cam = USBCamera(CONFIG["usb_device"], CONFIG["width"],
                     CONFIG["height"], CONFIG["fps"])
     cam.start()
-    thresholds = load_thresholds(CONFIG["thresholds_file"])
 
     slots = [None] * 5
     current_pos = None
-    cv2.namedWindow("Block", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("Block V23", cv2.WINDOW_NORMAL)
 
     COLOR_BGR = {"黑": (0, 0, 0), "白": (200, 200, 200),
                  "红": (0, 0, 255), "绿": (0, 255, 0), "蓝": (255, 0, 0)}
@@ -213,25 +152,43 @@ def main():
             frame = cam.read()
             if frame is None:
                 continue
-
-            color = _recognize_frame(frame, thresholds, CONFIG)
+            color, info = recognize(frame, CONFIG, thresholds)
+            pct = info.get("pct", {})
+            best = info.get("best", "?")
+            best_pct = info.get("best_pct", 0)
 
             display = frame.copy()
             h, w = frame.shape[:2]
 
+            # 画 ROI 圆框
             cv2.circle(display, (w // 2, h // 2), CONFIG["roi_radius"],
                       (255, 0, 255), 2)
 
+            # 顶部
             if color:
                 bgr = COLOR_BGR.get(color, (255, 255, 255))
                 cv2.rectangle(display, (0, 0), (w, 50), bgr, -1)
-                cv2.putText(display, f"[{color}]", (10, 35),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+                cv2.putText(display, f"[{color}] {best_pct*100:.0f}%",
+                           (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
             else:
                 cv2.rectangle(display, (0, 0), (w, 50), (50, 50, 50), -1)
-                cv2.putText(display, "NO BLOCK", (10, 35),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                cv2.putText(display, f"NO  max={best} {best_pct*100:.0f}%",
+                           (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
+            # 右侧
+            y = 70
+            for c in ["黑", "白", "红", "绿", "蓝"]:
+                p = pct.get(c, 0)
+                bgr = COLOR_BGR.get(c, (255, 255, 255))
+                cv2.rectangle(display, (w - 130, y - 15), (w, y + 5), bgr, -1)
+                if c == best:
+                    cv2.rectangle(display, (w - 130, y - 15), (w, y + 5), (0, 255, 255), 2)
+                cv2.putText(display, f"{c} {p*100:.0f}%",
+                           (w - 120, y - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                           (0, 0, 0), 1)
+                y += 22
+
+            # 底部
             slot_y = h - 60
             for i in range(5):
                 x = 10 + i * (w - 20) // 5
@@ -252,22 +209,20 @@ def main():
                     cv2.putText(display, f"{i+1}.{s}", (x + 5, slot_y + 25),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
 
-            cv2.imshow("Block", display)
+            cv2.imshow("Block V23", display)
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
             elif ord('1') <= key <= ord('5'):
                 current_pos = key - ord('0')
             elif key == ord(' '):
-                if current_pos is not None:
-                    saved = recognize()
-                    if saved:
-                        slots[current_pos - 1] = saved
-                        print(f"SAVE {current_pos} = {saved}")
-                        for j in range(5):
-                            if slots[j] is None:
-                                current_pos = j + 1
-                                break
+                if current_pos is not None and color:
+                    slots[current_pos - 1] = color
+                    print(f"SAVE {current_pos} = {color}")
+                    for j in range(5):
+                        if slots[j] is None:
+                            current_pos = j + 1
+                            break
             elif key in (ord('r'), ord('R')):
                 slots = [None] * 5
                 current_pos = None
