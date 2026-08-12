@@ -18,7 +18,8 @@
     t <deg>            角度环 TURNTO (CW+)     例: t 90
     arc r dir sweep    圆弧 (半径m, dir: 1=右转/-1=左转, 扫过角度°, 圆心自动算)
                        例: arc 0.5 1 180  (右转半圆)
-    s <x> <y>          重置坐标                例: s 0 0
+    s <x> <y> [yaw]    重置坐标/可选朝向        例: s 0 0 或 s 0 0 -90
+    sy <yaw>           保持当前坐标, 重置朝向    例: sy -90
     p                  打印当前位姿 (下位机50Hz上报)
     n <f|b|l|r|s>      视觉微调 (体坐标系, 慢速) 例: n f
                        f=前进 b=后退 l=左 r=右 s=停止+锁死
@@ -93,14 +94,27 @@ def do_arc(r: float, dir_: int, sweep: float):
     return timed(f"ARC r={r:.3f} {dname} {abs(sweep):.1f}° (车头沿切线)",
                  lambda: comm.arc(r, dir_, sweep))
 
-def do_sync(x: float, y: float):
-    print(f"  >> SYNC 坐标重置为 ({x:.3f}, {y:.3f})")
+def do_sync(x: float, y: float, yaw_deg: float | None = None):
+    if yaw_deg is None:
+        print(f"  >> SYNC 坐标重置为 ({x:.3f}, {y:.3f})")
+    else:
+        print(f"  >> SYNC 位姿重置为 ({x:.3f}, {y:.3f}, yaw={yaw_deg:.1f}°)")
     t0 = time.perf_counter()
-    comm.send_sync_pose(x, y)
+    comm.send_sync_pose(x, y, yaw_deg)
     ok = comm.wait_for(comm.TYPE_CMD_SYNC_RESP, 5.0)
     dt = time.perf_counter() - t0
     print(f"  << {'OK  ' if ok else 'FAIL'}  ({dt:.2f}s)")
     return bool(ok)
+
+
+def do_sync_yaw(yaw_deg: float):
+    """保持当前 x/y 不变, 只重置下位机当前朝向。"""
+    pose = comm.get_pose(max_age=1.0)
+    if pose is None:
+        print("  !! 没有新鲜 POSE，不能安全保持当前坐标；请先确认通信，或用 s <x> <y> <yaw>")
+        return False
+    x, y, _ = pose
+    return do_sync(x, y, yaw_deg)
 
 
 def do_pose() -> bool:
@@ -202,7 +216,8 @@ HELP = """命令:
     g <x> <y>          位置环 GOTO
     t <deg>            角度环 TURNTO (CW+)
     arc r dir sweep    圆弧 (dir: 1=右转 -1=左转, 扫过角度°)  例: arc 0.5 1 180
-    s <x> <y>          重置坐标
+    s <x> <y> [yaw]    重置坐标/可选朝向
+    sy <yaw>           保持当前坐标, 重置朝向
     p                  打印当前位姿
     n <f|b|l|r|s>      视觉微调 (f=前 b=后 l=左 r=右 s=停止+锁死)
     fm <dx> <dy>       诊断 FINE_MOVE 偏移(mm), 例: fm 30 0
@@ -236,6 +251,8 @@ def main():
                 continue
 
             parts = line.split()
+            if len(parts) == 1 and len(parts[0]) >= 2 and parts[0][0] == "r":
+                parts = ["r", parts[0][1:]]
             cmd = parts[0]
 
             try:
@@ -287,10 +304,18 @@ def main():
                         continue
                     do_arc(float(parts[1]), int(float(parts[2])), float(parts[3]))
                 elif cmd == "s":
-                    if len(parts) < 3:
-                        print("用法: s <x> <y>")
+                    if len(parts) not in (3, 4):
+                        print("用法: s <x> <y> [yaw]  例: s 0 0 或 s 0 0 -90")
                         continue
-                    do_sync(float(parts[1]), float(parts[2]))
+                    if len(parts) == 4:
+                        do_sync(float(parts[1]), float(parts[2]), float(parts[3]))
+                    else:
+                        do_sync(float(parts[1]), float(parts[2]))
+                elif cmd == "sy":
+                    if len(parts) != 2:
+                        print("用法: sy <yaw>  例: sy -90")
+                        continue
+                    do_sync_yaw(float(parts[1]))
                 elif cmd == "p":
                     do_pose()
                 elif cmd == "n":

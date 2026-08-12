@@ -17,6 +17,7 @@ AFTER_RECOGNIZE_DELAY_S = 1.0
 HEADING_D = 180
 BACKUP_M = 0.05
 SPLIT_THRESHOLD = 0.03
+INIT_YAW_D = -90.0
 
 _CUR_X, _CUR_Y = 0.0, 0.0
 
@@ -123,6 +124,17 @@ def arm(state):
     print(f"  ARM {state}")
     return _timed(f"ARM {state}", comm.arm, state, timeout=6.0)
 
+
+def sync_initial_pose():
+    """任务开始前把下位机当前位置基准重置为 (0,0,-90°)。"""
+    _update_cur(0.0, 0.0)
+    ok = _timed("SYNC initial pose (0,0,-90deg)", comm.sync_pose,
+                0.0, 0.0, INIT_YAW_D, timeout=5.0)
+    if not ok:
+        raise RuntimeError("初始位姿同步失败")
+    return ok
+
+
 def run_task_c():
     print("\n=== 阶段 C: 走弧 + 颜色识别 ===")
 
@@ -215,6 +227,7 @@ def main():
     comm.init("/dev/ttyCH341USB0", 115200)
     time.sleep(1.0)
     try:
+        sync_initial_pose()
         run_task_c()
     except RuntimeError as e:
         print(f"\n[兜底] 任务中断: {e}")

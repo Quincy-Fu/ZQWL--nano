@@ -256,9 +256,18 @@ class SerialComm:
         self._check_finite(dx_mm, dy_mm)
         self._send_nav(TYPE_CMD_FINE_MOVE, struct.pack("<ff", dx_mm, dy_mm))
 
-    def send_sync_pose(self, x: float, y: float) -> None:
-        self._check_finite(x, y)
-        self._send_nav(TYPE_CMD_SYNC_POSE, struct.pack("<ff", x, y))
+    def send_sync_pose(self, x: float, y: float, yaw_deg: float | None = None) -> None:
+        """同步下位机里程计坐标。
+
+        旧协议 8B payload 只同步 x/y，并保留下位机当前 yaw。
+        新协议 12B payload 同步 x/y/yaw，用于重置当前朝向。
+        """
+        if yaw_deg is None:
+            self._check_finite(x, y)
+            self._send_nav(TYPE_CMD_SYNC_POSE, struct.pack("<ff", x, y))
+        else:
+            self._check_finite(x, y, yaw_deg)
+            self._send_nav(TYPE_CMD_SYNC_POSE, struct.pack("<fff", x, y, yaw_deg))
 
     def send_path_begin(self, speed: float, count: int) -> None:
         """开始装载连续路径。count 是下位机将收到的总点数。"""
@@ -768,10 +777,17 @@ def send_fine_move(dx_mm: float, dy_mm: float) -> None:
         raise RuntimeError("serial not initialized")
     _comm.send_fine_move(dx_mm, dy_mm)
 
-def send_sync_pose(x: float, y: float) -> None:
+def send_sync_pose(x: float, y: float, yaw_deg: float | None = None) -> None:
     if _comm is None:
         raise RuntimeError("serial not initialized")
-    _comm.send_sync_pose(x, y)
+    _comm.send_sync_pose(x, y, yaw_deg)
+
+def sync_pose(x: float, y: float, yaw_deg: float | None = None,
+              timeout: float = 5.0) -> bool:
+    if _comm is None:
+        raise RuntimeError("serial not initialized, call init() first")
+    _comm.send_sync_pose(x, y, yaw_deg)
+    return _comm.wait_for(TYPE_CMD_SYNC_RESP, timeout)
 
 def send_path_begin(speed: float, count: int) -> None:
     if _comm is None:
