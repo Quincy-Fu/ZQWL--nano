@@ -186,6 +186,11 @@ class PathRunner:
                                       timeout=cmd.get("timeout"),
                                       prepend_current=cmd.get("prepend_current", True),
                                       final_yaw=cmd.get("final_yaw"))
+            elif c == "key_path":
+                return self._ser.key_path(cmd["points"],
+                                          speed=cmd.get("speed", 0.30),
+                                          timeout=cmd.get("timeout"),
+                                          prepend_current=cmd.get("prepend_current", False))
             elif c == "sync":
                 self._ser.send_sync_pose(cmd["x"], cmd["y"])
             elif c == "fine":
@@ -278,6 +283,9 @@ class _FakeSerial:
     def path(self, points, speed=0.30, timeout=None, prepend_current=True, final_yaw=None):
         self.sent.append(("path", points, speed, timeout, prepend_current, final_yaw))
         return self._ok
+    def key_path(self, points, speed=0.30, timeout=None, prepend_current=False):
+        self.sent.append(("key_path", points, speed, timeout, prepend_current))
+        return self._ok
     def send_sync_pose(self, x, y):
         self.sent.append(("sync", x, y))
     def send_fine_move(self, dx, dy):
@@ -331,6 +339,16 @@ def _self_check() -> None:
     assert abs(fake.sent[0][2] - 0.3) < 0.001
     assert fake.sent[0][5] == 90.0
     print("  [3/5] continuous path command OK")
+
+    fake.sent.clear()
+    key_path_cmd = {"cmd": "key_path", "points": [(0.0, 0.0, -90.0), (0.2, 0.1, -55.0)],
+                    "speed": 0.3, "label": "keypath1"}
+    ok = runner.run([key_path_cmd])
+    assert ok
+    assert fake.sent[0][0] == "key_path"
+    assert fake.sent[0][1] == key_path_cmd["points"]
+    assert abs(fake.sent[0][2] - 0.3) < 0.001
+    print("  [3.1/5] key_path command OK")
 
     # 3. 超时处理
     fake2 = _FakeSerial(always_ok=False)  # 永远返回 None (模拟超时)

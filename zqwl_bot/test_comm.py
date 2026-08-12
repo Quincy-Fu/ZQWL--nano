@@ -15,9 +15,11 @@
     x <val>            锁轴: X 移到 val m      例: x 0.3
     y <val>            锁轴: Y 移到 val m      例: y 0.3
     g <x> <y>          位置环 GOTO (m)         例: g 0.3 0.3
+    fd <dist> [yaw]    沿当前/指定朝向前进 dist m 例: fd 0.3 或 fd 0.3 -60
     t <deg>            角度环 TURNTO (CW+)     例: t 90
     arc r dir sweep    圆弧 (半径m, dir: 1=右转/-1=左转, 扫过角度°, 圆心自动算)
                        例: arc 0.5 1 180  (右转半圆)
+    kp [nosync]         固定关键点连续路径测试, 默认先同步到起点
     s <x> <y> [yaw]    重置坐标/可选朝向        例: s 0 0 或 s 0 0 -90
     sy <yaw>           保持当前坐标, 重置朝向    例: sy -90
     p                  打印当前位姿 (下位机50Hz上报)
@@ -34,6 +36,7 @@
 注意: 转盘响应是"估算移动时间到"而非电机真实到位; TOX/TOY 恒回成功(时序握手).
 """
 
+import math
 import sys
 import time
 
@@ -41,6 +44,17 @@ try:
     from . import comm          # 作为包内模块
 except ImportError:
     import comm                 # 作为脚本直接运行
+
+
+KEY_PATH_SPEED = 0.30
+KEY_PATH_POINTS = [
+    (-0.662, 0.250, -90.0),
+    (-0.900, 0.250, -90.0),
+    (-1.222, 0.480, -55.0),
+    (-1.412, 0.883, -25.0),
+    (-1.415, 1.329,   0.0),
+    (-1.160, 1.755,  30.0),
+]
 
 
 def timed(label: str, fn) -> bool:
@@ -86,6 +100,22 @@ def do_axis(axis: str, target: float):
 def do_goto(x: float, y: float):
     return timed(f"GOTO ({x:.3f}, {y:.3f})", lambda: comm.goto(x, y, timeout=40.0))
 
+
+def do_forward(dist_m: float, yaw_deg: float | None = None):
+    """按当前或指定朝向前进一段距离, 自动换算成 GOTO 目标坐标。"""
+    pose = comm.get_pose(max_age=1.0)
+    if pose is None:
+        print("  !! 没有新鲜 POSE，不能计算起点；请先用 p 确认位姿上报")
+        return False
+    x, y, pose_yaw = pose
+    yaw = pose_yaw if yaw_deg is None else yaw_deg
+    rad = math.radians(yaw)
+    tx = x + dist_m * math.sin(rad)
+    ty = y + dist_m * math.cos(rad)
+    print(f"  .. 起点=({x:.4f}, {y:.4f}) yaw={yaw:.1f}° dist={dist_m:.3f}m")
+    print(f"  .. 目标=({tx:.4f}, {ty:.4f})")
+    return do_goto(tx, ty)
+
 def do_turn(deg: float):
     return timed(f"TURNTO {deg:.1f}°", lambda: comm.turnto(deg, 30.0))
 
@@ -93,6 +123,26 @@ def do_arc(r: float, dir_: int, sweep: float):
     dname = "右转" if dir_ > 0 else "左转"
     return timed(f"ARC r={r:.3f} {dname} {abs(sweep):.1f}° (车头沿切线)",
                  lambda: comm.arc(r, dir_, sweep))
+
+
+def do_key_path(sync_start: bool = True):
+    """固定关键点连续路径测试: 每个点都带目标yaw, 下位机段内提前转向。"""
+    start = KEY_PATH_POINTS[0]
+    print("  .. 固定关键点路径:")
+    for idx, (x, y, yaw) in enumerate(KEY_PATH_POINTS):
+        print(f"     p{idx}: x={x:.3f} y={y:.3f} yaw={yaw:.1f}°")
+
+    if sync_start:
+        print("  .. 默认先同步下位机里程计到 p0；实车也应放在该起点附近。")
+        if not do_sync(start[0], start[1], start[2]):
+            return False
+    else:
+        print("  .. nosync: 不改里程计, 直接按当前下位机位姿执行。")
+
+    return timed(
+        f"KEY_PATH {len(KEY_PATH_POINTS)}点 v={KEY_PATH_SPEED:.2f}m/s",
+        lambda: comm.key_path(KEY_PATH_POINTS, speed=KEY_PATH_SPEED, timeout=40.0),
+    )
 
 def do_sync(x: float, y: float, yaw_deg: float | None = None):
     if yaw_deg is None:
@@ -214,8 +264,10 @@ HELP = """命令:
     x <val>            锁轴 X 移到 val m
     y <val>            锁轴 Y 移到 val m
     g <x> <y>          位置环 GOTO
+    fd <dist> [yaw]    沿当前/指定朝向前进 dist m, 例: fd 0.3 或 fd 0.3 -60
     t <deg>            角度环 TURNTO (CW+)
     arc r dir sweep    圆弧 (dir: 1=右转 -1=左转, 扫过角度°)  例: arc 0.5 1 180
+    kp [nosync]         固定关键点连续路径测试, 默认先同步到起点
     s <x> <y> [yaw]    重置坐标/可选朝向
     sy <yaw>           保持当前坐标, 重置朝向
     p                  打印当前位姿
@@ -293,6 +345,14 @@ def main():
                         print("用法: g <x> <y>")
                         continue
                     do_goto(float(parts[1]), float(parts[2]))
+                elif cmd in ("fd", "forward"):
+                    if len(parts) not in (2, 3):
+                        print("用法: fd <距离m> [yaw角度]  例: fd 0.3 或 fd 0.3 -60")
+                        continue
+                    if len(parts) == 3:
+                        do_forward(float(parts[1]), float(parts[2]))
+                    else:
+                        do_forward(float(parts[1]))
                 elif cmd == "t":
                     if len(parts) < 2:
                         print("用法: t <角度>")
@@ -303,6 +363,11 @@ def main():
                         print("用法: arc <半径m> <方向: 1右转/-1左转> <扫过角度°>  例: arc 0.5 1 180")
                         continue
                     do_arc(float(parts[1]), int(float(parts[2])), float(parts[3]))
+                elif cmd in ("kp", "keypath"):
+                    if len(parts) > 2 or (len(parts) == 2 and parts[1] != "nosync"):
+                        print("用法: kp [nosync]")
+                        continue
+                    do_key_path(sync_start=(len(parts) == 1))
                 elif cmd == "s":
                     if len(parts) not in (3, 4):
                         print("用法: s <x> <y> [yaw]  例: s 0 0 或 s 0 0 -90")

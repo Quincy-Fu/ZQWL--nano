@@ -54,7 +54,7 @@ TYPE_CMD_PATH_EXEC     = 0x24   # payload 空
 TYPE_CMD_PATH_RESP     = 0x25   # payload 1B status
 
 PATH_MODE_NORMAL = 0  # 普通通过点: 不停, 进入通过半径后切下一段
-PATH_MODE_KEY    = 1  # 关键点: 接近时减速; 作为终点时要求位置+角度到位
+PATH_MODE_KEY    = 1  # 关键点: 分段提前转到该点yaw, 位置和姿态到位后切段
 
 # 视觉微调 (到位后视觉闭环方向微调, 体坐标系)
 TYPE_CMD_VISION_NUDGE       = 0x27   # PC->MCU: payload 1B direction
@@ -456,7 +456,7 @@ class SerialComm:
              timeout: float | None = None,
              prepend_current: bool = True,
              final_yaw: float | None = None) -> bool:
-        """连续路径跟踪。普通点不停, 终点可用 final_yaw 强制角度到位。
+        """连续路径跟踪。普通点不停, 关键点按下位机策略提前转向并减速通过。
 
         points: 目标点序列, 每点可为 (x,y)、(x,y,yaw) 或 (x,y,yaw,mode)。
         prepend_current=True 时自动把最新位姿作为 p[0], 避免下位机把第一个目标点当起点。
@@ -498,6 +498,24 @@ class SerialComm:
             self.send_path_point(x, y, yaw, mode)
         self.send_path_exec()
         return self.wait_for(TYPE_CMD_PATH_RESP, timeout)
+
+    def key_path(self, points, speed: float = 0.30,
+                 timeout: float | None = None,
+                 prepend_current: bool = False) -> bool:
+        """关键点连续路径。
+
+        每个点必须带 yaw: (x, y, yaw) 或 (x, y, yaw, mode)。本函数会把所有点
+        强制作为 PATH_MODE_KEY 发送, 让下位机在每段前段提前转到下一点 yaw。
+        默认不插入当前位姿, 适合上位机已经给出完整起点的固定轨迹。
+        """
+        key_pts = []
+        for point in points:
+            if len(point) not in (3, 4):
+                raise ValueError("key_path point must be (x,y,yaw) or (x,y,yaw,mode)")
+            x, y, yaw = point[:3]
+            key_pts.append((float(x), float(y), float(yaw), PATH_MODE_KEY))
+        return self.path(key_pts, speed=speed, timeout=timeout,
+                         prepend_current=prepend_current, final_yaw=None)
 
     def vision_nudge(self, direction: int, timeout: float = 3.0) -> bool:
         """视觉微调 (体坐标系方向, 非阻塞运动).
@@ -861,6 +879,13 @@ def path(points, speed: float = 0.30,
         raise RuntimeError("serial not initialized, call init() first")
     return _comm.path(points, speed, timeout, prepend_current, final_yaw)
 
+def key_path(points, speed: float = 0.30,
+             timeout: float | None = None,
+             prepend_current: bool = False) -> bool:
+    if _comm is None:
+        raise RuntimeError("serial not initialized, call init() first")
+    return _comm.key_path(points, speed, timeout, prepend_current)
+
 def run(timeout: float = 5.0) -> bool:
     if _comm is None:
         raise RuntimeError("serial not initialized, call init() first")
@@ -1085,6 +1110,17 @@ def _self_check() -> None:
     assert c._ser.written[n + 3] == pack_frame(
         TYPE_CMD_PATH_POINT, struct.pack("<fffBxxx", 0.4, 0.0, 90.0, PATH_MODE_KEY))
     assert c._ser.written[n + 4] == pack_frame(TYPE_CMD_PATH_EXEC, b"")
+
+    # 6.7.3 key_path: 不自动插入当前位姿, 每个点都作为关键点发送
+    n = len(c._ser.written)
+    assert c.key_path([(0.0, 0.0, -90.0), (0.2, 0.1, -55.0)], speed=0.3, timeout=0.1)
+    assert len(c._ser.written) == n + 4
+    assert c._ser.written[n] == pack_frame(TYPE_CMD_PATH_BEGIN, struct.pack("<fB", 0.3, 2))
+    assert c._ser.written[n + 1] == pack_frame(
+        TYPE_CMD_PATH_POINT, struct.pack("<fffBxxx", 0.0, 0.0, -90.0, PATH_MODE_KEY))
+    assert c._ser.written[n + 2] == pack_frame(
+        TYPE_CMD_PATH_POINT, struct.pack("<fffBxxx", 0.2, 0.1, -55.0, PATH_MODE_KEY))
+    assert c._ser.written[n + 3] == pack_frame(TYPE_CMD_PATH_EXEC, b"")
 
     # 6.8 run → 空 payload 帧 AA 55 06 00 + 收到 RUN_RESP
     assert c.run()
