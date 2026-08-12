@@ -20,6 +20,7 @@
     arc r dir sweep    圆弧 (半径m, dir: 1=右转/-1=左转, 扫过角度°, 圆心自动算)
                        例: arc 0.5 1 180  (右转半圆)
     kp [nosync]         固定关键点连续路径测试, 默认先同步到起点
+    kpr [nosync]        固定关键点路径测试, 每个原地转角同时转盘到槽位1-4
     s <x> <y> [yaw]    重置坐标/可选朝向        例: s 0 0 或 s 0 0 -90
     sy <yaw>           保持当前坐标, 重置朝向    例: sy -90
     p                  打印当前位姿 (下位机50Hz上报)
@@ -59,6 +60,11 @@ KEY_PATH_POINTS = [
     (-1.415, 1.329,  30.0),
     (-1.160, 1.755,  30.0),
 ]
+KEY_PATH_ROTATE_SLOTS = [1, 2, 3, 4]
+KEY_PATH_SEG_TIMEOUT_MIN = 25.0
+KEY_PATH_TURN_TIMEOUT = 25.0
+KEY_PATH_ROTATE_TIMEOUT = 12.0
+KEY_PATH_XY_EPS = 1e-4
 
 
 def timed(label: str, fn) -> bool:
@@ -147,6 +153,87 @@ def do_key_path(sync_start: bool = True):
         f"KEY_PATH {len(KEY_PATH_POINTS)}点 v={KEY_PATH_SPEED:.2f}m/s",
         lambda: comm.key_path(KEY_PATH_POINTS, speed=KEY_PATH_SPEED, timeout=120.0),
     )
+
+
+def _same_xy(a, b) -> bool:
+    return abs(a[0] - b[0]) <= KEY_PATH_XY_EPS and abs(a[1] - b[1]) <= KEY_PATH_XY_EPS
+
+
+def _segment_timeout(a, b) -> float:
+    dist = math.hypot(b[0] - a[0], b[1] - a[1])
+    return max(KEY_PATH_SEG_TIMEOUT_MIN, dist / max(KEY_PATH_SPEED, 0.01) * 6.0 + 6.0)
+
+
+def _send_key_path_segment(points) -> int:
+    """发送两点 key_path 小段并返回 PATH_EXEC 的响应基线。"""
+    comm.send_path_begin(KEY_PATH_SPEED, len(points))
+    for x, y, yaw in points:
+        comm.send_path_point(x, y, yaw, comm.PATH_MODE_KEY)
+    return comm.send_path_exec()
+
+
+def _run_key_path_segment(a, b, idx: int) -> bool:
+    timeout = _segment_timeout(a, b)
+    return timed(
+        f"KEY_PATH 移动 p{idx-1}->p{idx} v={KEY_PATH_SPEED:.2f}m/s",
+        lambda: comm.key_path([a, b], speed=KEY_PATH_SPEED, timeout=timeout),
+    )
+
+
+def _run_key_turn_with_rotate(a, b, idx: int, slot: int) -> bool:
+    def run() -> bool:
+        path_seen = _send_key_path_segment([a, b])
+        rotate_seen = comm.send_rotate(slot)
+
+        path_ok = comm.wait_for_after(comm.TYPE_CMD_PATH_RESP, path_seen, KEY_PATH_TURN_TIMEOUT)
+        rotate_ok = comm.wait_for_after(comm.TYPE_ROTATE_RESP, rotate_seen, KEY_PATH_ROTATE_TIMEOUT)
+        if not path_ok:
+            print("  !! 原地转角 PATH_RESP 超时或失败")
+        if not rotate_ok:
+            print("  !! 转盘 ROTATE_RESP 超时或失败")
+        return path_ok and rotate_ok
+
+    return timed(
+        f"KEY_PATH 原地转角 p{idx-1}->p{idx}, 同时转盘到槽位 {slot}",
+        run,
+    )
+
+
+def do_key_path_with_rotate(sync_start: bool = True) -> bool:
+    """固定关键点路径: 每个重复坐标原地转角时, 同时转盘到下一个槽位。"""
+    start = KEY_PATH_POINTS[0]
+    print("  .. 固定关键点路径 + 转角同步转盘:")
+    for idx, (x, y, yaw) in enumerate(KEY_PATH_POINTS):
+        print(f"     p{idx}: x={x:.3f} y={y:.3f} yaw={yaw:.1f}°")
+    print(f"  .. 转盘槽位序列: {KEY_PATH_ROTATE_SLOTS}")
+
+    if sync_start:
+        print("  .. 默认先同步下位机里程计到 p0；实车也应放在该起点附近。")
+        if not do_sync(start[0], start[1], start[2]):
+            return False
+    else:
+        print("  .. nosync: 不改里程计, 直接按当前下位机位姿执行。")
+
+    rotate_idx = 0
+    for idx in range(1, len(KEY_PATH_POINTS)):
+        a = KEY_PATH_POINTS[idx - 1]
+        b = KEY_PATH_POINTS[idx]
+        if _same_xy(a, b):
+            if rotate_idx >= len(KEY_PATH_ROTATE_SLOTS):
+                print("  !! 转盘槽位数量少于原地转角数量")
+                return False
+            slot = KEY_PATH_ROTATE_SLOTS[rotate_idx]
+            rotate_idx += 1
+            if not _run_key_turn_with_rotate(a, b, idx, slot):
+                return False
+        else:
+            if not _run_key_path_segment(a, b, idx):
+                return False
+
+    if rotate_idx != len(KEY_PATH_ROTATE_SLOTS):
+        print("  !! 转盘槽位数量多于原地转角数量")
+        return False
+    return True
 
 def do_sync(x: float, y: float, yaw_deg: float | None = None):
     if yaw_deg is None:
@@ -272,6 +359,7 @@ HELP = """命令:
     t <deg>            角度环 TURNTO (CW+)
     arc r dir sweep    圆弧 (dir: 1=右转 -1=左转, 扫过角度°)  例: arc 0.5 1 180
     kp [nosync]         固定关键点连续路径测试, 默认先同步到起点
+    kpr [nosync]        固定关键点路径测试, 每个原地转角同时转盘到槽位1-4
     s <x> <y> [yaw]    重置坐标/可选朝向
     sy <yaw>           保持当前坐标, 重置朝向
     p                  打印当前位姿
@@ -372,6 +460,11 @@ def main():
                         print("用法: kp [nosync]")
                         continue
                     do_key_path(sync_start=(len(parts) == 1))
+                elif cmd in ("kpr", "kprotate", "keypathrotate"):
+                    if len(parts) > 2 or (len(parts) == 2 and parts[1] != "nosync"):
+                        print("用法: kpr [nosync]")
+                        continue
+                    do_key_path_with_rotate(sync_start=(len(parts) == 1))
                 elif cmd == "s":
                     if len(parts) not in (3, 4):
                         print("用法: s <x> <y> [yaw]  例: s 0 0 或 s 0 0 -90")

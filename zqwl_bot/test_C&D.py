@@ -1,55 +1,78 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-test_task_c.py - 阶段 C 测试 (恢复原版起点, 接入 block 多帧)
+test_C&D.py - C/D 区新流程测试。
+
+流程按实车调试顺序写死：先同步位姿，二维码识别得到 A/B/C/D/E 目标颜色，
+再沿关键点轨迹识别进入各槽位的物块颜色，最后按 A/B/D/C/E 顺序到点、
+切换转盘并后退 5cm。放置段只走横移+直行，不走斜线。
 """
+
 import math
 import time
-import threading
 
 import comm
-import qr1, block
+import qr1
+import block
 
 
-# ============== 配置 ==============
-ARC_SPEED_MM_S = 200
-AFTER_RECOGNIZE_DELAY_S = 1.0
-HEADING_D = 180
-BACKUP_M = 0.05
-SPLIT_THRESHOLD = 0.03
-INIT_YAW_D = -90.0
+PORT = "/dev/ttyCH341USB0"
+BAUDRATE = 115200
 
-_CUR_X, _CUR_Y = 0.0, 0.0
+INIT_X = 0.0
+INIT_Y = 0.0
+INIT_YAW = 90.0
 
-TARGETS = [
-    (-0.63203, 1.45514),
-    ( 0.22038, 1.45564),
-    (-0.42737, 0.71556),
-    ( 0.33466, 0.71464),
-    ( 0.83621, 0.71518),
+KEY_PATH_SPEED = 0.60
+KEY_PATH_XY_EPS = 1e-4
+KEY_PATH_SEG_TIMEOUT_MIN = 25.0
+KEY_PATH_TURN_TIMEOUT = 25.0
+KEY_PATH_ROTATE_TIMEOUT = 12.0
+AXIS_MOVE_EPS = 1e-4
+PLACE_BACKUP_Y = 0.05
+
+KEY_PATH_POINTS = [
+    (-0.662, 0.250, -90.0),
+    (-0.900, 0.250, -90.0),
+    (-0.900, 0.250, -55.0),
+    (-1.222, 0.480, -55.0),
+    (-1.222, 0.480, -25.0),
+    (-1.412, 0.883, -25.0),
+    (-1.412, 0.883,   0.0),
+    (-1.415, 1.329,   0.0),
+    (-1.415, 1.329,  30.0),
+    (-1.160, 1.755,  30.0),
+]
+KEY_PATH_ROTATE_SLOTS = [1, 2, 3, 4]
+
+TARGET_POINTS = {
+    "A": (-0.620, 1.650),
+    "B": (-0.400, 1.370),
+    "C": ( 0.290, 1.600),
+    "D": ( 0.400, 1.310),
+    "E": ( 0.900, 1.390),
+}
+QR_TARGET_ORDER = ["A", "B", "C", "D", "E"]
+PLACE_ORDER = ["A", "B", "D", "C", "E"]
+FIRST_PLACE_APPROACH = (-0.620, 1.751)
+
+POST_PATH_AFTER_ARM0 = [
+    (0.600, 1.390),
+    (0.600, 0.250),
+    (0.100, 0.250),
+    (0.100, -0.050),
 ]
 
-
-# ============== 角度工具 ==============
-def user_deg(p, c):
-    dx, dy = p[0] - c[0], p[1] - c[1]
-    return (90 - math.degrees(math.atan2(dy, dx))) % 360
-
-def arc_sweep(start, end, center, ccw):
-    a_s = user_deg(start, center)
-    a_e = user_deg(end, center)
-    if ccw:
-        return (a_s - a_e) % 360
-    return (a_e - a_s) % 360
+_CUR_X = 0.0
+_CUR_Y = 0.0
 
 
-# ============== 串口高层 ==============
-def _update_cur(x, y):
+def _update_cur(x: float, y: float) -> None:
     global _CUR_X, _CUR_Y
-    _CUR_X, _CUR_Y = x, y
+    _CUR_X, _CUR_Y = float(x), float(y)
 
 
-def _timed(label, func, *args, **kwargs):
+def _timed(label: str, func, *args, **kwargs):
     t0 = time.monotonic()
     print(f"[TIMING] {label} start", flush=True)
     result = func(*args, **kwargs)
@@ -57,183 +80,260 @@ def _timed(label, func, *args, **kwargs):
     return result
 
 
-def go_to(x, y, x_first=False):
-    """分段走到 (x,y)：两轴差距都较大时拆成平移/直行两段。"""
-    global _CUR_X, _CUR_Y
-    print(f"  GOTO ({x:.4f}, {y:.4f})")
-    dx = abs(x - _CUR_X)
-    dy = abs(y - _CUR_Y)
-    if dx > SPLIT_THRESHOLD and dy > SPLIT_THRESHOLD:
-        if x_first:
-            print(f"    -> 拆段: ({x:.4f}, {_CUR_Y:.4f}) -> ({x:.4f}, {y:.4f})")
-            ok = _timed(f"GOTO seg1 ({x:.4f}, {_CUR_Y:.4f})", comm.goto, x, _CUR_Y, timeout=40.0)
-            if not ok:
-                return ok
-            ok = _timed(f"GOTO seg2 ({x:.4f}, {y:.4f})", comm.goto, x, y, timeout=40.0)
-        else:
-            print(f"    -> 拆段: ({_CUR_X:.4f}, {y:.4f}) -> ({x:.4f}, {y:.4f})")
-            ok = _timed(f"GOTO seg1 ({_CUR_X:.4f}, {y:.4f})", comm.goto, _CUR_X, y, timeout=40.0)
-            if not ok:
-                return ok
-            ok = _timed(f"GOTO seg2 ({x:.4f}, {y:.4f})", comm.goto, x, y, timeout=40.0)
-    else:
-        ok = _timed(f"GOTO direct ({x:.4f}, {y:.4f})", comm.goto, x, y, timeout=40.0)
+def _require(ok: bool, label: str) -> None:
+    if not ok:
+        raise RuntimeError(f"{label} failed")
+
+
+def sync_pose(x: float, y: float, yaw_deg: float) -> bool:
+    ok = _timed(
+        f"SYNC pose ({x:.3f}, {y:.3f}, yaw={yaw_deg:.1f})",
+        comm.sync_pose,
+        x,
+        y,
+        yaw_deg,
+        timeout=5.0,
+    )
     if ok:
         _update_cur(x, y)
     return ok
 
 
-def turn_to(deg):
-    """原地转到指定车体角度。"""
-    print(f"  TURNTO {deg:.1f}° (车体)")
-    return _timed(f"TURNTO {deg:.1f}", comm.turnto, deg, timeout=30.0)
-
-def rotate(pos):
-    print(f"  ROTATE {pos}")
-    return _timed(f"ROTATE {pos}", comm.rotate, pos, timeout=12.0)
-
-
-def arc_with_waypoints(r, dir_, sweep_deg, on_waypoints):
-    def timer():
-        t0 = time.time()
-        for t, cb in on_waypoints:
-            wait = t - (time.time() - t0)
-            if wait > 0:
-                time.sleep(wait)
-            cb()
-    th = threading.Thread(target=timer, daemon=True)
-    th.start()
-    dname = "左转(CCW)" if dir_ < 0 else "右转(CW)"
-    print(f"  ARC r={r:.3f}m {dname} sweep={sweep_deg:.1f}°")
-    ok = comm.arc(r, dir_, sweep_deg)
-    th.join()
+def go_to(x: float, y: float, timeout: float = 40.0) -> bool:
+    print(f"  GOTO ({x:.4f}, {y:.4f})")
+    ok = _timed(f"GOTO ({x:.4f}, {y:.4f})", comm.goto, x, y, timeout=timeout)
+    if ok:
+        _update_cur(x, y)
     return ok
 
 
-def place_and_backup(x, y, rotate_pos, heading=HEADING_D, backup=BACKUP_M):
-    turn_to(heading)
-    go_to(x, y)
-    rotate(rotate_pos)
-    rad = math.radians(heading)
-    bx = x - backup * math.sin(rad)
-    by = y - backup * math.cos(rad)
-    print(f"  后移到 ({bx:.4f}, {by:.4f})")
-    go_to(bx, by)
+def go_axis_x_then_y(x: float, y: float, label: str = "axis move") -> bool:
+    """只走横移+直行：先改 X，再改 Y，避免斜走。"""
+    print(f"  AXIS_MOVE {label}: target=({x:.4f}, {y:.4f})")
+    if abs(_CUR_X - x) > AXIS_MOVE_EPS:
+        if not go_to(x, _CUR_Y):
+            return False
+    if abs(_CUR_Y - y) > AXIS_MOVE_EPS:
+        if not go_to(x, y):
+            return False
+    return True
 
-def arm(state):
+
+def backup_y_after_place(name: str) -> bool:
+    """放置点动作后，沿 +Y 后退 5cm。"""
+    backup_y = _CUR_Y + PLACE_BACKUP_Y
+    print(f"  BACKUP {name}: y + {PLACE_BACKUP_Y:.3f}m -> ({_CUR_X:.4f}, {backup_y:.4f})")
+    return go_to(_CUR_X, backup_y)
+
+
+def turn_to(deg: float, timeout: float = 30.0) -> bool:
+    print(f"  TURNTO {deg:.1f}°")
+    return _timed(f"TURNTO {deg:.1f}", comm.turnto, deg, timeout=timeout)
+
+
+def arm(state: int, timeout: float = 6.0) -> bool:
     print(f"  ARM {state}")
-    return _timed(f"ARM {state}", comm.arm, state, timeout=6.0)
+    return _timed(f"ARM {state}", comm.arm, state, timeout=timeout)
 
 
-def sync_initial_pose():
-    """任务开始前把下位机当前位置基准重置为 (0,0,-90°)。"""
-    _update_cur(0.0, 0.0)
-    ok = _timed("SYNC initial pose (0,0,-90deg)", comm.sync_pose,
-                0.0, 0.0, INIT_YAW_D, timeout=5.0)
-    if not ok:
-        raise RuntimeError("初始位姿同步失败")
+def rotate(pos: int, timeout: float = 12.0) -> bool:
+    print(f"  ROTATE slot {pos}")
+    return _timed(f"ROTATE slot {pos}", comm.rotate, pos, timeout=timeout)
+
+
+def arm_and_light(arm_state: int, light_id: int) -> bool:
+    """机械臂和补光灯尽量同时触发，并分别确认响应。"""
+    def run() -> bool:
+        seen = comm.response_seq()
+        comm.send_arm(arm_state)
+        comm.send_light(light_id, True)
+        arm_ok = comm.wait_for_after(comm.TYPE_ARM_RESP, seen, 6.0)
+        light_ok = comm.wait_for_after(comm.TYPE_LIGHT_RESP, seen, 5.0)
+        if not arm_ok:
+            print("  !! 机械臂响应超时或失败")
+        if not light_ok:
+            print("  !! 补光灯响应超时或失败")
+        return arm_ok and light_ok
+
+    print(f"  ARM {arm_state} + LIGHT {light_id} ON")
+    return _timed(f"ARM {arm_state} + LIGHT {light_id} ON", run)
+
+
+def recognize_qr1_targets() -> dict[str, str]:
+    seq = _timed("QR1 recognize", qr1.recognize)
+    color_seq = qr1.TASK1_PLANS.get(seq)
+    if color_seq is None:
+        raise RuntimeError(f"QR1 result {seq!r} not in TASK1_PLANS")
+    target_colors = dict(zip(QR_TARGET_ORDER, color_seq))
+    print(f"  QR1: {seq} -> {target_colors}")
+    return target_colors
+
+
+def recognize_block_for_slot(slot: int) -> str:
+    color = _timed(f"BLOCK recognize block for slot {slot}", block.recognize_stable,
+                   frames=10, timeout=3.0)
+    if color is None:
+        raise RuntimeError(f"block color for slot {slot} recognize failed")
+    print(f"  loaded slot {slot} <- block color {color}")
+    return color
+
+
+def invert_loaded_slot_colors(loaded_slot_colors: dict[int, str]) -> dict[str, int]:
+    if len(loaded_slot_colors) != 5:
+        raise RuntimeError(f"loaded slot color count invalid: {loaded_slot_colors}")
+    color_to_slot: dict[str, int] = {}
+    for slot, color in loaded_slot_colors.items():
+        if color in color_to_slot:
+            raise RuntimeError(
+                f"duplicate color {color}: slot {color_to_slot[color]} and slot {slot}"
+            )
+        color_to_slot[color] = slot
+    print(f"  color -> slot: {color_to_slot}")
+    return color_to_slot
+
+
+def rotate_for_target(name: str, target_colors: dict[str, str], color_to_slot: dict[str, int]) -> bool:
+    color = target_colors[name]
+    if color not in color_to_slot:
+        raise RuntimeError(f"target {name} needs color {color}, but slot map is {color_to_slot}")
+    slot = color_to_slot[color]
+    print(f"  PLACE {name}: need {color}, rotate slot {slot}")
+    return rotate(slot)
+
+
+def _same_xy(a, b) -> bool:
+    return abs(a[0] - b[0]) <= KEY_PATH_XY_EPS and abs(a[1] - b[1]) <= KEY_PATH_XY_EPS
+
+
+def _segment_timeout(a, b) -> float:
+    dist = math.hypot(b[0] - a[0], b[1] - a[1])
+    return max(KEY_PATH_SEG_TIMEOUT_MIN, dist / max(KEY_PATH_SPEED, 0.01) * 6.0 + 6.0)
+
+
+def _send_key_path_segment(points) -> int:
+    comm.send_path_begin(KEY_PATH_SPEED, len(points))
+    for x, y, yaw in points:
+        comm.send_path_point(x, y, yaw, comm.PATH_MODE_KEY)
+    return comm.send_path_exec()
+
+
+def _run_key_path_segment(a, b, idx: int) -> bool:
+    timeout = _segment_timeout(a, b)
+    ok = _timed(
+        f"KEY_PATH move p{idx - 1}->p{idx} v={KEY_PATH_SPEED:.2f}m/s",
+        comm.key_path,
+        [a, b],
+        speed=KEY_PATH_SPEED,
+        timeout=timeout,
+    )
+    if ok:
+        _update_cur(b[0], b[1])
     return ok
 
 
-def run_task_c():
-    print("\n=== 阶段 C: 走弧 + 颜色识别 ===")
+def _run_key_turn_with_rotate(a, b, idx: int, slot: int) -> bool:
+    def run() -> bool:
+        path_seen = _send_key_path_segment([a, b])
+        rotate_seen = comm.send_rotate(slot)
 
-    # 14
-    turn_to(90)
-    go_to(-0.66158, 0.29568)
+        path_ok = comm.wait_for_after(comm.TYPE_CMD_PATH_RESP, path_seen, KEY_PATH_TURN_TIMEOUT)
+        rotate_ok = comm.wait_for_after(comm.TYPE_ROTATE_RESP, rotate_seen, KEY_PATH_ROTATE_TIMEOUT)
+        if not path_ok:
+            print("  !! 原地转角 PATH_RESP 超时或失败")
+        if not rotate_ok:
+            print("  !! 转盘 ROTATE_RESP 超时或失败")
+        return path_ok and rotate_ok
 
-    # 15. QR1
-    seq1 = _timed("QR1 recognize", qr1.recognize)
-    color_seq = qr1.TASK1_PLANS[seq1]
-    print(f"  QR1: {seq1} -> {color_seq}")
-
-    # 16. 恢复原版起点 (-0.6, 0.2)，但用连续 path 到位并转向
-    go_to(-0.6, 0.2)
-    turn_to(-89)
-    arm(1)
-
-    # 17
-    rotate(0)
-
-    # 18-19. ★ start_c 跟 go_to 一致, 用 (-0.6, 0.2)
-    start_c = (-0.6, 0.2)
-    end_c = (-0.63203, 2.02231)
-    center_c = (-0.575, 1.055)
-    r = 0.910
-
-    sweep_c = arc_sweep(start_c, end_c, center_c, ccw=False)  # 顺时针
-    print(f"  走顺时针圆弧, sweep={sweep_c:.1f}°")
-
-    arc_len_c = math.radians(sweep_c) * r
-    arc_time_c = arc_len_c / (ARC_SPEED_MM_S / 1000)
-    wp_deg_c = [
-        user_deg((-1.05824, 0.25825), center_c),
-        user_deg((-1.39938, 0.60489), center_c),
-        user_deg((-1.524, 1.075), center_c),
-        user_deg((-1.39938, 1.54511), center_c),
-    ]
-    a_s_c = user_deg(start_c, center_c)
-    wp_times_c = [arc_time_c * ((w - a_s_c) % 360) / sweep_c for w in wp_deg_c]
-
-    color_at_pos = [None] * 5
-
-    def on_wp_c(idx):
-        # ★ 5 帧众数 (快速移动中)
-        color = block.recognize(frames=5, timeout=1.5)
-        color_at_pos[idx] = color
-        print(f"  [过点 {idx}] 颜色 = {color}")
-        time.sleep(AFTER_RECOGNIZE_DELAY_S)
-        rotate(idx + 1)
-
-    # 走圆弧前开补光灯 4
-    print("  LIGHT 4 ON")
-    comm.send_light(4, True)
-    time.sleep(0.05)
-
-    arc_with_waypoints(r, 1, sweep_c, [
-        (wp_times_c[0], lambda: on_wp_c(0)),
-        (wp_times_c[1], lambda: on_wp_c(1)),
-        (wp_times_c[2], lambda: on_wp_c(2)),
-        (wp_times_c[3], lambda: on_wp_c(3)),
-    ])
-    _update_cur(end_c[0], end_c[1])
-
-    color_at_pos[4] = block.recognize(frames=5, timeout=1.5)
-    print(f"  [终点 4] 颜色 = {color_at_pos[4]}")
-
-    color_to_pos = {c: i for i, c in enumerate(color_at_pos) if c}
-    print(f"  颜色->位置: {color_to_pos}")
-
-    # === 阶段 D ===
-    print("\n=== 阶段 D: 5 个圆环放置 ===")
-    for i, (tx, ty) in enumerate(TARGETS):
-        color = color_seq[i]
-        if color not in color_to_pos:
-            print(f"  [!] 第 {i+1}: 颜色 {color} 不在, 跳过")
-            continue
-        pos = color_to_pos[color]
-        print(f"  第 {i+1}: 颜色={color} -> 转盘={pos}, 目标=({tx:.4f}, {ty:.4f})")
-        place_and_backup(tx, ty, pos)
-
-    print("\n=== 回 HOME ===")
-    print("  ARM 0")
-    comm.send_arm(0)
-    time.sleep(0.05)
-    go_to(0, 0, x_first=True)
-    turn_to(0)
+    return _timed(
+        f"KEY_PATH turn p{idx - 1}->p{idx}, rotate slot {slot}",
+        run,
+    )
 
 
-def main():
-    comm.init("/dev/ttyCH341USB0", 115200)
+def run_key_path_with_rotate() -> dict[int, str] | None:
+    """执行固定关键点轨迹，并记录进入转盘 0-4 槽位的物块颜色。
+
+    约定进入该函数前转盘已经在槽位 0。路径中每个重复坐标点会先识别
+    即将进入当前槽位的物块颜色，再一边原地转角一边切换到下一个槽位。
+    """
+    print("\n=== 固定关键点轨迹 + 物块入槽颜色识别 + 转角同步转盘 ===")
+    loaded_slot_colors: dict[int, str] = {}
+    current_slot = 0
+    rotate_idx = 0
+    for idx in range(1, len(KEY_PATH_POINTS)):
+        a = KEY_PATH_POINTS[idx - 1]
+        b = KEY_PATH_POINTS[idx]
+        if _same_xy(a, b):
+            if rotate_idx >= len(KEY_PATH_ROTATE_SLOTS):
+                print("  !! 转盘槽位数量少于原地转角数量")
+                return None
+            loaded_slot_colors[current_slot] = recognize_block_for_slot(current_slot)
+            slot = KEY_PATH_ROTATE_SLOTS[rotate_idx]
+            rotate_idx += 1
+            if not _run_key_turn_with_rotate(a, b, idx, slot):
+                return None
+            current_slot = slot
+        else:
+            if not _run_key_path_segment(a, b, idx):
+                return None
+
+    if rotate_idx != len(KEY_PATH_ROTATE_SLOTS):
+        print("  !! 转盘槽位数量多于原地转角数量")
+        return None
+    _update_cur(KEY_PATH_POINTS[-1][0], KEY_PATH_POINTS[-1][1])
+    loaded_slot_colors[current_slot] = recognize_block_for_slot(current_slot)
+    return loaded_slot_colors
+
+
+def run_task_cd() -> None:
+    print("\n=== test_C&D 新流程 ===")
+
+    _require(sync_pose(INIT_X, INIT_Y, INIT_YAW), "SYNC initial pose")
+    _require(go_to(0.0, 0.25), "go to (0, 0.25)")
+    _require(go_to(-0.662, 0.25), "go to (-0.662, 0.25)")
+
+    target_colors = recognize_qr1_targets()
+
+    _require(turn_to(-90.0), "turn to -90")
+    _require(arm_and_light(1, 4), "arm 1 and light 4 on")
+    _require(rotate(0), "rotate slot 0 before slot scan")
+    loaded_slot_colors = run_key_path_with_rotate()
+    if loaded_slot_colors is None:
+        raise RuntimeError("key path with slot scan failed")
+    color_to_slot = invert_loaded_slot_colors(loaded_slot_colors)
+
+    _require(turn_to(180.0), "turn to 180")
+
+    _require(go_axis_x_then_y(*FIRST_PLACE_APPROACH, label="first approach before A"),
+             "first approach before A")
+    for name in PLACE_ORDER:
+        x, y = TARGET_POINTS[name]
+        _require(go_axis_x_then_y(x, y, label=f"move to {name}"), f"move to {name}")
+        _require(rotate_for_target(name, target_colors, color_to_slot), f"rotate for {name}")
+        _require(backup_y_after_place(name), f"backup after {name}")
+
+    _require(arm(0), "arm 0")
+    for x, y in POST_PATH_AFTER_ARM0:
+        _require(go_axis_x_then_y(x, y, label=f"exit ({x:.3f}, {y:.3f})"),
+                 f"exit to ({x:.3f}, {y:.3f})")
+
+    print("\n=== test_C&D 流程完成 ===")
+
+
+def main() -> None:
+    comm.init(PORT, BAUDRATE)
     time.sleep(1.0)
     try:
-        sync_initial_pose()
-        run_task_c()
+        run_task_cd()
     except RuntimeError as e:
         print(f"\n[兜底] 任务中断: {e}")
     except KeyboardInterrupt:
         print("\n[用户中断]")
     finally:
+        try:
+            block.close()
+        except Exception as e:
+            print(f"[清理] block camera close failed: {e}")
         comm.shutdown()
 
 

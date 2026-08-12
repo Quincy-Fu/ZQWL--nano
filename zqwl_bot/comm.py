@@ -12,6 +12,7 @@ import math
 import struct
 import threading
 import time
+from collections import deque
 
 import serial
 
@@ -124,6 +125,7 @@ class SerialComm:
         self._resp_sent_seq: int = 0   # 最近一次发命令时的 seq 基线 (发送瞬间记录)
         self._nav_resp_type: int = 0
         self._nav_resp_status: int = 0
+        self._resp_history = deque(maxlen=32)  # (seq, type, status), 供并发命令事后确认
         # 位姿 (下位机50Hz常驻上报, 存最新一帧供随时读取)
         self._pose: tuple[float, float, float] | None = None   # (x, y, yaw_deg)
         self._pose_ts: float = 0.0                               # monotonic 时间戳
@@ -151,13 +153,14 @@ class SerialComm:
         frame = pack_frame(TYPE_CMD_VEL, struct.pack("<fff", vx, vy, w))
         self._ser.write(frame)
 
-    def send_rotate(self, pos: int) -> None:
+    def send_rotate(self, pos: int) -> int:
         if not self._ser:
             raise RuntimeError("serial not started")
         if not (0 <= pos <= 4):
             raise ValueError("rotate pos must be 0-4")
-        self._mark_send()
+        seen = self._mark_send()
         self._ser.write(pack_frame(TYPE_ROTATE, struct.pack("<B", pos)))
+        return seen
 
     def send_arm(self, state: int) -> None:
         if not self._ser:
@@ -194,17 +197,19 @@ class SerialComm:
 
     # --- 导航命令发送 ---
 
-    def _mark_send(self) -> None:
+    def _mark_send(self) -> int:
         """记录发送时刻的 seq 基线 (必须在 write 之前调用)."""
         with self._resp_cond:
             self._resp_sent_seq = self._nav_resp_seq
+            return self._resp_sent_seq
 
-    def _send_nav(self, msg_type: int, payload: bytes) -> None:
+    def _send_nav(self, msg_type: int, payload: bytes) -> int:
         """发送导航命令. (响应由 seq 机制区分, 无需在此清除.)"""
         if not self._ser:
             raise RuntimeError("serial not started")
-        self._mark_send()
+        seen = self._mark_send()
         self._ser.write(pack_frame(msg_type, payload))
+        return seen
 
     @staticmethod
     def _check_finite(*vals: float) -> None:
@@ -289,9 +294,9 @@ class SerialComm:
                        struct.pack("<fffBxxx", float(x), float(y),
                                    float(target_theta), int(mode)))
 
-    def send_path_exec(self) -> None:
+    def send_path_exec(self) -> int:
         """触发执行已装载的连续路径。"""
-        self._send_nav(TYPE_CMD_PATH_EXEC, b"")
+        return self._send_nav(TYPE_CMD_PATH_EXEC, b"")
 
     def send_vision_nudge(self, direction: int) -> None:
         """发送视觉微调命令 (体坐标系方向, 1B payload).
@@ -367,6 +372,35 @@ class SerialComm:
     # 与下位机一一对应: 锁轴=TOX/TOY(1数据), 走点=GOTO(2数据)或GOTO+TURNTO(3数据),
     # 圆弧=ARC(3数据: 半径/方向/扫角, 可选第4个速度). 坐标单位米, yaw 单位度(CW+).
     # 每条命令 MCU 阻塞执行后回 status.
+
+    def response_seq(self) -> int:
+        """返回当前响应 seq, 用于并发命令的事后确认。"""
+        with self._resp_cond:
+            return self._nav_resp_seq
+
+    def wait_for_after(self, expect: int, seen_seq: int, timeout: float) -> bool:
+        """等待 seen_seq 之后出现过的指定响应。
+
+        这个接口查询响应历史队列，适合“先发一条不阻塞命令，
+        同时执行另一条阻塞命令，最后再确认第一条响应”的场景。
+        """
+        deadline = time.monotonic() + timeout
+        seen = int(seen_seq)
+        with self._resp_cond:
+            while True:
+                max_seen = seen
+                for seq, msg_type, status in self._resp_history:
+                    if seq <= seen:
+                        continue
+                    max_seen = max(max_seen, seq)
+                    if msg_type == expect:
+                        return status == 1
+                seen = max_seen
+
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    return False
+                self._resp_cond.wait(remain)
 
     def lock_axis(self, axis: str, target: float, timeout: float = 40.0) -> bool:
         """锁轴移动 (1 个数据).
@@ -674,9 +708,11 @@ class SerialComm:
     def _dispatch(self, msg_type: int, payload: bytes) -> None:
         if msg_type in _NAV_RESP_TYPES and len(payload) == 1:
             with self._resp_cond:
+                status = payload[0]
                 self._nav_resp_type = msg_type
-                self._nav_resp_status = payload[0]
+                self._nav_resp_status = status
                 self._nav_resp_seq += 1
+                self._resp_history.append((self._nav_resp_seq, msg_type, status))
                 self._resp_cond.notify_all()
         elif msg_type == TYPE_POSE and len(payload) >= 12:
             x, y, theta_rad = struct.unpack("<fff", payload[:12])
@@ -754,10 +790,10 @@ def send_velocity(vx: float, vy: float, w: float) -> None:
     _comm.send_velocity(vx, vy, w)
 
 
-def send_rotate(pos: int) -> None:
+def send_rotate(pos: int) -> int:
     if _comm is None:
         raise RuntimeError("serial not initialized, call init() first")
-    _comm.send_rotate(pos)
+    return _comm.send_rotate(pos)
 
 
 def send_arm(state: int) -> None:
@@ -828,10 +864,10 @@ def send_path_point(x: float, y: float,
         raise RuntimeError("serial not initialized")
     _comm.send_path_point(x, y, target_theta, mode)
 
-def send_path_exec() -> None:
+def send_path_exec() -> int:
     if _comm is None:
         raise RuntimeError("serial not initialized")
-    _comm.send_path_exec()
+    return _comm.send_path_exec()
 
 def send_vision_nudge(direction: int) -> None:
     if _comm is None:
@@ -859,6 +895,18 @@ def wait_for(expect: int, timeout: float = 30.0) -> bool:
     if _comm is None:
         raise RuntimeError("serial not initialized, call init() first")
     return _comm.wait_for(expect, timeout)
+
+def response_seq() -> int:
+    """返回当前响应 seq, 用于并发命令的事后确认。"""
+    if _comm is None:
+        raise RuntimeError("serial not initialized, call init() first")
+    return _comm.response_seq()
+
+def wait_for_after(expect: int, seen_seq: int, timeout: float = 30.0) -> bool:
+    """等待 seen_seq 之后出现过的指定响应。"""
+    if _comm is None:
+        raise RuntimeError("serial not initialized, call init() first")
+    return _comm.wait_for_after(expect, seen_seq, timeout)
 
 
 # 高层运动命令单例 API ("选择形式": 锁轴 / 走点 / 圆弧, 阻塞式返回成败)

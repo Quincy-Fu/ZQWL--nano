@@ -17,7 +17,23 @@ import qr2, block
 ARC_SPEED_MM_S = 200
 WAYPOINT_DELAY_S = 1.0
 BACKUP_M = 0.05
+PLACE_BACKUP_M = 0.10
 HEADING_D = 0                  # 阶段 B 放物车头朝向 (车体坐标)
+INIT_YAW_D = 90.0
+SPLIT_THRESHOLD = 0.03
+
+# 冠亚季点位。按用户说明: 冠/亚/季 对应 A/B/C。
+RANK_TARGETS = [
+    ("亚军", "B", 0.25, 1.779, 3, 2),
+    ("冠军", "A", 0.05, 1.779, 4, 2),
+    ("季军", "C", -0.15, 1.779, 1, 0),
+]
+RETURN_POINTS = [(-0.15, 0.1), (-0.05, 0.1)]
+
+# QR2 返回的 3 个字母对应位置 1、2、3 上的物块顺序。
+# 圆弧过程中实际依次经过 3、2、1, 所以取转盘槽位时要按位置号反查。
+ARC_PASS_POSITIONS = [3, 2, 1]
+ARC_ROTATE_FRACTIONS = [1.0 / 3.0, 2.0 / 3.0, 0.95]
 
 # 阶段 B 3 个目标点
 TARGETS_B = [
@@ -27,6 +43,8 @@ TARGETS_B = [
 ]
 
 ALPHA_TO_POS = {"A": 0, "B": 1, "C": 2}
+
+_CUR_X, _CUR_Y = 0.0, 0.0
 
 
 # ============== 角度工具 (算 sweep) ==============
@@ -43,9 +61,44 @@ def arc_sweep(start, end, center, ccw):
 
 
 # ============== 串口高层 ==============
+def _update_cur(x, y):
+    global _CUR_X, _CUR_Y
+    _CUR_X, _CUR_Y = x, y
+
+
+def refresh_cur_from_pose():
+    """圆弧后用下位机上报位姿刷新本地分段移动起点。"""
+    pose = comm.get_pose(max_age=1.0)
+    if pose is None:
+        print("  !! 没有新鲜 POSE，本地分段起点沿用上一次记录")
+        return False
+    _update_cur(pose[0], pose[1])
+    print(f"  当前位姿刷新: ({pose[0]:.4f}, {pose[1]:.4f}), yaw={pose[2]:.1f}°")
+    return True
+
+
 def go_to(x, y):
     print(f"  GOTO ({x:.4f}, {y:.4f})")
-    return comm.goto(x, y, timeout=40.0)
+    ok = comm.goto(x, y, timeout=40.0)
+    if ok:
+        _update_cur(x, y)
+    return ok
+
+
+def go_to_split(x, y, x_first=False):
+    """两轴差距都较大时拆成横移和直行两段，减少斜移。"""
+    global _CUR_X, _CUR_Y
+    dx = abs(x - _CUR_X)
+    dy = abs(y - _CUR_Y)
+    if dx > SPLIT_THRESHOLD and dy > SPLIT_THRESHOLD:
+        if x_first:
+            if not go_to(x, _CUR_Y):
+                return False
+            return go_to(x, y)
+        if not go_to(_CUR_X, y):
+            return False
+        return go_to(x, y)
+    return go_to(x, y)
 
 def turn_to(deg):
     print(f"  TURNTO {deg:.1f}° (车体)")
@@ -58,6 +111,21 @@ def rotate(pos):
 def arm(state):
     print(f"  ARM {state}")
     return comm.arm(state, timeout=6.0)
+
+
+def arm_async(state):
+    """发送机械臂命令但不等待响应，用于后退时同步切状态。"""
+    print(f"  ARM {state} (不等待, 与后退动作衔接)")
+    comm.send_arm(state)
+    return True
+
+
+def sync_pose(x, y, yaw):
+    print(f"  SYNC POSE ({x:.4f}, {y:.4f}, yaw={yaw:.1f}°)")
+    ok = comm.sync_pose(x, y, yaw, timeout=5.0)
+    if ok:
+        _update_cur(x, y)
+    return ok
 
 
 def arc_with_waypoints(r, dir_, sweep_deg, on_waypoints):
@@ -91,73 +159,76 @@ def place_and_backup(x, y, rotate_pos, heading=HEADING_D, backup=BACKUP_M):
     comm.goto(bx, by, timeout=10.0)
 
 
+def place_rank(rank_name, letter, x, y, arm_state, after_arm_state):
+    """到达名次点后切机械臂、切转盘、后退 10cm，并同步切后续机械臂状态。"""
+    slot = ALPHA_TO_POS[letter]
+    print(f"  {rank_name}: {letter} -> 转盘槽位 {slot}, 目标=({x:.4f}, {y:.4f})")
+    if not go_to_split(x, y):
+        return False
+    if not arm(arm_state):
+        return False
+    if not rotate(slot):
+        return False
+    bx, by = x, y - PLACE_BACKUP_M
+    print(f"  {rank_name}: 后退 10cm 到 ({bx:.4f}, {by:.4f}), 同步切机械臂状态 {after_arm_state}")
+    arm_async(after_arm_state)
+    return go_to_split(bx, by)
+
+
 # ============== 阶段 A + B ==============
 def run_task_ab():
-    # ===== 阶段 A: 右半区装载 =====
-    print("\n=== 阶段 A: 右半区装载 ===")
+    print("\n=== 阶段 A+B: 按指定路线测试 ===")
 
-    # 1. HOME (0,0) -> (0, 0.295), 朝 0°
-    turn_to(0)
-    go_to(0, 0.295)
+    # 1. 起点位姿基准
+    if not sync_pose(0.0, 0.0, INIT_YAW_D):
+        raise RuntimeError("初始位姿同步失败")
 
-    # 2. 朝 90° -> (0.63679, 0.29568)
-    turn_to(90)
-    go_to(0.63679, 0.29568)
+    # 2. 扫码前移动
+    go_to(0.0, 0.25)
+    go_to(0.7, 0.25)
 
-    # 3-4. QR2 识别字母顺序 -> 转盘位置方案
-    seq2 = qr2.recognize()                       # "CAB"
-    plan = [ALPHA_TO_POS[c] for c in seq2]       # 例 [2, 0, 1]
-    print(f"  QR2: {seq2} -> 方案 {plan}")
+    # 3. QR2 识别 1->2->3 三个位置上的 ABC 摆放顺序
+    seq2 = qr2.recognize()                       # 例: "CAB"
+    pos_to_slot = {
+        pos_no: ALPHA_TO_POS[letter]
+        for pos_no, letter in zip((1, 2, 3), seq2)
+    }
+    print(f"  QR2: {seq2} -> 1/2/3位置转盘槽位 {pos_to_slot}")
 
-    # 5. 平移到 (0.63679, 0.12996)
-    go_to(0.63679, 0.26)
-
-    # 6. 准备: 调转盘到 plan[0] + 机械臂 1 号位
-    rotate(plan[0])
+    # 4. 进入圆弧前先进入取放状态, 转盘在经过 3/2/1 时切到对应槽位
     arm(1)
 
-    # 7. 走逆时针圆弧 (dir=-1) + 2 过点切转盘
-    start_a = (0.63679, 0.26)
-    end_a = (0.575, 2.024)
-    center_a = (0.575, 1.055)
-    r = 0.939
+    arc_r = 0.84
+    arc_dir = -1
+    arc_sweep_deg = 130.0
+    arc_time = math.radians(arc_sweep_deg) * arc_r / (ARC_SPEED_MM_S / 1000)
 
-    sweep_a = arc_sweep(start_a, end_a, center_a, ccw=True)
-    print(f"  走逆时针圆弧, sweep={sweep_a:.1f}°")
-
-    arc_len_a = math.radians(sweep_a) * r
-    arc_time_a = arc_len_a / (ARC_SPEED_MM_S / 1000)
-    wp1_deg = user_deg((1.46721, 0.65758), center_a)
-    wp2_deg = user_deg((1.564, 1.075), center_a)
-    a_s_a = user_deg(start_a, center_a)
-    t1 = arc_time_a * ((a_s_a - wp1_deg) % 360) / sweep_a
-    t2 = arc_time_a * ((a_s_a - wp2_deg) % 360) / sweep_a
-
-    def on_wp_a(idx):
-        # 过点 idx+1 1s 后切到 plan[idx+1]
+    def on_arc_switch(idx):
         time.sleep(WAYPOINT_DELAY_S)
-        rotate(plan[idx + 1])
+        pos_no = ARC_PASS_POSITIONS[idx]
+        slot = pos_to_slot[pos_no]
+        letter = seq2[pos_no - 1]
+        print(f"  [圆弧位置 {pos_no}] 转盘切到槽位 {slot} ({letter})")
+        rotate(slot)
 
-    arc_with_waypoints(r, -1, sweep_a, [
-        (t1, lambda: on_wp_a(0)),
-        (t2, lambda: on_wp_a(1)),
+    arc_with_waypoints(arc_r, arc_dir, arc_sweep_deg, [
+        (arc_time * ARC_ROTATE_FRACTIONS[0], lambda: on_arc_switch(0)),
+        (arc_time * ARC_ROTATE_FRACTIONS[1], lambda: on_arc_switch(1)),
+        (arc_time * ARC_ROTATE_FRACTIONS[2], lambda: on_arc_switch(2)),
     ])
 
-    # ===== 阶段 B: 右半区圆环放置 =====
-    print("\n=== 阶段 B: 3 个圆环放置 (简化版) ===")
+    # 5. 圆弧后进入冠亚季放置流程
+    refresh_cur_from_pose()
     turn_to(0)
+    arm(2)
+    for rank_name, letter, x, y, arm_state, after_arm_state in RANK_TARGETS:
+        if not place_rank(rank_name, letter, x, y, arm_state, after_arm_state):
+            raise RuntimeError(f"{rank_name} 放置流程失败")
 
-    # TODO: 阶段 B 之前应该 arm(3), 然后 3 个 place_and_backup
-    # 这里只做 3 个放置, 转盘位置写死
-    for i, (tx, ty, pos) in enumerate(TARGETS_B):
-        print(f"  第 {i+1} 个: 目标=({tx:.4f}, {ty:.4f}), 转盘={pos}")
-        # 调机械臂 (按你之前的规则: 3, 2, 4)
-        arm_states = [3, 2, 4]
-        arm(arm_states[i])
-        place_and_backup(tx, ty, pos)
-
-    # 13. 回到 (0, 0.295)
-    go_to(0, 0.295)
+    # 6. 后续回退点
+    for x, y in RETURN_POINTS:
+        if not go_to_split(x, y):
+            raise RuntimeError("回退路径失败")
 
     print("\n[完成] 阶段 A + B 测试结束")
 

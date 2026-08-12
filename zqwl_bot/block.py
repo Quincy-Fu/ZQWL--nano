@@ -263,7 +263,7 @@ def _recognize_multi(frames, min_hits, timeout_s):
             time.sleep(0.01)
             continue
 
-        color = _single_frame_color(frame, thresholds)
+        color, _ = _single_frame_color(frame, thresholds)
         votes[color if color else None] += 1
         count += 1
 
