@@ -46,13 +46,17 @@ except ImportError:
     import comm                 # 作为脚本直接运行
 
 
-KEY_PATH_SPEED = 0.30
+KEY_PATH_SPEED = 0.60
 KEY_PATH_POINTS = [
     (-0.662, 0.250, -90.0),
     (-0.900, 0.250, -90.0),
+    (-0.900, 0.250, -55.0),
     (-1.222, 0.480, -55.0),
+    (-1.222, 0.480, -25.0),
     (-1.412, 0.883, -25.0),
+    (-1.412, 0.883,   0.0),
     (-1.415, 1.329,   0.0),
+    (-1.415, 1.329,  30.0),
     (-1.160, 1.755,  30.0),
 ]
 
@@ -126,7 +130,7 @@ def do_arc(r: float, dir_: int, sweep: float):
 
 
 def do_key_path(sync_start: bool = True):
-    """固定关键点连续路径测试: 每个点都带目标yaw, 下位机段内提前转向。"""
+    """固定关键点连续路径测试: 重复坐标点表示先转角, 再走下一段。"""
     start = KEY_PATH_POINTS[0]
     print("  .. 固定关键点路径:")
     for idx, (x, y, yaw) in enumerate(KEY_PATH_POINTS):
@@ -141,7 +145,7 @@ def do_key_path(sync_start: bool = True):
 
     return timed(
         f"KEY_PATH {len(KEY_PATH_POINTS)}点 v={KEY_PATH_SPEED:.2f}m/s",
-        lambda: comm.key_path(KEY_PATH_POINTS, speed=KEY_PATH_SPEED, timeout=40.0),
+        lambda: comm.key_path(KEY_PATH_POINTS, speed=KEY_PATH_SPEED, timeout=120.0),
     )
 
 def do_sync(x: float, y: float, yaw_deg: float | None = None):

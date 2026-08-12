@@ -505,7 +505,7 @@ class SerialComm:
         """关键点连续路径。
 
         每个点必须带 yaw: (x, y, yaw) 或 (x, y, yaw, mode)。本函数会把所有点
-        强制作为 PATH_MODE_KEY 发送, 让下位机在每段前段提前转到下一点 yaw。
+        强制作为 PATH_MODE_KEY 发送; 重复坐标点由下位机解释为原地转角点。
         默认不插入当前位姿, 适合上位机已经给出完整起点的固定轨迹。
         """
         key_pts = []
@@ -514,6 +514,15 @@ class SerialComm:
                 raise ValueError("key_path point must be (x,y,yaw) or (x,y,yaw,mode)")
             x, y, yaw = point[:3]
             key_pts.append((float(x), float(y), float(yaw), PATH_MODE_KEY))
+        if timeout is None:
+            total_len = 0.0
+            zero_turns = 0
+            for (x0, y0, _, _), (x1, y1, _, _) in zip(key_pts, key_pts[1:]):
+                seg_len = math.hypot(x1 - x0, y1 - y0)
+                if seg_len < 1e-4:
+                    zero_turns += 1
+                total_len += seg_len
+            timeout = max(30.0, total_len / speed * 6.0 + zero_turns * 8.0 + 15.0)
         return self.path(key_pts, speed=speed, timeout=timeout,
                          prepend_current=prepend_current, final_yaw=None)
 
