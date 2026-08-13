@@ -15,6 +15,7 @@ import comm
 
 CONFIG = {
     "usb_device": 1,
+    "usb_devices": [1, 0],
     "width": 640,
     "height": 480,
     "fps": 30,
@@ -77,7 +78,9 @@ class USBCamera:
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if not self.cap.isOpened():
-            raise RuntimeError("无法打开USB摄像头")
+            self.cap.release()
+            self.cap = None
+            raise RuntimeError(f"无法打开USB摄像头 device={self.device}")
 
     def read(self):
         if self.cap is None:
@@ -100,10 +103,28 @@ _viewer_started = False
 
 def _get_cam():
     if _cam_cache["cam"] is None:
-        cam = USBCamera(CONFIG["usb_device"], CONFIG["width"],
-                       CONFIG["height"], CONFIG["fps"])
-        cam.start()
-        _cam_cache["cam"] = cam
+        devices = CONFIG.get("usb_devices") or [CONFIG.get("usb_device", 1)]
+        # 保留 usb_device 作为首选，同时自动尝试 1/0，避免摄像头枚举顺序变化。
+        ordered_devices = []
+        for dev in [CONFIG.get("usb_device", 1), *devices, 1, 0]:
+            if dev not in ordered_devices:
+                ordered_devices.append(dev)
+
+        last_error = None
+        for dev in ordered_devices:
+            cam = USBCamera(dev, CONFIG["width"], CONFIG["height"], CONFIG["fps"])
+            try:
+                cam.start()
+            except RuntimeError as e:
+                last_error = e
+                continue
+            CONFIG["usb_device"] = dev
+            _cam_cache["cam"] = cam
+            print(f"[block] USB摄像头已打开: device={dev}")
+            break
+
+        if _cam_cache["cam"] is None:
+            raise RuntimeError(f"无法打开USB摄像头，已尝试 {ordered_devices}: {last_error}")
     return _cam_cache["cam"]
 
 

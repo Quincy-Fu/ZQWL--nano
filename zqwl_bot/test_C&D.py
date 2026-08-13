@@ -141,12 +141,13 @@ def rotate(pos: int, timeout: float = 12.0) -> bool:
     return _timed(f"ROTATE slot {pos}", comm.rotate, pos, timeout=timeout)
 
 
-def arm_and_light(arm_state: int, light_id: int) -> bool:
-    """机械臂和补光灯尽量同时触发，并分别确认响应。"""
+def prepare_block_scan(arm_state: int, light_id: int) -> bool:
+    """机械臂、补光灯和 USB 摄像头尽量同时准备。"""
     def run() -> bool:
         seen = comm.response_seq()
         comm.send_arm(arm_state)
         comm.send_light(light_id, True)
+        block.start_viewer()
         arm_ok = comm.wait_for_after(comm.TYPE_ARM_RESP, seen, 6.0)
         light_ok = comm.wait_for_after(comm.TYPE_LIGHT_RESP, seen, 5.0)
         if not arm_ok:
@@ -155,8 +156,8 @@ def arm_and_light(arm_state: int, light_id: int) -> bool:
             print("  !! 补光灯响应超时或失败")
         return arm_ok and light_ok
 
-    print(f"  ARM {arm_state} + LIGHT {light_id} ON")
-    return _timed(f"ARM {arm_state} + LIGHT {light_id} ON", run)
+    print(f"  ARM {arm_state} + LIGHT {light_id} ON + USB CAMERA START")
+    return _timed(f"ARM {arm_state} + LIGHT {light_id} ON + USB CAMERA START", run)
 
 
 def recognize_qr1_targets() -> dict[str, str]:
@@ -295,7 +296,7 @@ def run_task_cd() -> None:
     target_colors = recognize_qr1_targets()
 
     _require(turn_to(-90.0), "turn to -90")
-    _require(arm_and_light(1, 4), "arm 1 and light 4 on")
+    _require(prepare_block_scan(1, 4), "arm 1, light 4 and USB camera ready")
     _require(rotate(0), "rotate slot 0 before slot scan")
     loaded_slot_colors = run_key_path_with_rotate()
     if loaded_slot_colors is None:
@@ -330,6 +331,10 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n[用户中断]")
     finally:
+        try:
+            comm.light(4, False, timeout=2.0)
+        except Exception as e:
+            print(f"[清理] light 4 off failed: {e}")
         try:
             block.close()
         except Exception as e:
