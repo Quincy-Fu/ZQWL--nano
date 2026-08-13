@@ -4,11 +4,12 @@
 test_C&D.py - C/D 区新流程测试。
 
 流程按实车调试顺序写死：先同步位姿，二维码识别得到 A/B/C/D/E 目标颜色，
-再顺序扫描转盘槽位颜色，随后走 C/D 圆弧，最后按 A/B/D/C/E 顺序到点、
-切换转盘并后退 5cm。放置段只走横移+直行，不走斜线。
+再转到 -90° 准备机械臂/补光灯/USB，随后走 C/D 圆弧，最后按 A/B/D/C/E
+顺序到点并后退 5cm。放置段只走横移+直行，不走斜线。
 """
 
 import math
+import threading
 import time
 
 import comm
@@ -37,6 +38,9 @@ CD_ARC_RADIUS = 0.869
 CD_ARC_DIR = 1
 CD_ARC_SWEEP_DEG = 130.0
 CD_ARC_SPEED = KEY_PATH_SPEED
+CD_TURNTABLE_FIRST_SLOT = 1
+CD_TURNTABLE_ARC_SLOTS = [2, 3, 4]
+CD_TURNTABLE_ARC_INTERVAL_S = 1.0
 
 KEY_PATH_POINTS = [
     (-0.662, 0.250, -90.0),
@@ -148,6 +152,29 @@ def rotate(pos: int, timeout: float = 12.0) -> bool:
     return _timed(f"ROTATE slot {pos}", comm.rotate, pos, timeout=timeout)
 
 
+def rotate_async(pos: int, label: str = "") -> bool:
+    """只下发转盘槽位命令，不等待响应；用于和转向/圆弧并行动作。"""
+    suffix = f" {label}" if label else ""
+    print(f"  ROTATE slot {pos} (不等待{suffix})")
+    comm.send_rotate(pos)
+    return True
+
+
+def start_timed_turntable_slots(slots, interval_s: float) -> tuple[threading.Thread, threading.Event]:
+    """后台每隔固定时间下发一次转盘槽位切换。"""
+    stop_event = threading.Event()
+
+    def worker() -> None:
+        for slot in slots:
+            if stop_event.wait(interval_s):
+                break
+            rotate_async(slot, label="定时切换")
+
+    th = threading.Thread(target=worker, name="cd-turntable-timer", daemon=True)
+    th.start()
+    return th, stop_event
+
+
 def refresh_cur_from_pose(label: str = "pose") -> bool:
     """用下位机上报位姿刷新本地坐标，供后续横移+直行分段使用。"""
     for _ in range(20):
@@ -166,15 +193,23 @@ def run_cd_arc() -> bool:
     """按用户指定参数直接走 C/D 圆弧。"""
     timeout = (math.radians(CD_ARC_SWEEP_DEG) * CD_ARC_RADIUS /
                max(CD_ARC_SPEED, 0.01) * 2.5 + 15.0)
-    ok = _timed(
-        f"ARC r={CD_ARC_RADIUS:.3f} dir={CD_ARC_DIR} sweep={CD_ARC_SWEEP_DEG:.1f} v={CD_ARC_SPEED:.2f}",
-        comm.arc,
-        CD_ARC_RADIUS,
-        CD_ARC_DIR,
-        CD_ARC_SWEEP_DEG,
-        speed=CD_ARC_SPEED,
-        timeout=timeout,
+    turntable_thread, turntable_stop = start_timed_turntable_slots(
+        CD_TURNTABLE_ARC_SLOTS,
+        CD_TURNTABLE_ARC_INTERVAL_S,
     )
+    try:
+        ok = _timed(
+            f"ARC r={CD_ARC_RADIUS:.3f} dir={CD_ARC_DIR} sweep={CD_ARC_SWEEP_DEG:.1f} v={CD_ARC_SPEED:.2f}",
+            comm.arc,
+            CD_ARC_RADIUS,
+            CD_ARC_DIR,
+            CD_ARC_SWEEP_DEG,
+            speed=CD_ARC_SPEED,
+            timeout=timeout,
+        )
+    finally:
+        turntable_stop.set()
+        turntable_thread.join(timeout=1.0)
     if ok:
         return refresh_cur_from_pose("after C/D arc")
     return False
@@ -256,6 +291,12 @@ def rotate_for_target(name: str, target_colors: dict[str, str], color_to_slot: d
     slot = color_to_slot[color]
     print(f"  PLACE {name}: need {color}, rotate slot {slot}")
     return rotate(slot)
+
+
+def log_target_color(name: str, target_colors: dict[str, str]) -> None:
+    """不切转盘时，只打印当前目标点对应的二维码颜色。"""
+    color = target_colors.get(name, "未知")
+    print(f"  PLACE {name}: QR目标颜色={color}，本流程不按槽位切转盘")
 
 
 def _same_xy(a, b) -> bool:
@@ -351,11 +392,11 @@ def run_task_cd() -> None:
 
     target_colors = recognize_qr1_targets()
 
+    _require(turn_to(-90.0), "turn to -90 before C/D arc")
     _require(prepare_block_scan(1, 4), "arm 1, light 4 and USB camera ready")
-    loaded_slot_colors = scan_turntable_slots()
-    color_to_slot = invert_loaded_slot_colors(loaded_slot_colors)
 
     _require(go_to(*CD_ARC_START), "go to C/D arc start")
+    rotate_async(CD_TURNTABLE_FIRST_SLOT, label="到达圆弧起点先切一次")
     _require(turn_to(CD_ARC_START_YAW), "turn to C/D arc yaw")
     _require(run_cd_arc(), "C/D arc")
     _require(turn_to(180.0), "turn to 180")
@@ -365,7 +406,7 @@ def run_task_cd() -> None:
     for name in PLACE_ORDER:
         x, y = TARGET_POINTS[name]
         _require(go_axis_x_then_y(x, y, label=f"move to {name}"), f"move to {name}")
-        _require(rotate_for_target(name, target_colors, color_to_slot), f"rotate for {name}")
+        log_target_color(name, target_colors)
         _require(backup_y_after_place(name), f"backup after {name}")
 
     _require(arm(0), "arm 0")
