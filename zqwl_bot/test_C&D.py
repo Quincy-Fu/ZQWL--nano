@@ -4,13 +4,14 @@
 test_C&D.py - C/D 区新流程测试。
 
 流程按实车调试顺序写死：先同步位姿，二维码识别得到 A/B/C/D/E 目标颜色，
-再转到 -90° 准备机械臂/补光灯/USB，随后走 C/D 圆弧，最后按 A/B/D/C/E
-顺序到点并后退 5cm。放置段只走横移+直行，不走斜线。
+再转到 -90° 准备机械臂/补光灯/USB，按实车经过顺序识别 5 个物块并同步收纳，
+随后按 A/B/D/C/E 顺序到点、按颜色切转盘并后退 5cm。放置段只走横移+直行，不走斜线。
 """
 
 import math
 import threading
 import time
+from typing import Optional
 
 import comm
 import qr1
@@ -38,9 +39,17 @@ CD_ARC_RADIUS = 0.869
 CD_ARC_DIR = 1
 CD_ARC_SWEEP_DEG = 130.0
 CD_ARC_SPEED = KEY_PATH_SPEED
-CD_TURNTABLE_FIRST_SLOT = 1
-CD_TURNTABLE_ARC_SLOTS = [2, 3, 4]
-CD_TURNTABLE_ARC_INTERVAL_S = 1.0
+CD_SLOT_COUNT = 5
+CD_ARC_TRIGGER_RADIUS_M = 0.30
+CD_ARC_POSE_POLL_S = 0.03
+CD_ARC_RECOGNIZE_FRAMES = 5
+CD_ARC_RECOGNIZE_TIMEOUT_S = 0.60
+CD_ARC_COLOR_POINTS = [
+    ("第2个物块", -1.1595, 0.4474),
+    ("第3个物块", -1.4256, 0.8523),
+    ("第4个物块", -1.4871, 1.3273),
+    ("第5个物块", -1.3121, 1.7667),
+]
 
 KEY_PATH_POINTS = [
     (-0.662, 0.250, -90.0),
@@ -160,19 +169,73 @@ def rotate_async(pos: int, label: str = "") -> bool:
     return True
 
 
-def start_timed_turntable_slots(slots, interval_s: float) -> tuple[threading.Thread, threading.Event]:
-    """后台每隔固定时间下发一次转盘槽位切换。"""
+def advance_turntable_after_color(slot_state: dict[str, int], label: str) -> int:
+    """识别到一个物块后，把转盘切到下一槽位用于收纳/准备下一个物块。"""
+    next_slot = (slot_state["current"] + 1) % CD_SLOT_COUNT
+    rotate_async(next_slot, label=label)
+    slot_state["current"] = next_slot
+    return next_slot
+
+
+def recognize_current_slot_color(loaded_slot_colors: dict[int, str],
+                                 slot_state: dict[str, int],
+                                 label: str,
+                                 stable: bool) -> Optional[str]:
+    """识别当前经过的物块颜色，并记录到当前转盘槽位。"""
+    slot = slot_state["current"]
+    block.set_status(f"正在识别{label} -> 槽位 {slot}")
+    if stable:
+        color = _timed(f"BLOCK recognize {label} slot {slot}", block.recognize_stable,
+                       frames=10, timeout=3.0)
+    else:
+        color = _timed(f"BLOCK recognize {label} slot {slot}", block.recognize_no_fallback,
+                       frames=CD_ARC_RECOGNIZE_FRAMES,
+                       timeout=CD_ARC_RECOGNIZE_TIMEOUT_S)
+    if color is None:
+        block.set_status(f"{label} 识别失败")
+        return None
+    loaded_slot_colors[slot] = color
+    block.set_status(f"{label} -> 槽位 {slot}: {color}")
+    print(f"  {label}: slot {slot} <- color {color}")
+    return color
+
+
+def start_arc_color_monitor(loaded_slot_colors: dict[int, str],
+                            slot_state: dict[str, int]) -> tuple[threading.Thread, threading.Event, dict]:
+    """圆弧期间按近似坐标触发颜色识别，成功后立即切下一槽位。"""
     stop_event = threading.Event()
+    state = {"done": 0, "failed": [], "last_pose": None}
 
     def worker() -> None:
-        for slot in slots:
-            if stop_event.wait(interval_s):
-                break
-            rotate_async(slot, label="定时切换")
+        next_idx = 0
+        while not stop_event.is_set() and next_idx < len(CD_ARC_COLOR_POINTS):
+            pose = comm.get_pose(max_age=0.5)
+            if pose is None:
+                time.sleep(CD_ARC_POSE_POLL_S)
+                continue
+            x, y, yaw = pose
+            state["last_pose"] = pose
+            label, tx, ty = CD_ARC_COLOR_POINTS[next_idx]
+            dist = math.hypot(x - tx, y - ty)
+            if dist <= CD_ARC_TRIGGER_RADIUS_M:
+                print(f"  [{label}] 进入识别范围 dist={dist:.3f}m, pose=({x:.4f},{y:.4f},yaw={yaw:.1f}°)")
+                color = recognize_current_slot_color(loaded_slot_colors, slot_state,
+                                                     label, stable=False)
+                if color is not None:
+                    advance_turntable_after_color(slot_state, f"{label}识别后收纳")
+                    state["done"] += 1
+                    next_idx += 1
+                else:
+                    # 识别失败时短暂重试；如果还在范围内，下一轮会继续尝试。
+                    time.sleep(0.05)
+            else:
+                time.sleep(CD_ARC_POSE_POLL_S)
+        if next_idx < len(CD_ARC_COLOR_POINTS):
+            state["failed"] = [p[0] for p in CD_ARC_COLOR_POINTS[next_idx:]]
 
-    th = threading.Thread(target=worker, name="cd-turntable-timer", daemon=True)
+    th = threading.Thread(target=worker, name="cd-arc-color-monitor", daemon=True)
     th.start()
-    return th, stop_event
+    return th, stop_event, state
 
 
 def refresh_cur_from_pose(label: str = "pose") -> bool:
@@ -189,13 +252,13 @@ def refresh_cur_from_pose(label: str = "pose") -> bool:
     return False
 
 
-def run_cd_arc() -> bool:
-    """按用户指定参数直接走 C/D 圆弧。"""
+def run_cd_arc(loaded_slot_colors: dict[int, str], slot_state: dict[str, int]) -> bool:
+    """按用户指定参数走 C/D 圆弧，并在近似坐标处识别颜色、切转盘。"""
     timeout = (math.radians(CD_ARC_SWEEP_DEG) * CD_ARC_RADIUS /
                max(CD_ARC_SPEED, 0.01) * 2.5 + 15.0)
-    turntable_thread, turntable_stop = start_timed_turntable_slots(
-        CD_TURNTABLE_ARC_SLOTS,
-        CD_TURNTABLE_ARC_INTERVAL_S,
+    monitor_thread, monitor_stop, monitor_state = start_arc_color_monitor(
+        loaded_slot_colors,
+        slot_state,
     )
     try:
         ok = _timed(
@@ -208,8 +271,11 @@ def run_cd_arc() -> bool:
             timeout=timeout,
         )
     finally:
-        turntable_stop.set()
-        turntable_thread.join(timeout=1.0)
+        monitor_stop.set()
+        monitor_thread.join(timeout=1.0)
+    if monitor_state["done"] != len(CD_ARC_COLOR_POINTS):
+        print(f"  !! 圆弧颜色识别未完成: done={monitor_state['done']}, missing={monitor_state['failed']}")
+        return False
     if ok:
         return refresh_cur_from_pose("after C/D arc")
     return False
@@ -293,12 +359,6 @@ def rotate_for_target(name: str, target_colors: dict[str, str], color_to_slot: d
     return rotate(slot)
 
 
-def log_target_color(name: str, target_colors: dict[str, str]) -> None:
-    """不切转盘时，只打印当前目标点对应的二维码颜色。"""
-    color = target_colors.get(name, "未知")
-    print(f"  PLACE {name}: QR目标颜色={color}，本流程不按槽位切转盘")
-
-
 def _same_xy(a, b) -> bool:
     return abs(a[0] - b[0]) <= KEY_PATH_XY_EPS and abs(a[1] - b[1]) <= KEY_PATH_XY_EPS
 
@@ -348,7 +408,7 @@ def _run_key_turn_with_rotate(a, b, idx: int, slot: int) -> bool:
     )
 
 
-def run_key_path_with_rotate() -> dict[int, str] | None:
+def run_key_path_with_rotate() -> Optional[dict[int, str]]:
     """执行固定关键点轨迹，并记录进入转盘 0-4 槽位的物块颜色。
 
     约定进入该函数前转盘已经在槽位 0。路径中每个重复坐标点会先识别
@@ -394,11 +454,19 @@ def run_task_cd() -> None:
 
     _require(turn_to(-90.0), "turn to -90 before C/D arc")
     _require(prepare_block_scan(1, 4), "arm 1, light 4 and USB camera ready")
+    loaded_slot_colors: dict[int, str] = {}
+    slot_state = {"current": 0}
+    _require(
+        recognize_current_slot_color(loaded_slot_colors, slot_state,
+                                     "第1个物块", stable=True) is not None,
+        "recognize first block color",
+    )
 
     _require(go_to(*CD_ARC_START), "go to C/D arc start")
-    rotate_async(CD_TURNTABLE_FIRST_SLOT, label="到达圆弧起点先切一次")
+    advance_turntable_after_color(slot_state, "第1个物块到圆弧起点后收纳")
     _require(turn_to(CD_ARC_START_YAW), "turn to C/D arc yaw")
-    _require(run_cd_arc(), "C/D arc")
+    _require(run_cd_arc(loaded_slot_colors, slot_state), "C/D arc")
+    color_to_slot = invert_loaded_slot_colors(loaded_slot_colors)
     _require(turn_to(180.0), "turn to 180")
 
     _require(go_axis_x_then_y(*FIRST_PLACE_APPROACH, label="first approach before A"),
@@ -406,7 +474,7 @@ def run_task_cd() -> None:
     for name in PLACE_ORDER:
         x, y = TARGET_POINTS[name]
         _require(go_axis_x_then_y(x, y, label=f"move to {name}"), f"move to {name}")
-        log_target_color(name, target_colors)
+        _require(rotate_for_target(name, target_colors, color_to_slot), f"rotate for {name}")
         _require(backup_y_after_place(name), f"backup after {name}")
 
     _require(arm(0), "arm 0")
