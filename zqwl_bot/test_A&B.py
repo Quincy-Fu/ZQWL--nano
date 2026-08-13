@@ -240,9 +240,12 @@ def run_task_ab():
         (ARC_SWITCH_BY_DEG[1][0], pos_to_slot[ARC_SWITCH_BY_DEG[1][1]]),
         (arc_sweep_deg, ARC_END_UNUSED_SLOT),
     ]
-    print(f"  ARC_ROTATE triggers={arc_triggers}")
-    if not comm.arc_rotate(arc_r, arc_dir, arc_sweep_deg, arc_speed, arc_triggers):
-        raise RuntimeError("arc_rotate failed")
+    arc_timeout = math.radians(arc_sweep_deg) * arc_r / arc_speed * 2.5 + 15.0
+    print(f"  ARC_ROTATE triggers={arc_triggers}, timeout={arc_timeout:.1f}s")
+    print("  [圆弧] 已下发复合命令；等待下位机 0x30 响应。若车不动，优先检查下位机是否已烧录新固件。")
+    if not comm.arc_rotate(arc_r, arc_dir, arc_sweep_deg, arc_speed, arc_triggers,
+                           timeout=arc_timeout):
+        raise RuntimeError("arc_rotate failed: 未收到 0x30 响应；请确认下位机已烧录支持 ARC_ROTATE 的新固件")
 
     # 5. 圆弧后进入冠亚季放置流程
     refresh_cur_from_pose()

@@ -4,7 +4,7 @@
 test_C&D.py - C/D 区新流程测试。
 
 流程按实车调试顺序写死：先同步位姿，二维码识别得到 A/B/C/D/E 目标颜色，
-再沿关键点轨迹识别进入各槽位的物块颜色，最后按 A/B/D/C/E 顺序到点、
+再顺序扫描转盘槽位颜色，随后走 C/D 圆弧，最后按 A/B/D/C/E 顺序到点、
 切换转盘并后退 5cm。放置段只走横移+直行，不走斜线。
 """
 
@@ -30,6 +30,13 @@ KEY_PATH_TURN_TIMEOUT = 25.0
 KEY_PATH_ROTATE_TIMEOUT = 12.0
 AXIS_MOVE_EPS = 1e-4
 PLACE_BACKUP_Y = 0.05
+
+CD_ARC_START = (-0.900, 0.250)
+CD_ARC_START_YAW = -69.0
+CD_ARC_RADIUS = 0.869
+CD_ARC_DIR = 1
+CD_ARC_SWEEP_DEG = 130.0
+CD_ARC_SPEED = KEY_PATH_SPEED
 
 KEY_PATH_POINTS = [
     (-0.662, 0.250, -90.0),
@@ -141,6 +148,38 @@ def rotate(pos: int, timeout: float = 12.0) -> bool:
     return _timed(f"ROTATE slot {pos}", comm.rotate, pos, timeout=timeout)
 
 
+def refresh_cur_from_pose(label: str = "pose") -> bool:
+    """用下位机上报位姿刷新本地坐标，供后续横移+直行分段使用。"""
+    for _ in range(20):
+        pose = comm.get_pose(max_age=0.5)
+        if pose is not None:
+            x, y, yaw = pose
+            _update_cur(x, y)
+            print(f"  POSE {label}: ({x:.4f}, {y:.4f}, yaw={yaw:.1f}°)")
+            return True
+        time.sleep(0.05)
+    print(f"  !! {label} 位姿刷新失败")
+    return False
+
+
+def run_cd_arc() -> bool:
+    """按用户指定参数直接走 C/D 圆弧。"""
+    timeout = (math.radians(CD_ARC_SWEEP_DEG) * CD_ARC_RADIUS /
+               max(CD_ARC_SPEED, 0.01) * 2.5 + 15.0)
+    ok = _timed(
+        f"ARC r={CD_ARC_RADIUS:.3f} dir={CD_ARC_DIR} sweep={CD_ARC_SWEEP_DEG:.1f} v={CD_ARC_SPEED:.2f}",
+        comm.arc,
+        CD_ARC_RADIUS,
+        CD_ARC_DIR,
+        CD_ARC_SWEEP_DEG,
+        speed=CD_ARC_SPEED,
+        timeout=timeout,
+    )
+    if ok:
+        return refresh_cur_from_pose("after C/D arc")
+    return False
+
+
 def prepare_block_scan(arm_state: int, light_id: int) -> bool:
     """机械臂、补光灯和 USB 摄像头尽量同时准备。"""
     def run() -> bool:
@@ -182,6 +221,18 @@ def recognize_block_for_slot(slot: int) -> str:
     block.set_status(f"槽位 {slot} 识别结果: {color}")
     print(f"  loaded slot {slot} <- block color {color}")
     return color
+
+
+def scan_turntable_slots() -> dict[int, str]:
+    """按槽位 0→4 顺序扫描转盘颜色表。"""
+    print("\n=== 转盘槽位颜色顺序扫描 ===")
+    loaded_slot_colors: dict[int, str] = {}
+    _require(rotate(0), "rotate slot 0 before slot scan")
+    for slot in range(5):
+        loaded_slot_colors[slot] = recognize_block_for_slot(slot)
+        if slot < 4:
+            _require(rotate(slot + 1), f"rotate slot {slot + 1} during slot scan")
+    return loaded_slot_colors
 
 
 def invert_loaded_slot_colors(loaded_slot_colors: dict[int, str]) -> dict[str, int]:
@@ -300,14 +351,13 @@ def run_task_cd() -> None:
 
     target_colors = recognize_qr1_targets()
 
-    _require(turn_to(-90.0), "turn to -90")
     _require(prepare_block_scan(1, 4), "arm 1, light 4 and USB camera ready")
-    _require(rotate(0), "rotate slot 0 before slot scan")
-    loaded_slot_colors = run_key_path_with_rotate()
-    if loaded_slot_colors is None:
-        raise RuntimeError("key path with slot scan failed")
+    loaded_slot_colors = scan_turntable_slots()
     color_to_slot = invert_loaded_slot_colors(loaded_slot_colors)
 
+    _require(go_to(*CD_ARC_START), "go to C/D arc start")
+    _require(turn_to(CD_ARC_START_YAW), "turn to C/D arc yaw")
+    _require(run_cd_arc(), "C/D arc")
     _require(turn_to(180.0), "turn to 180")
 
     _require(go_axis_x_then_y(*FIRST_PLACE_APPROACH, label="first approach before A"),

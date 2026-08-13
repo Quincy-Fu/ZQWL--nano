@@ -395,8 +395,8 @@ class SerialComm:
                     seen = self._nav_resp_seq
                     if self._nav_resp_type == expect:
                         return self._nav_resp_status == 1
-                    log.warning("skip stale resp type=0x%02x (expect 0x%02x)",
-                                self._nav_resp_type, expect)
+                    log.debug("skip stale resp type=0x%02x (expect 0x%02x)",
+                              self._nav_resp_type, expect)
                 remain = deadline - time.monotonic()
                 if remain <= 0:
                     return False
