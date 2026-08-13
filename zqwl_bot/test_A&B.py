@@ -32,9 +32,9 @@ RANK_TARGETS = [
 RETURN_POINTS = [(-0.30, 0.10), (-0.15, 0.10), (-0.05, 0.10), (0.0, 0.10), (0.0, 0.0)]
 
 # QR2 返回的 3 个字母对应位置 1、2、3 上的物块顺序。
-# 圆弧过程中实际依次经过 3、2、1，切换触发点按已转过角度定义。
+# 圆弧过程中实际依次经过 3、2、1，切换触发点由下位机按实际弧进度执行。
 ARC_PRELOAD_POSITION = 3
-ARC_SWITCH_BY_DEG = [(40.0, 2), (70.0, 1)]
+ARC_SWITCH_BY_DEG = [(50.0, 2), (80.0, 1)]
 ARC_END_UNUSED_SLOT = 4
 
 # 阶段 B 3 个目标点
@@ -123,15 +123,11 @@ def arm(state):
 
 
 def arm_and_rotate_async(arm_state, slot):
-    """机械臂和转盘同时下发；只等待机械臂响应，转盘让它后台转。"""
-    print(f"  ARM {arm_state} + ROTATE {slot} (转盘不等待)")
-    seen = comm.response_seq()
+    """机械臂和转盘同时下发，不等待响应；圆弧立即开始。"""
+    print(f"  ARM {arm_state} + ROTATE {slot} (不等待，圆弧同步开始)")
     comm.send_arm(arm_state)
     comm.send_rotate(slot)
-    ok = comm.wait_for_after(comm.TYPE_ARM_RESP, seen, 6.0)
-    if not ok:
-        print("  !! 机械臂响应超时或失败")
-    return ok
+    return True
 
 
 def arm_and_rotate(arm_state, slot):
@@ -229,7 +225,7 @@ def run_task_ab():
     }
     print(f"  QR2: {seq2} -> 1/2/3位置转盘槽位 {pos_to_slot}")
 
-    # 4. 进入圆弧前先进入取放状态，同时转盘切到第一个经过的位置 3
+    # 4. 圆弧启动时同步进入取放状态，并让转盘切到第一个经过的位置 3
     first_slot = pos_to_slot[ARC_PRELOAD_POSITION]
     first_letter = seq2[ARC_PRELOAD_POSITION - 1]
     print(f"  [圆弧预置位置 {ARC_PRELOAD_POSITION}] 转盘切到槽位 {first_slot} ({first_letter})")
@@ -238,22 +234,15 @@ def run_task_ab():
     arc_r = 0.84
     arc_dir = -1
     arc_sweep_deg = 130.0
-    arc_time = math.radians(arc_sweep_deg) * arc_r / (ARC_SPEED_MM_S / 1000)
-
-    def on_arc_switch(pos_no):
-        time.sleep(WAYPOINT_DELAY_S)
-        slot = pos_to_slot[pos_no]
-        letter = seq2[pos_no - 1]
-        print(f"  [圆弧位置 {pos_no}] 转盘切到槽位 {slot} ({letter})")
-        rotate_async(slot)
-
-    arc_with_waypoints(arc_r, arc_dir, arc_sweep_deg, [
-        (arc_time * trigger_deg / arc_sweep_deg,
-         lambda pos_no=pos_no: on_arc_switch(pos_no))
-        for trigger_deg, pos_no in ARC_SWITCH_BY_DEG
-    ])
-    print(f"  [圆弧结束] 转盘切到未使用槽位 {ARC_END_UNUSED_SLOT}")
-    rotate_async(ARC_END_UNUSED_SLOT)
+    arc_speed = ARC_SPEED_MM_S / 1000.0
+    arc_triggers = [
+        (ARC_SWITCH_BY_DEG[0][0], pos_to_slot[ARC_SWITCH_BY_DEG[0][1]]),
+        (ARC_SWITCH_BY_DEG[1][0], pos_to_slot[ARC_SWITCH_BY_DEG[1][1]]),
+        (arc_sweep_deg, ARC_END_UNUSED_SLOT),
+    ]
+    print(f"  ARC_ROTATE triggers={arc_triggers}")
+    if not comm.arc_rotate(arc_r, arc_dir, arc_sweep_deg, arc_speed, arc_triggers):
+        raise RuntimeError("arc_rotate failed")
 
     # 5. 圆弧后进入冠亚季放置流程
     refresh_cur_from_pose()

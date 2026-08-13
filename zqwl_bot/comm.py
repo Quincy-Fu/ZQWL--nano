@@ -72,6 +72,8 @@ TYPE_CMD_VISION_CORRECT_RESP  = 0x2C   # MCU->PC: payload 1B status (1=到位且
 # IMU 零偏校准 (车必须静止; 下位机转发 IMU 0x70 校准命令)
 TYPE_CMD_IMU_CALIB       = 0x2D   # PC->MCU: payload 空
 TYPE_CMD_IMU_CALIB_RESP  = 0x2E   # MCU->PC: payload 1B status (1=IMU帧恢复)
+TYPE_CMD_ARC_ROTATE      = 0x2F   # PC->MCU: 圆弧 + 3个转盘触发点
+TYPE_CMD_ARC_ROTATE_RESP = 0x30   # MCU->PC: payload 1B status
 
 # 视觉微调方向码
 NUDGE_STOP     = 0   # 立即停止+电磁锁死
@@ -90,6 +92,7 @@ _NAV_RESP_TYPES = frozenset({
     TYPE_CMD_SET_ZERO_RESP,
     TYPE_CMD_VISION_CORRECT_RESP,
     TYPE_CMD_IMU_CALIB_RESP,
+    TYPE_CMD_ARC_ROTATE_RESP,
 })
 
 FRAME_OVERHEAD = 2 + 1 + 1 + 2  # header + type + len + crc16
@@ -256,6 +259,37 @@ class SerialComm:
             self._check_finite(speed)
             self._send_nav(TYPE_CMD_ARC,
                            struct.pack("<ffff", radius, d, sweep, speed))
+
+    def send_arc_rotate(self, radius: float, dir: int, sweep_deg: float,
+                        speed: float,
+                        triggers: list[tuple[float, int]]) -> None:
+        """发送圆弧+转盘触发命令。
+
+        triggers 固定 3 组: (触发角度deg, 转盘槽位)。触发角度按下位机实际圆弧进度判断。
+        payload: <fffffBfBfB> = radius,dir,sweep,speed,trig1,slot1,trig2,slot2,trig3,slot3
+        """
+        self._check_finite(radius, sweep_deg, speed)
+        if radius <= 0:
+            raise ValueError(f"arc radius must be > 0, got {radius}")
+        if dir == 0:
+            raise ValueError("arc dir must be +1 (right turn) or -1 (left turn)")
+        if speed <= 0:
+            raise ValueError(f"arc speed must be > 0, got {speed}")
+        if len(triggers) != 3:
+            raise ValueError("arc_rotate requires exactly 3 triggers")
+        d = 1.0 if dir > 0 else -1.0
+        sweep = abs(float(sweep_deg))
+        vals = []
+        for deg, slot in triggers:
+            self._check_finite(float(deg))
+            if not (0 <= int(slot) <= 4):
+                raise ValueError(f"rotate slot must be 0-4, got {slot}")
+            vals.append((float(deg), int(slot)))
+        self._send_nav(
+            TYPE_CMD_ARC_ROTATE,
+            struct.pack("<fffffBfBfB", radius, d, sweep, speed,
+                        vals[0][0], vals[0][1], vals[1][0], vals[1][1], vals[2][0], vals[2][1]),
+        )
 
     def send_fine_move(self, dx_mm: float, dy_mm: float) -> None:
         self._check_finite(dx_mm, dy_mm)
@@ -471,6 +505,16 @@ class SerialComm:
             timeout = arclen / v * 2.5 + 15.0
         self.send_arc(radius, dir, sweep_deg, speed)
         return self.wait_for(TYPE_CMD_ARC_RESP, timeout)
+
+    def arc_rotate(self, radius: float, dir: int, sweep_deg: float,
+                   speed: float, triggers: list[tuple[float, int]],
+                   timeout: float | None = None) -> bool:
+        """圆弧运动，并由下位机按实际弧进度触发转盘。"""
+        if timeout is None:
+            arclen = abs(sweep_deg) * math.pi / 180.0 * radius
+            timeout = arclen / max(speed, 0.01) * 2.5 + 15.0
+        self.send_arc_rotate(radius, dir, sweep_deg, speed, triggers)
+        return self.wait_for(TYPE_CMD_ARC_ROTATE_RESP, timeout)
 
     @staticmethod
     def _normalize_path_point(point) -> tuple[float, float, float, int]:
@@ -835,6 +879,13 @@ def send_arc(radius: float, dir: int, sweep_deg: float,
         raise RuntimeError("serial not initialized")
     _comm.send_arc(radius, dir, sweep_deg, speed)
 
+def send_arc_rotate(radius: float, dir: int, sweep_deg: float,
+                    speed: float,
+                    triggers: list[tuple[float, int]]) -> None:
+    if _comm is None:
+        raise RuntimeError("serial not initialized")
+    _comm.send_arc_rotate(radius, dir, sweep_deg, speed, triggers)
+
 def send_fine_move(dx_mm: float, dy_mm: float) -> None:
     if _comm is None:
         raise RuntimeError("serial not initialized")
@@ -927,6 +978,13 @@ def arc(radius: float, dir: int, sweep_deg: float,
     if _comm is None:
         raise RuntimeError("serial not initialized, call init() first")
     return _comm.arc(radius, dir, sweep_deg, speed, timeout)
+
+def arc_rotate(radius: float, dir: int, sweep_deg: float,
+               speed: float, triggers: list[tuple[float, int]],
+               timeout: float | None = None) -> bool:
+    if _comm is None:
+        raise RuntimeError("serial not initialized, call init() first")
+    return _comm.arc_rotate(radius, dir, sweep_deg, speed, triggers, timeout)
 
 def path(points, speed: float = 0.30,
          timeout: float | None = None,

@@ -14,8 +14,8 @@ import comm
 
 
 CONFIG = {
-    "usb_device": 1,
-    "usb_devices": [1, 0],
+    "usb_device": 0,
+    "usb_devices": [0, 1],
     "width": 640,
     "height": 480,
     "fps": 30,
@@ -37,6 +37,8 @@ CONFIG = {
     "fast_min_hits": 3,
 
     "last_known_max_age_s": 3.0,
+    "latest_frame_max_age_s": 0.30,
+    "device_retry_cooldown_s": 20.0,
 
     # ★ 实时显示
     "show_window": True,            # 实时显示开关
@@ -95,10 +97,15 @@ class USBCamera:
 
 
 _cam_cache = {"cam": None}
+_cam_lock = threading.RLock()
+_bad_devices = {}
 _last_known = {"result": None, "time": 0.0}
 _latest_frame = None           # ★ viewer 线程共享的最近帧
+_latest_frame_time = 0.0
 _frame_lock = threading.Lock()
 _viewer_started = False
+_viewer_thread = None
+_viewer_stop = threading.Event()
 _status_text = "等待识别"
 _status_lock = threading.Lock()
 
@@ -115,31 +122,98 @@ def _get_status():
         return _status_text
 
 
+def _ordered_devices():
+    """生成 USB 摄像头尝试顺序；当前首选 + 配置列表 + 0/1 兜底。"""
+    devices = CONFIG.get("usb_devices") or [CONFIG.get("usb_device", 0)]
+    ordered_devices = []
+    for dev in [CONFIG.get("usb_device", 0), *devices, 0, 1]:
+        if dev not in ordered_devices:
+            ordered_devices.append(dev)
+    return ordered_devices
+
+
+def _available_devices():
+    """过滤近期读帧失败的设备；如果全被过滤，则清空冷却重新尝试。"""
+    now = time.time()
+    ordered = _ordered_devices()
+    available = []
+    for dev in ordered:
+        until = _bad_devices.get(dev, 0.0)
+        if until <= now:
+            _bad_devices.pop(dev, None)
+            available.append(dev)
+    if not available:
+        _bad_devices.clear()
+        available = ordered
+    return available
+
+
+def _clear_frame_cache_locked():
+    global _latest_frame, _latest_frame_time
+    with _frame_lock:
+        _latest_frame = None
+        _latest_frame_time = 0.0
+    _last_known["result"] = None
+    _last_known["time"] = 0.0
+
+
+def _drop_cam_locked(cam, reason):
+    """丢弃当前摄像头，下一次读帧会尝试下一个 USB 设备。"""
+    if cam is None:
+        return
+    print(f"[block] USB摄像头 device={cam.device} 异常: {reason}，切换下一个设备", flush=True)
+    _bad_devices[cam.device] = time.time() + CONFIG["device_retry_cooldown_s"]
+    if _cam_cache["cam"] is cam:
+        try:
+            cam.stop()
+        finally:
+            _cam_cache["cam"] = None
+            _clear_frame_cache_locked()
+
+
 def _get_cam():
-    if _cam_cache["cam"] is None:
-        devices = CONFIG.get("usb_devices") or [CONFIG.get("usb_device", 1)]
-        # 保留 usb_device 作为首选，同时自动尝试 1/0，避免摄像头枚举顺序变化。
-        ordered_devices = []
-        for dev in [CONFIG.get("usb_device", 1), *devices, 1, 0]:
-            if dev not in ordered_devices:
-                ordered_devices.append(dev)
-
-        last_error = None
-        for dev in ordered_devices:
-            cam = USBCamera(dev, CONFIG["width"], CONFIG["height"], CONFIG["fps"])
-            try:
-                cam.start()
-            except RuntimeError as e:
-                last_error = e
-                continue
-            CONFIG["usb_device"] = dev
-            _cam_cache["cam"] = cam
-            print(f"[block] USB摄像头已打开: device={dev}")
-            break
-
+    with _cam_lock:
         if _cam_cache["cam"] is None:
-            raise RuntimeError(f"无法打开USB摄像头，已尝试 {ordered_devices}: {last_error}")
-    return _cam_cache["cam"]
+            ordered_devices = _available_devices()
+            last_error = None
+            for dev in ordered_devices:
+                cam = USBCamera(dev, CONFIG["width"], CONFIG["height"], CONFIG["fps"])
+                try:
+                    cam.start()
+                except RuntimeError as e:
+                    last_error = e
+                    continue
+                CONFIG["usb_device"] = dev
+                _cam_cache["cam"] = cam
+                print(f"[block] USB摄像头已打开: device={dev}", flush=True)
+                break
+
+            if _cam_cache["cam"] is None:
+                raise RuntimeError(f"无法打开USB摄像头，已尝试 {ordered_devices}: {last_error}")
+        return _cam_cache["cam"]
+
+
+def _cache_frame(frame):
+    """缓存最新有效帧，识别线程只使用短时间内的新帧。"""
+    global _latest_frame, _latest_frame_time
+    with _frame_lock:
+        _latest_frame = frame.copy()
+        _latest_frame_time = time.time()
+
+
+def _read_camera_frame():
+    """统一摄像头读帧入口；读失败时自动切换 0/1 设备。"""
+    attempts = max(1, len(_ordered_devices()))
+    for _ in range(attempts):
+        with _cam_lock:
+            cam = _get_cam()
+            frame = cam.read()
+            if frame is not None:
+                _cache_frame(frame)
+                return frame
+            _drop_cam_locked(cam, "读帧失败")
+        time.sleep(0.05)
+    return None
 
 
 # ============ ★ 实时显示后台线程 ============
@@ -164,8 +238,8 @@ def _draw_pct_bars(display, h, w, pcts, best, color):
 
 def _viewer_loop():
     """后台线程: 持续 read 摄像头 + 显示 (实时画面)"""
-    cam = _get_cam()
-    cv2.namedWindow(CONFIG["show_window_name"], cv2.WINDOW_NORMAL)
+    if CONFIG["show_window"]:
+        cv2.namedWindow(CONFIG["show_window_name"], cv2.WINDOW_NORMAL)
 
     # 启动时如果阈值文件没就绪
     thresholds = load_thresholds(CONFIG["thresholds_file"])
@@ -175,15 +249,10 @@ def _viewer_loop():
     COLOR_BGR = {"黑": (0, 0, 0), "白": (200, 200, 200),
                  "红": (0, 0, 255), "绿": (0, 255, 0), "蓝": (255, 0, 0)}
 
-    while True:
+    while not _viewer_stop.is_set():
         t0 = time.time()
-        frame = cam.read()
+        frame = _read_camera_frame()
         if frame is not None:
-            # ★ 缓存最近帧 (给 recognizer 用)
-            global _latest_frame
-            with _frame_lock:
-                _latest_frame = frame.copy()
-
             # 实时显示
             if CONFIG["show_window"]:
                 display = frame.copy()
@@ -222,17 +291,20 @@ def _viewer_loop():
             time.sleep(frame_interval - elapsed)
 
         # waitKey 让窗口响应
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        if CONFIG["show_window"] and (cv2.waitKey(1) & 0xFF == ord('q')):
+            _viewer_stop.set()
             break
 
 
 def start_viewer():
     """启动实时显示线程 (一次性)"""
-    global _viewer_started
-    if _viewer_started:
+    global _viewer_started, _viewer_thread
+    if _viewer_thread is not None and _viewer_thread.is_alive():
         return
+    _viewer_stop.clear()
     th = threading.Thread(target=_viewer_loop, daemon=True)
     th.start()
+    _viewer_thread = th
     _viewer_started = True
     print("[block] 实时显示线程已启动")
 
@@ -240,7 +312,11 @@ def start_viewer():
 def _read_latest_frame():
     """从 viewer 线程的缓存拿最近帧 (线程安全)"""
     with _frame_lock:
-        return _latest_frame
+        if _latest_frame is None:
+            return None
+        if (time.time() - _latest_frame_time) > CONFIG["latest_frame_max_age_s"]:
+            return None
+        return _latest_frame.copy()
 
 
 # ============ 单帧识别 (供 recognizer + viewer 共享) ============
@@ -296,9 +372,8 @@ def _recognize_multi(frames, min_hits, timeout_s):
         # 优先用 viewer 线程的缓存
         frame = _read_latest_frame()
         if frame is None:
-            # 没启动 viewer 或还没读到, 自己读
-            cam = _get_cam()
-            frame = cam.read()
+            # 没启动 viewer 或缓存过旧时，走统一读帧入口；避免多线程同时读同一个 VideoCapture。
+            frame = _read_camera_frame()
         if frame is None:
             time.sleep(0.01)
             continue
@@ -367,7 +442,23 @@ def recognize_stable(frames=None, timeout=None):
 
 def close():
     """关闭摄像头 (main 退出时调用)"""
-    if _cam_cache["cam"] is not None:
-        _cam_cache["cam"].stop()
-        _cam_cache["cam"] = None
-    cv2.destroyAllWindows()
+    global _viewer_started, _viewer_thread
+    _viewer_stop.set()
+    th = _viewer_thread
+    if th is not None and th.is_alive():
+        th.join(timeout=2.0)
+        if th.is_alive():
+            print("[block] 实时显示线程仍在读帧，继续执行摄像头释放", flush=True)
+
+    with _cam_lock:
+        if _cam_cache["cam"] is not None:
+            _cam_cache["cam"].stop()
+            _cam_cache["cam"] = None
+        _clear_frame_cache_locked()
+
+    _viewer_started = False
+    _viewer_thread = None
+    try:
+        cv2.destroyAllWindows()
+    except cv2.error as e:
+        print(f"[block] destroyAllWindows failed: {e}", flush=True)
