@@ -14,6 +14,7 @@ main 里用法:
 
 import cv2
 import numpy as np
+import sys
 import time
 import comm
 
@@ -65,6 +66,11 @@ CONFIG = {
     "post_align_offset_y_mm": 100,
     "step2_to_step3_pause_s": 2.0,
     "step3_back_offset_px": 500,
+
+    "show_debug_window": True,
+    "debug_window_name": "Ring Debug",
+    "debug_mask_window_name": "Ring Mask",
+    "debug_max_candidates": 80,
 }
 
 
@@ -353,8 +359,47 @@ def find_ring_center(frame):
         if best is None or cluster_score > best["cluster_score"]:
             fit["cluster_score"] = cluster_score
             fit["candidate_count"] = len(cluster["items"])
+            fit["candidates"] = candidates
+            fit["mask"] = dark
             best = fit
     return best
+
+
+def _draw_debug(frame, result=None, candidates=None):
+    """绘制同心圆调试画面。"""
+    display = frame.copy()
+    h, w = display.shape[:2]
+    cv2.line(display, (w // 2 - 18, h // 2), (w // 2 + 18, h // 2), (255, 255, 0), 1)
+    cv2.line(display, (w // 2, h // 2 - 18), (w // 2, h // 2 + 18), (255, 255, 0), 1)
+    cv2.circle(display, (w // 2, h // 2), 5, (255, 255, 0), -1)
+
+    if candidates:
+        for cand in sorted(candidates, key=lambda c: c["score"], reverse=True)[:CONFIG["debug_max_candidates"]]:
+            cx = int(round(cand["cx"]))
+            cy = int(round(cand["cy"]))
+            r = int(round(cand["radius_px"]))
+            cv2.circle(display, (cx, cy), max(2, r), (80, 120, 255), 1)
+            cv2.circle(display, (cx, cy), 2, (80, 120, 255), -1)
+
+    if result:
+        cx = int(round(result["cx"]))
+        cy = int(round(result["cy"]))
+        r = int(round(result["radius_px"]))
+        cv2.circle(display, (cx, cy), max(2, r), (0, 255, 0), 2)
+        cv2.circle(display, (cx, cy), 6, (0, 0, 255), -1)
+        cv2.line(display, (w // 2, h // 2), (cx, cy), (0, 255, 255), 2)
+        offset = _offset_from_result(result)
+        cv2.putText(display, f"dx={offset['dx_mm']:+.1f}mm dy={offset['dy_mm']:+.1f}mm",
+                    (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(display, f"scale={offset['mm_per_px']:.3f} mm/px match={offset['match_count']}",
+                    (10, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        if offset["fallback_single"]:
+            cv2.putText(display, "fallback: 210mm outer arc",
+                        (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 180, 255), 2)
+    else:
+        cv2.putText(display, "NO RING", (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+    return display
 
 
 # ============ 摄像头单例 ============
@@ -586,6 +631,48 @@ def detect_offset(verbose=False):
     return offset
 
 
+def preview():
+    """实时显示圆环识别画面。按 q 退出，按 p 打印当前 dx/dy。"""
+    cam = _get_cam()
+    print("[ring] 预览已启动: q退出, p打印当前dx/dy")
+    last_result = None
+    while True:
+        frame = cam.read()
+        if frame is None:
+            time.sleep(0.02)
+            continue
+        candidates, mask = _extract_ring_candidates(frame)
+        result = None
+        if candidates:
+            best = None
+            for cluster in _cluster_by_center(candidates):
+                fit = _fit_scale_for_cluster(cluster)
+                if fit is None:
+                    continue
+                cluster_score = fit["total_score"] + len(cluster["items"]) * 1000.0
+                if best is None or cluster_score > best["cluster_score"]:
+                    fit["cluster_score"] = cluster_score
+                    fit["candidate_count"] = len(cluster["items"])
+                    fit["candidates"] = candidates
+                    result = fit
+                    best = fit
+        if result:
+            last_result = result
+        display = _draw_debug(frame, result, candidates)
+        cv2.imshow(CONFIG["debug_window_name"], display)
+        cv2.imshow(CONFIG["debug_mask_window_name"], mask)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        if key == ord('p'):
+            if last_result is None:
+                print("[ring] 当前没有有效检测")
+            else:
+                _print_detection(_offset_from_result(last_result))
+    cv2.destroyWindow(CONFIG["debug_window_name"])
+    cv2.destroyWindow(CONFIG["debug_mask_window_name"])
+
+
 def _print_detection(offset):
     """打印检测结果，方便现场调试比例是否匹配到正确圆。"""
     print(f"  ring center = ({offset['cx']}, {offset['cy']})")
@@ -755,10 +842,13 @@ def close():
 
 if __name__ == "__main__":
     try:
-        offset = detect_offset(verbose=True)
-        if offset is None:
-            print("[ring] 未检测到同心圆环")
+        if len(sys.argv) > 1 and sys.argv[1].lower() in ("once", "detect"):
+            offset = detect_offset(verbose=True)
+            if offset is None:
+                print("[ring] 未检测到同心圆环")
+            else:
+                print(f"[ring] dx={offset['dx_mm']:+.1f}mm, dy={offset['dy_mm']:+.1f}mm")
         else:
-            print(f"[ring] dx={offset['dx_mm']:+.1f}mm, dy={offset['dy_mm']:+.1f}mm")
+            preview()
     finally:
         close()
