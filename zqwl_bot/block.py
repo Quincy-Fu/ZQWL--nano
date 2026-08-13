@@ -20,7 +20,7 @@ CONFIG = {
     "height": 480,
     "fps": 30,
     "thresholds_file": "hsv_thresholds.json",
-    "roi_radius": 200,
+    "roi_radius": 140,
 
     "vote_min_pct": 0.20,
 
