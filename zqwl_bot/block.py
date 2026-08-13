@@ -99,6 +99,20 @@ _last_known = {"result": None, "time": 0.0}
 _latest_frame = None           # ★ viewer 线程共享的最近帧
 _frame_lock = threading.Lock()
 _viewer_started = False
+_status_text = "等待识别"
+_status_lock = threading.Lock()
+
+
+def set_status(text):
+    """设置实时画面左上角状态文字。"""
+    global _status_text
+    with _status_lock:
+        _status_text = str(text)
+
+
+def _get_status():
+    with _status_lock:
+        return _status_text
 
 
 def _get_cam():
@@ -177,6 +191,11 @@ def _viewer_loop():
                 # 画 ROI
                 cv2.circle(display, (w // 2, h // 2), CONFIG["roi_radius"],
                           (255, 0, 255), 2)
+
+                status = _get_status()
+                cv2.rectangle(display, (0, h - 38), (w, h), (30, 30, 30), -1)
+                cv2.putText(display, status, (10, h - 12),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
                 # 单帧识别结果 (快速反馈)
                 color, pcts = _single_frame_color(frame, thresholds)

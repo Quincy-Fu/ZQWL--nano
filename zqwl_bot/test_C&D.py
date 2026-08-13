@@ -36,12 +36,12 @@ KEY_PATH_POINTS = [
     (-0.900, 0.250, -90.0),
     (-0.900, 0.250, -55.0),
     (-1.222, 0.480, -55.0),
-    (-1.222, 0.480, -25.0),
-    (-1.412, 0.883, -25.0),
-    (-1.412, 0.883,   0.0),
-    (-1.415, 1.329,   0.0),
-    (-1.415, 1.329,  30.0),
-    (-1.160, 1.755,  30.0),
+    (-1.222, 0.480, -22.0),
+    (-1.389, 0.893, -22.0),
+    (-1.389, 0.893,   0.0),
+    (-1.389, 1.339,   0.0),
+    (-1.389, 1.339,  30.0),
+    (-1.141, 1.769,  30.0),
 ]
 KEY_PATH_ROTATE_SLOTS = [1, 2, 3, 4]
 
@@ -147,6 +147,8 @@ def prepare_block_scan(arm_state: int, light_id: int) -> bool:
         seen = comm.response_seq()
         comm.send_arm(arm_state)
         comm.send_light(light_id, True)
+        block.CONFIG["show_window"] = True
+        block.set_status("准备物块识别: ARM 1 + LIGHT 4 + USB")
         block.start_viewer()
         arm_ok = comm.wait_for_after(comm.TYPE_ARM_RESP, seen, 6.0)
         light_ok = comm.wait_for_after(comm.TYPE_LIGHT_RESP, seen, 5.0)
@@ -171,10 +173,13 @@ def recognize_qr1_targets() -> dict[str, str]:
 
 
 def recognize_block_for_slot(slot: int) -> str:
+    block.set_status(f"正在识别转盘槽位 {slot}")
     color = _timed(f"BLOCK recognize block for slot {slot}", block.recognize_stable,
                    frames=10, timeout=3.0)
     if color is None:
+        block.set_status(f"槽位 {slot} 识别失败")
         raise RuntimeError(f"block color for slot {slot} recognize failed")
+    block.set_status(f"槽位 {slot} 识别结果: {color}")
     print(f"  loaded slot {slot} <- block color {color}")
     return color
 
