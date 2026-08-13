@@ -25,15 +25,16 @@ SPLIT_THRESHOLD = 0.03
 # 冠亚季点位。按用户说明: 冠/亚/季 对应 A/B/C。
 RANK_TARGETS = [
     ("亚军", "B", 0.25, 1.779, 3, 2),
-    ("冠军", "A", 0.05, 1.779, 4, 2),
-    ("季军", "C", -0.15, 1.779, 1, 0),
+    ("冠军", "A", -0.02, 1.779, 4, 2),
+    ("季军", "C", -0.30, 1.779, 1, 0),
 ]
 RETURN_POINTS = [(-0.15, 0.1), (-0.05, 0.1)]
 
 # QR2 返回的 3 个字母对应位置 1、2、3 上的物块顺序。
-# 圆弧过程中实际依次经过 3、2、1, 所以取转盘槽位时要按位置号反查。
-ARC_PASS_POSITIONS = [3, 2, 1]
-ARC_ROTATE_FRACTIONS = [1.0 / 3.0, 2.0 / 3.0, 0.95]
+# 圆弧过程中实际依次经过 3、2、1，切换触发点按已转过角度定义。
+ARC_PRELOAD_POSITION = 3
+ARC_SWITCH_BY_DEG = [(50.0, 2), (80.0, 1)]
+ARC_END_UNUSED_SLOT = 4
 
 # 阶段 B 3 个目标点
 TARGETS_B = [
@@ -195,27 +196,32 @@ def run_task_ab():
     }
     print(f"  QR2: {seq2} -> 1/2/3位置转盘槽位 {pos_to_slot}")
 
-    # 4. 进入圆弧前先进入取放状态, 转盘在经过 3/2/1 时切到对应槽位
+    # 4. 进入圆弧前先进入取放状态，同时转盘切到第一个经过的位置 3
     arm(1)
+    first_slot = pos_to_slot[ARC_PRELOAD_POSITION]
+    first_letter = seq2[ARC_PRELOAD_POSITION - 1]
+    print(f"  [圆弧预置位置 {ARC_PRELOAD_POSITION}] 转盘切到槽位 {first_slot} ({first_letter})")
+    rotate(first_slot)
 
     arc_r = 0.84
     arc_dir = -1
     arc_sweep_deg = 130.0
     arc_time = math.radians(arc_sweep_deg) * arc_r / (ARC_SPEED_MM_S / 1000)
 
-    def on_arc_switch(idx):
+    def on_arc_switch(pos_no):
         time.sleep(WAYPOINT_DELAY_S)
-        pos_no = ARC_PASS_POSITIONS[idx]
         slot = pos_to_slot[pos_no]
         letter = seq2[pos_no - 1]
         print(f"  [圆弧位置 {pos_no}] 转盘切到槽位 {slot} ({letter})")
         rotate(slot)
 
     arc_with_waypoints(arc_r, arc_dir, arc_sweep_deg, [
-        (arc_time * ARC_ROTATE_FRACTIONS[0], lambda: on_arc_switch(0)),
-        (arc_time * ARC_ROTATE_FRACTIONS[1], lambda: on_arc_switch(1)),
-        (arc_time * ARC_ROTATE_FRACTIONS[2], lambda: on_arc_switch(2)),
+        (arc_time * trigger_deg / arc_sweep_deg,
+         lambda pos_no=pos_no: on_arc_switch(pos_no))
+        for trigger_deg, pos_no in ARC_SWITCH_BY_DEG
     ])
+    print(f"  [圆弧结束] 转盘切到未使用槽位 {ARC_END_UNUSED_SLOT}")
+    rotate(ARC_END_UNUSED_SLOT)
 
     # 5. 圆弧后进入冠亚季放置流程
     refresh_cur_from_pose()
