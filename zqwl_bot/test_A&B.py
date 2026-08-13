@@ -28,12 +28,13 @@ RANK_TARGETS = [
     ("冠军", "A", -0.02, 1.779, 4, 2),
     ("季军", "C", -0.30, 1.779, 1, 0),
 ]
-RETURN_POINTS = [(-0.15, 0.1), (-0.05, 0.1)]
+# 季军放置后回起点路径：显式拆成直行/横移路点，避免斜移。
+RETURN_POINTS = [(-0.30, 0.10), (-0.15, 0.10), (-0.05, 0.10), (0.0, 0.10), (0.0, 0.0)]
 
 # QR2 返回的 3 个字母对应位置 1、2、3 上的物块顺序。
 # 圆弧过程中实际依次经过 3、2、1，切换触发点按已转过角度定义。
 ARC_PRELOAD_POSITION = 3
-ARC_SWITCH_BY_DEG = [(50.0, 2), (80.0, 1)]
+ARC_SWITCH_BY_DEG = [(40.0, 2), (70.0, 1)]
 ARC_END_UNUSED_SLOT = 4
 
 # 阶段 B 3 个目标点
@@ -109,9 +110,43 @@ def rotate(pos):
     print(f"  ROTATE {pos}")
     return comm.rotate(pos, timeout=12.0)
 
+
+def rotate_async(pos):
+    """只下发转盘切换命令，不等待估算到位响应，用于圆弧过程中提前切槽。"""
+    print(f"  ROTATE {pos} (不等待)")
+    comm.send_rotate(pos)
+    return True
+
 def arm(state):
     print(f"  ARM {state}")
     return comm.arm(state, timeout=6.0)
+
+
+def arm_and_rotate_async(arm_state, slot):
+    """机械臂和转盘同时下发；只等待机械臂响应，转盘让它后台转。"""
+    print(f"  ARM {arm_state} + ROTATE {slot} (转盘不等待)")
+    seen = comm.response_seq()
+    comm.send_arm(arm_state)
+    comm.send_rotate(slot)
+    ok = comm.wait_for_after(comm.TYPE_ARM_RESP, seen, 6.0)
+    if not ok:
+        print("  !! 机械臂响应超时或失败")
+    return ok
+
+
+def arm_and_rotate(arm_state, slot):
+    """机械臂和转盘同时下发，两个都确认后才继续。"""
+    print(f"  ARM {arm_state} + ROTATE {slot} (等待到位)")
+    seen = comm.response_seq()
+    comm.send_arm(arm_state)
+    comm.send_rotate(slot)
+    arm_ok = comm.wait_for_after(comm.TYPE_ARM_RESP, seen, 6.0)
+    rotate_ok = comm.wait_for_after(comm.TYPE_ROTATE_RESP, seen, 12.0)
+    if not arm_ok:
+        print("  !! 机械臂响应超时或失败")
+    if not rotate_ok:
+        print("  !! 转盘响应超时或失败")
+    return arm_ok and rotate_ok
 
 
 def arm_async(state):
@@ -166,9 +201,7 @@ def place_rank(rank_name, letter, x, y, arm_state, after_arm_state):
     print(f"  {rank_name}: {letter} -> 转盘槽位 {slot}, 目标=({x:.4f}, {y:.4f})")
     if not go_to_split(x, y):
         return False
-    if not arm(arm_state):
-        return False
-    if not rotate(slot):
+    if not arm_and_rotate(arm_state, slot):
         return False
     bx, by = x, y - PLACE_BACKUP_M
     print(f"  {rank_name}: 后退 10cm 到 ({bx:.4f}, {by:.4f}), 同步切机械臂状态 {after_arm_state}")
@@ -197,11 +230,10 @@ def run_task_ab():
     print(f"  QR2: {seq2} -> 1/2/3位置转盘槽位 {pos_to_slot}")
 
     # 4. 进入圆弧前先进入取放状态，同时转盘切到第一个经过的位置 3
-    arm(1)
     first_slot = pos_to_slot[ARC_PRELOAD_POSITION]
     first_letter = seq2[ARC_PRELOAD_POSITION - 1]
     print(f"  [圆弧预置位置 {ARC_PRELOAD_POSITION}] 转盘切到槽位 {first_slot} ({first_letter})")
-    rotate(first_slot)
+    arm_and_rotate_async(1, first_slot)
 
     arc_r = 0.84
     arc_dir = -1
@@ -213,7 +245,7 @@ def run_task_ab():
         slot = pos_to_slot[pos_no]
         letter = seq2[pos_no - 1]
         print(f"  [圆弧位置 {pos_no}] 转盘切到槽位 {slot} ({letter})")
-        rotate(slot)
+        rotate_async(slot)
 
     arc_with_waypoints(arc_r, arc_dir, arc_sweep_deg, [
         (arc_time * trigger_deg / arc_sweep_deg,
@@ -221,7 +253,7 @@ def run_task_ab():
         for trigger_deg, pos_no in ARC_SWITCH_BY_DEG
     ])
     print(f"  [圆弧结束] 转盘切到未使用槽位 {ARC_END_UNUSED_SLOT}")
-    rotate(ARC_END_UNUSED_SLOT)
+    rotate_async(ARC_END_UNUSED_SLOT)
 
     # 5. 圆弧后进入冠亚季放置流程
     refresh_cur_from_pose()

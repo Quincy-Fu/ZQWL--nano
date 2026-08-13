@@ -10,6 +10,7 @@ qr2.py - 右侧二维码识别
 import os
 import time
 import logging
+import threading
 import cv2
 import numpy as np
 
@@ -132,9 +133,24 @@ class CSICamera:
         finally:
             buf.unmap(info)
 
-    def stop(self):
-        if self.pipe:
-            self.pipe.set_state(Gst.State.NULL)
+    def stop(self, async_stop: bool = False):
+        pipe = self.pipe
+        self.pipe = None
+        self.sink = None
+        if not pipe:
+            return
+
+        def _stop_pipe():
+            t0 = time.monotonic()
+            pipe.set_state(Gst.State.NULL)
+            dt = time.monotonic() - t0
+            log.info("[QR2 timing] CSI stop %.3fs", dt)
+            print(f"[QR2 timing] CSI stop {dt:.3f}s", flush=True)
+
+        if async_stop:
+            threading.Thread(target=_stop_pipe, name="qr2-csi-stop", daemon=True).start()
+        else:
+            _stop_pipe()
 
 
 def _is_valid_num(data: str) -> bool:
@@ -156,6 +172,7 @@ def _set_light(light_id: int, on: bool) -> None:
 def recognize(timeout: float = 3.0) -> str:
     """识别数字 1-6, 查表返回 3 字母顺序 ('CAB' 这种). 超时抛 RuntimeError."""
     cam = CSICamera()
+    t_start = time.monotonic()
     cam.start()
     detector = QRDetector(MODEL_DIR)
     log.info("[QR2] 开补光灯 3")
@@ -175,6 +192,9 @@ def recognize(timeout: float = 3.0) -> str:
                 if _is_valid_num(data):
                     letters = QR2_NUM_TO_LETTERS[data]
                     log.info(f"  [QR2] 确认: {data} -> {letters}")
+                    dt = time.monotonic() - t_start
+                    log.info("[QR2 timing] detected in %.3fs", dt)
+                    print(f"[QR2 timing] detected in {dt:.3f}s", flush=True)
                     return letters
                 else:
                     log.info(f"  [QR2] '{data}' 不在 1-6, 跳过")
@@ -184,8 +204,15 @@ def recognize(timeout: float = 3.0) -> str:
             time.sleep(0.05)
         raise RuntimeError(f"QR2: {timeout}s 内未识别到合法二维码 (1-6)")
     finally:
+        t_cleanup = time.monotonic()
         _set_light(3, False)
-        cam.stop()
+        dt_light = time.monotonic() - t_cleanup
+        log.info("[QR2 timing] light off %.3fs", dt_light)
+        print(f"[QR2 timing] light off {dt_light:.3f}s", flush=True)
+        cam.stop(async_stop=True)
+        dt_cleanup = time.monotonic() - t_cleanup
+        log.info("[QR2 timing] return after cleanup %.3fs", dt_cleanup)
+        print(f"[QR2 timing] return after cleanup {dt_cleanup:.3f}s", flush=True)
 
 
 def recognize_with_preview(timeout: float = 30.0) -> str:
