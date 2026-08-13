@@ -580,6 +580,33 @@ def _safe_goto(target_x, target_y, timeout=20.0, max_retry=2):
         return False
 
 
+def _safe_fine_move(dx_mm, dy_mm, timeout=20.0, max_retry=2):
+    """发送下位机已有 dx/dy 微调命令，并等待到位反馈。"""
+    for attempt in range(max_retry):
+        try:
+            seen_seq = comm.response_seq()
+            comm.send_fine_move(dx_mm, dy_mm)
+            ok = comm.wait_for_after(comm.TYPE_CMD_FINE_RESP, seen_seq, timeout)
+            if ok:
+                return True
+            print(f"  [fine_move {attempt+1}] 下位机返回失败或等待超时")
+        except Exception as e:
+            print(f"  [fine_move {attempt+1}] err: {e}")
+        time.sleep(0.3)
+
+    if not ensure_comm_alive(verbose=True):
+        return False
+    time.sleep(0.5)
+
+    try:
+        seen_seq = comm.response_seq()
+        comm.send_fine_move(dx_mm, dy_mm)
+        return comm.wait_for_after(comm.TYPE_CMD_FINE_RESP, seen_seq, timeout)
+    except Exception as e:
+        print(f"  [fine_move] 恢复后仍失败: {e}")
+        return False
+
+
 def _wait(seconds, label, verbose=True):
     if verbose:
         print(f"  === {label} (等 {seconds}s) ===")
@@ -631,10 +658,32 @@ def detect_offset(verbose=False):
     return offset
 
 
+def _move_by_offset(offset, verbose=True):
+    """按检测得到的 dx/dy 直接调用下位机微调协议。"""
+    if abs(offset["dx_px"]) <= CONFIG["dead_zone_px"] and \
+       abs(offset["dy_px"]) <= CONFIG["dead_zone_px"]:
+        if verbose:
+            print("  [OK] 已在死区内，无需移动")
+        return True
+
+    if not ensure_comm_alive(verbose=verbose):
+        return False
+
+    if verbose:
+        print("\n  === 单次同心圆 dx/dy 微调 ===")
+        print(f"  下发微调    = dx {offset['dx_mm']:+.1f} mm, dy {offset['dy_mm']:+.1f} mm")
+
+    ok = _safe_fine_move(offset["dx_mm"], offset["dy_mm"],
+                         timeout=CONFIG["correct_timeout_s"])
+    if verbose:
+        print(f"  [fine move] {'OK' if ok else 'FAIL'}")
+    return ok
+
+
 def preview():
-    """实时显示圆环识别画面。按 q 退出，按 p 打印当前 dx/dy。"""
+    """实时显示圆环识别画面。按 q 退出，按 p 打印当前 dx/dy，按 A 执行一次微调。"""
     cam = _get_cam()
-    print("[ring] 预览已启动: q退出, p打印当前dx/dy")
+    print("[ring] 预览已启动: q退出, p打印当前dx/dy, A按当前dx/dy移动")
     last_result = None
     while True:
         frame = cam.read()
@@ -664,11 +713,19 @@ def preview():
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
-        if key == ord('p'):
+        if key in (ord('p'), ord('P')):
             if last_result is None:
                 print("[ring] 当前没有有效检测")
             else:
                 _print_detection(_offset_from_result(last_result))
+        if key in (ord('a'), ord('A')):
+            if last_result is None:
+                print("[ring] 当前没有有效检测，不能移动")
+            else:
+                offset = _offset_from_result(last_result)
+                _print_detection(offset)
+                ok = _move_by_offset(offset, verbose=True)
+                print(f"[ring] A键微调 {'OK' if ok else 'FAIL'}")
     cv2.destroyWindow(CONFIG["debug_window_name"])
     cv2.destroyWindow(CONFIG["debug_mask_window_name"])
 
@@ -690,40 +747,13 @@ def _print_detection(offset):
 
 def align_once_to_ring(verbose=True):
     """到达圆环附近后，只根据当前画面圆心偏差执行一次 dx/dy 定位。"""
-    if not ensure_comm_alive(verbose=verbose):
-        return False
-
     time.sleep(CONFIG["pre_cmd_sleep_s"])
     offset = detect_offset(verbose=verbose)
     if offset is None:
         if verbose:
             print("  [FAIL] 没找到同心圆环")
         return False
-
-    if abs(offset["dx_px"]) <= CONFIG["dead_zone_px"] and \
-       abs(offset["dy_px"]) <= CONFIG["dead_zone_px"]:
-        if verbose:
-            print("  [OK] 已在死区内，无需移动")
-        return True
-
-    pose = comm.get_pose(max_age=1.0)
-    if pose is None:
-        if verbose:
-            print("  [FAIL] 没拿到位姿")
-        return False
-
-    x_now, y_now, _ = pose
-    target_x = x_now + offset["dx_mm"] / 1000.0
-    target_y = y_now + offset["dy_mm"] / 1000.0
-    if verbose:
-        print("\n  === 单次同心圆 dx/dy 定位 ===")
-        print(f"  移动        = dx {offset['dx_mm']:+.1f} mm, dy {offset['dy_mm']:+.1f} mm")
-        print(f"  目标位置    = ({target_x:.3f}, {target_y:.3f}) m")
-
-    ok = _safe_goto(target_x, target_y, timeout=CONFIG["correct_timeout_s"])
-    if verbose:
-        print(f"  [align once] {'OK' if ok else 'FAIL'}")
-    return ok
+    return _move_by_offset(offset, verbose=verbose)
 
 
 # ============ ★ 公共 API: 3 步对齐 ============
