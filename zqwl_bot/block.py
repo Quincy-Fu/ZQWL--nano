@@ -14,8 +14,8 @@ import comm
 
 
 CONFIG = {
-    "usb_device": 0,
-    "usb_devices": [0, 1],
+    "usb_device": 1,
+    "usb_devices": [1, 0],
     "width": 640,
     "height": 480,
     "fps": 30,
@@ -23,6 +23,7 @@ CONFIG = {
     "roi_radius": 140,
 
     "vote_min_pct": 0.20,
+    "motion_vote_min_pct": 0.08,
 
     "black_v_max": 60,
     "white_v_min": 150,
@@ -109,7 +110,7 @@ _last_known = {"result": None, "time": 0.0}
 _latest_frame = None           # ★ viewer 线程共享的最近帧
 _latest_frame_time = 0.0
 _frame_lock = threading.Lock()
-_recent_color_samples = []     # 圆弧运动中复用 viewer 连续识别结果
+_recent_color_samples = []     # 圆弧运动中复用 viewer 连续识别结果: (time, color, pct)
 _recent_color_lock = threading.Lock()
 _viewer_started = False
 _viewer_thread = None
@@ -131,10 +132,10 @@ def _get_status():
 
 
 def _ordered_devices():
-    """生成 USB 摄像头尝试顺序；当前首选 + 配置列表 + 0/1 兜底。"""
-    devices = CONFIG.get("usb_devices") or [CONFIG.get("usb_device", 0)]
+    """生成 USB 摄像头尝试顺序；实车优先 1，0 只作为回退。"""
+    devices = CONFIG.get("usb_devices") or [CONFIG.get("usb_device", 1)]
     ordered_devices = []
-    for dev in [CONFIG.get("usb_device", 0), *devices, 0, 1]:
+    for dev in [CONFIG.get("usb_device", 1), *devices, 1, 0]:
         if dev not in ordered_devices:
             ordered_devices.append(dev)
     return ordered_devices
@@ -264,8 +265,12 @@ def _viewer_loop():
         frame = _read_camera_frame()
         if frame is not None:
             # 单帧识别结果持续写入缓存；显示窗口只是消费这个结果。
-            color, pcts = _single_frame_color(frame, thresholds)
-            _record_color_sample(color)
+            color, pcts = _single_frame_color(
+                frame,
+                thresholds,
+                vote_min_pct=CONFIG["motion_vote_min_pct"],
+            )
+            _record_color_sample(color, pcts)
 
             # 实时显示
             if CONFIG["show_window"]:
@@ -338,12 +343,12 @@ def clear_recent_colors():
         _recent_color_samples.clear()
 
 
-def _record_color_sample(color):
+def _record_color_sample(color, pct=None):
     """记录 viewer 每帧颜色结果，供圆弧运动中快速读取。"""
     now = time.time()
     keep_s = max(CONFIG["motion_recent_window_s"], 0.5)
     with _recent_color_lock:
-        _recent_color_samples.append((now, color))
+        _recent_color_samples.append((now, color, pct or {}))
         cutoff = now - keep_s
         while _recent_color_samples and _recent_color_samples[0][0] < cutoff:
             _recent_color_samples.pop(0)
@@ -358,7 +363,7 @@ def get_recent_motion_color(window_s=None, min_hits=None):
     now = time.time()
     votes = {"黑": 0, "白": 0, "红": 0, "绿": 0, "蓝": 0}
     with _recent_color_lock:
-        samples = [(t, c) for t, c in _recent_color_samples
+        samples = [(t, c) for t, c, _pct in _recent_color_samples
                    if (now - t) <= window_s and c is not None]
     for _, color in samples:
         if color in votes:
@@ -369,9 +374,37 @@ def get_recent_motion_color(window_s=None, min_hits=None):
     return None
 
 
+def recent_motion_debug(window_s=None):
+    """返回最近运动识别窗口的统计，判断是没赶上还是 ROI 比例不够。"""
+    if window_s is None:
+        window_s = CONFIG["motion_recent_window_s"]
+    now = time.time()
+    votes = {"黑": 0, "白": 0, "红": 0, "绿": 0, "蓝": 0, None: 0}
+    best_pct = {"黑": 0.0, "白": 0.0, "红": 0.0, "绿": 0.0, "蓝": 0.0}
+    ages = []
+    with _recent_color_lock:
+        samples = [(t, c, pct) for t, c, pct in _recent_color_samples
+                   if (now - t) <= window_s]
+    for t, color, pct in samples:
+        votes[color if color else None] = votes.get(color if color else None, 0) + 1
+        ages.append(now - t)
+        for c, v in (pct or {}).items():
+            if c in best_pct and v > best_pct[c]:
+                best_pct[c] = float(v)
+    return {
+        "samples": len(samples),
+        "newest_age": min(ages) if ages else None,
+        "oldest_age": max(ages) if ages else None,
+        "votes": votes,
+        "best_pct": best_pct,
+    }
+
+
 # ============ 单帧识别 (供 recognizer + viewer 共享) ============
-def _single_frame_color(frame, thresholds):
+def _single_frame_color(frame, thresholds, vote_min_pct=None):
     """单帧识别, 返回 (color, pct_dict) 或 (None, {})"""
+    if vote_min_pct is None:
+        vote_min_pct = CONFIG["vote_min_pct"]
     h, w = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     V = hsv[:, :, 2]
@@ -405,7 +438,7 @@ def _single_frame_color(frame, thresholds):
     pct = {c: float(np.sum(m == 255)) / roi_total
            for c, m in color_masks.items()}
     best = max(pct, key=lambda k: pct[k])
-    if pct[best] < CONFIG["vote_min_pct"]:
+    if pct[best] < vote_min_pct:
         return None, pct
     return best, pct
 

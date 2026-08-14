@@ -192,6 +192,13 @@ def recognize_current_slot_color(loaded_slot_colors: dict[int, str],
                        window_s=0.28,
                        min_hits=2)
     if color is None:
+        debug = block.recent_motion_debug(window_s=0.45)
+        print(
+            f"  !! {label} 运动识别失败: samples={debug['samples']}, "
+            f"age={debug['newest_age']}, votes={debug['votes']}, "
+            f"best_pct={debug['best_pct']}",
+            flush=True,
+        )
         block.set_status(f"{label} 识别失败")
         return None
     loaded_slot_colors[slot] = color
@@ -220,6 +227,12 @@ def start_arc_color_monitor(loaded_slot_colors: dict[int, str],
             dist = math.hypot(x - tx, y - ty)
             if dist <= CD_ARC_TRIGGER_RADIUS_M:
                 print(f"  [{label}] 进入识别范围 dist={dist:.3f}m, pose=({x:.4f},{y:.4f},yaw={yaw:.1f}°)")
+                debug = block.recent_motion_debug(window_s=0.45)
+                print(
+                    f"  [{label}] recent block samples={debug['samples']}, "
+                    f"votes={debug['votes']}, best_pct={debug['best_pct']}",
+                    flush=True,
+                )
                 color = recognize_current_slot_color(loaded_slot_colors, slot_state,
                                                      label, stable=False)
                 if color is not None:
