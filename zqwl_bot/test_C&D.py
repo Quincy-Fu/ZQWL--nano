@@ -38,17 +38,17 @@ CD_ARC_START_YAW = -69.0
 CD_ARC_RADIUS = 0.869
 CD_ARC_DIR = 1
 CD_ARC_SWEEP_DEG = 130.0
-CD_ARC_SPEED = 0.25
+CD_ARC_SPEED = 0.18
 CD_SLOT_COUNT = 5
-CD_ARC_TRIGGER_RADIUS_M = 0.30
-CD_ARC_POSE_POLL_S = 0.03
-CD_ARC_RECOGNIZE_FRAMES = 5
-CD_ARC_RECOGNIZE_TIMEOUT_S = 0.60
+CD_ARC_TRIGGER_RADIUS_M = 0.38
+CD_ARC_POSE_POLL_S = 0.02
+CD_ARC_RECOGNIZE_FRAMES = 2
+CD_ARC_RECOGNIZE_TIMEOUT_S = 0.18
 CD_ARC_COLOR_POINTS = [
-    ("第2个物块", -1.1595, 0.4474),
-    ("第3个物块", -1.4256, 0.8523),
-    ("第4个物块", -1.4871, 1.3273),
-    ("第5个物块", -1.3121, 1.7667),
+    ("第2个物块", -1.1184, 0.3751),
+    ("第3个物块", -1.4294, 0.7839),
+    ("第4个物块", -1.3818, 1.2153),
+    ("第5个物块", -1.1385, 1.5952),
 ]
 
 KEY_PATH_POINTS = [
@@ -188,13 +188,14 @@ def recognize_current_slot_color(loaded_slot_colors: dict[int, str],
         color = _timed(f"BLOCK recognize {label} slot {slot}", block.recognize_stable,
                        frames=10, timeout=3.0)
     else:
-        color = _timed(f"BLOCK recognize {label} slot {slot}", block.recognize_no_fallback,
-                       frames=CD_ARC_RECOGNIZE_FRAMES,
-                       timeout=CD_ARC_RECOGNIZE_TIMEOUT_S)
+        color = _timed(f"BLOCK recognize {label} slot {slot}", block.recognize_motion,
+                       window_s=0.28,
+                       min_hits=2)
     if color is None:
         block.set_status(f"{label} 识别失败")
         return None
     loaded_slot_colors[slot] = color
+    block.clear_recent_colors()
     block.set_status(f"{label} -> 槽位 {slot}: {color}")
     print(f"  {label}: slot {slot} <- color {color}")
     return color
@@ -290,6 +291,7 @@ def prepare_block_scan(arm_state: int, light_id: int) -> bool:
         block.CONFIG["show_window"] = True
         block.set_status("准备物块识别: ARM 1 + LIGHT 4 + USB")
         block.start_viewer()
+        block.clear_recent_colors()
         arm_ok = comm.wait_for_after(comm.TYPE_ARM_RESP, seen, 6.0)
         light_ok = comm.wait_for_after(comm.TYPE_LIGHT_RESP, seen, 5.0)
         if not arm_ok:

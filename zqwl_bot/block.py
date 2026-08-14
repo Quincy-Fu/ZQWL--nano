@@ -36,6 +36,12 @@ CONFIG = {
     "fast_timeout_s": 1.5,
     "fast_min_hits": 3,
 
+    "motion_recent_window_s": 0.25,
+    "motion_recent_min_hits": 2,
+    "motion_fallback_frames": 2,
+    "motion_fallback_timeout_s": 0.18,
+    "motion_fallback_min_hits": 1,
+
     "last_known_max_age_s": 3.0,
     "latest_frame_max_age_s": 0.30,
     "device_retry_cooldown_s": 20.0,
@@ -103,6 +109,8 @@ _last_known = {"result": None, "time": 0.0}
 _latest_frame = None           # ★ viewer 线程共享的最近帧
 _latest_frame_time = 0.0
 _frame_lock = threading.Lock()
+_recent_color_samples = []     # 圆弧运动中复用 viewer 连续识别结果
+_recent_color_lock = threading.Lock()
 _viewer_started = False
 _viewer_thread = None
 _viewer_stop = threading.Event()
@@ -153,6 +161,8 @@ def _clear_frame_cache_locked():
     with _frame_lock:
         _latest_frame = None
         _latest_frame_time = 0.0
+    with _recent_color_lock:
+        _recent_color_samples.clear()
     _last_known["result"] = None
     _last_known["time"] = 0.0
 
@@ -253,6 +263,10 @@ def _viewer_loop():
         t0 = time.time()
         frame = _read_camera_frame()
         if frame is not None:
+            # 单帧识别结果持续写入缓存；显示窗口只是消费这个结果。
+            color, pcts = _single_frame_color(frame, thresholds)
+            _record_color_sample(color)
+
             # 实时显示
             if CONFIG["show_window"]:
                 display = frame.copy()
@@ -267,7 +281,6 @@ def _viewer_loop():
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
                 # 单帧识别结果 (快速反馈)
-                color, pcts = _single_frame_color(frame, thresholds)
                 if color:
                     bgr = COLOR_BGR.get(color, (255, 255, 255))
                     cv2.rectangle(display, (0, 0), (w, 50), bgr, -1)
@@ -317,6 +330,43 @@ def _read_latest_frame():
         if (time.time() - _latest_frame_time) > CONFIG["latest_frame_max_age_s"]:
             return None
         return _latest_frame.copy()
+
+
+def clear_recent_colors():
+    """清空最近颜色缓存，避免上一个物块的结果串到下一个点。"""
+    with _recent_color_lock:
+        _recent_color_samples.clear()
+
+
+def _record_color_sample(color):
+    """记录 viewer 每帧颜色结果，供圆弧运动中快速读取。"""
+    now = time.time()
+    keep_s = max(CONFIG["motion_recent_window_s"], 0.5)
+    with _recent_color_lock:
+        _recent_color_samples.append((now, color))
+        cutoff = now - keep_s
+        while _recent_color_samples and _recent_color_samples[0][0] < cutoff:
+            _recent_color_samples.pop(0)
+
+
+def get_recent_motion_color(window_s=None, min_hits=None):
+    """读取最近连续识别缓存；不使用 last_known 兜底，适合运动中触发点。"""
+    if window_s is None:
+        window_s = CONFIG["motion_recent_window_s"]
+    if min_hits is None:
+        min_hits = CONFIG["motion_recent_min_hits"]
+    now = time.time()
+    votes = {"黑": 0, "白": 0, "红": 0, "绿": 0, "蓝": 0}
+    with _recent_color_lock:
+        samples = [(t, c) for t, c in _recent_color_samples
+                   if (now - t) <= window_s and c is not None]
+    for _, color in samples:
+        if color in votes:
+            votes[color] += 1
+    winner = max(votes, key=votes.get)
+    if votes[winner] >= min_hits:
+        return winner
+    return None
 
 
 # ============ 单帧识别 (供 recognizer + viewer 共享) ============
@@ -418,6 +468,34 @@ def recognize(frames=None, timeout=None):
     _last_known["result"] = result
     _last_known["time"] = time.time()
     return result
+
+
+def recognize_no_fallback(frames=None, timeout=None, min_hits=None):
+    """快速识别但不使用 last_known 兜底，避免运动中把上一个物块串到下一个槽位。"""
+    start_viewer()
+
+    if frames is None:
+        frames = CONFIG["fast_frames"]
+    if timeout is None:
+        timeout = CONFIG["fast_timeout_s"]
+    if min_hits is None:
+        min_hits = max(1, min(int(frames), CONFIG["fast_min_hits"]))
+
+    result, _hits = _recognize_multi(frames, min_hits, timeout)
+    return result
+
+
+def recognize_motion(window_s=None, min_hits=None):
+    """圆弧运动中取色：优先用 viewer 连续缓存，失败再极短补采。"""
+    start_viewer()
+    color = get_recent_motion_color(window_s=window_s, min_hits=min_hits)
+    if color is not None:
+        return color
+    return recognize_no_fallback(
+        frames=CONFIG["motion_fallback_frames"],
+        timeout=CONFIG["motion_fallback_timeout_s"],
+        min_hits=CONFIG["motion_fallback_min_hits"],
+    )
 
 
 def recognize_stable(frames=None, timeout=None):
