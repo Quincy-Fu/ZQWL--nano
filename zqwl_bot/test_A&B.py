@@ -231,7 +231,7 @@ def place_rank_with_ring(rank_name):
     letter, x, y, arm_state, sync_x, sync_y = RANK_PLACE_POINTS[rank_name]
     slot = ALPHA_TO_POS[letter]
     print(f"\n=== {rank_name}: {letter} -> 槽位 {slot}, 目标=({x:.4f}, {y:.4f}) ===")
-    if not go_to(x, y):
+    if not go_to_split(x, y):
         return False
     if not arm_light_rotate(arm_state, slot, light_id=4, light_on=True):
         return False
@@ -262,7 +262,7 @@ def run_task_ab():
     print(f"  [圆弧预置位置 {ARC_PRELOAD_POSITION}] 转盘切到槽位 {first_slot} ({first_letter})")
     arm_and_rotate_async(1, first_slot)
 
-    arc_r = 0.84
+    arc_r = 0.86
     arc_dir = -1
     arc_sweep_deg = 130.0
     arc_speed = ARC_SPEED_MM_S / 1000.0

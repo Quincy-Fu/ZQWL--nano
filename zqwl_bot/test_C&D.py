@@ -41,7 +41,7 @@ CD_ARC_START_YAW = -69.0
 CD_ARC_RADIUS = 0.869
 CD_ARC_DIR = 1
 CD_ARC_SWEEP_DEG = 130.0
-CD_ARC_SPEED = 0.18
+CD_ARC_SPEED = 0.30
 CD_SLOT_COUNT = 5
 CD_LOAD_ROTATE_LIMIT = 4
 CD_ARC_POSE_POLL_S = 0.02
@@ -49,7 +49,10 @@ CD_ARM_READY_SETTLE_S = 0.80
 CD_DISPLAY_ONCE_WINDOW_S = 0.80
 CD_ARC_RECOGNIZE_TIME_OFFSET_S = 1.00
 CD_ARC_TIME_WINDOW_HALF_S = 0.90
-CD_ARC_ROTATE_AFTER_CENTER_S = 0.50
+# 转盘切槽时机按圆弧行驶距离算，而不是写死时间。
+# 旧参数 0.18m/s * 0.50s ≈ 0.09m；提速后保持同样空间位置触发。
+CD_ARC_ROTATE_AFTER_CENTER_DIST_M = 0.09
+# 圆弧运动中白色很容易被白底误触发，默认排除；只在白色成为最后一个缺失颜色时放开。
 CD_ARC_ACTIVE_EXCLUDE_COLORS = {"白"}
 CD_ARC_COLOR_POINTS = [
     ("第2个物块", -1.1184, 0.3751),
@@ -340,10 +343,20 @@ def start_first_block_monitor(loaded_slot_colors: dict[int, str],
 
 
 def start_arc_color_monitor(loaded_slot_colors: dict[int, str],
-                            slot_state: dict[str, int]) -> tuple[threading.Thread, threading.Event, dict]:
+                            slot_state: dict[str, int],
+                            target_colors: dict[str, str]) -> tuple[threading.Thread, threading.Event, dict]:
     """圆弧期间按预计经过时间开窗口识别；转盘也按时间触发。"""
     stop_event = threading.Event()
     state = {"done": 0, "failed": [], "missing_colors": [], "last_pose": None, "schedule": []}
+
+    def active_exclude_colors() -> set[str]:
+        expected = list(target_colors.values())
+        used = set(loaded_slot_colors.values())
+        missing = [color for color in expected if color not in used]
+        exclude = set(CD_ARC_ACTIVE_EXCLUDE_COLORS)
+        if missing == ["白"]:
+            exclude.discard("白")
+        return exclude
 
     def arc_point_time_s(x: float, y: float) -> tuple[float, float]:
         """把近似坐标投影到当前圆弧上，返回预计经过时间和扫过角度。"""
@@ -369,7 +382,8 @@ def start_arc_color_monitor(loaded_slot_colors: dict[int, str],
         center_t = min(total_t, raw_center_t + CD_ARC_RECOGNIZE_TIME_OFFSET_S)
         window_start = max(0.0, center_t - CD_ARC_TIME_WINDOW_HALF_S)
         window_end = min(total_t, center_t + CD_ARC_TIME_WINDOW_HALF_S)
-        rotate_t = center_t + CD_ARC_ROTATE_AFTER_CENTER_S if idx < len(CD_ARC_COLOR_POINTS) - 1 else None
+        rotate_delay_s = CD_ARC_ROTATE_AFTER_CENTER_DIST_M / max(CD_ARC_SPEED, 0.01)
+        rotate_t = center_t + rotate_delay_s if idx < len(CD_ARC_COLOR_POINTS) - 1 else None
         schedule.append({
             "label": label,
             "raw_center_t": raw_center_t,
@@ -407,7 +421,7 @@ def start_arc_color_monitor(loaded_slot_colors: dict[int, str],
                 elapsed = time.monotonic() - started_at
 
                 if color is None and elapsed <= item["window_end"]:
-                    used_colors = set(loaded_slot_colors.values()) | CD_ARC_ACTIVE_EXCLUDE_COLORS
+                    used_colors = set(loaded_slot_colors.values()) | active_exclude_colors()
                     color = block.wait_for_display_color(
                         timeout_s=0.03,
                         window_s=CD_DISPLAY_ONCE_WINDOW_S,
@@ -432,8 +446,17 @@ def start_arc_color_monitor(loaded_slot_colors: dict[int, str],
                 time.sleep(CD_ARC_POSE_POLL_S)
 
             if color is None:
+                used_colors = set(loaded_slot_colors.values()) | active_exclude_colors()
+                debug = block.recent_motion_debug(
+                    window_s=CD_DISPLAY_ONCE_WINDOW_S,
+                    exclude_colors=used_colors,
+                )
                 state["missing_colors"].append(label)
-                print(f"  {label}: 时间窗口未识别到红/绿/蓝/黑，后续用排除法")
+                print(
+                    f"  {label}: 时间窗口未识别到有效颜色，后续用排除法; "
+                    f"samples={debug.get('samples')}, votes={debug.get('votes')}, "
+                    f"best_pct={debug.get('best_pct')}"
+                )
             state["done"] += 1
             next_idx += 1
             block.clear_recognition_cache()
@@ -460,13 +483,16 @@ def refresh_cur_from_pose(label: str = "pose") -> bool:
     return False
 
 
-def run_cd_arc(loaded_slot_colors: dict[int, str], slot_state: dict[str, int]) -> bool:
+def run_cd_arc(loaded_slot_colors: dict[int, str],
+               slot_state: dict[str, int],
+               target_colors: dict[str, str]) -> bool:
     """按用户指定参数走 C/D 圆弧，并在近似坐标处识别颜色、按定时切转盘。"""
     timeout = (math.radians(CD_ARC_SWEEP_DEG) * CD_ARC_RADIUS /
                max(CD_ARC_SPEED, 0.01) * 2.5 + 15.0)
     monitor_thread, monitor_stop, monitor_state = start_arc_color_monitor(
         loaded_slot_colors,
         slot_state,
+        target_colors,
     )
     try:
         ok = _timed(
@@ -753,7 +779,7 @@ def run_task_cd() -> None:
 
     advance_turntable_after_color(slot_state, "第1个物块到圆弧起点后收纳")
     _require(turn_to(CD_ARC_START_YAW), "turn to C/D arc yaw")
-    _require(run_cd_arc(loaded_slot_colors, slot_state), "C/D arc")
+    _require(run_cd_arc(loaded_slot_colors, slot_state, target_colors), "C/D arc")
     complete_loaded_slot_colors_by_exclusion(loaded_slot_colors, target_colors)
     color_to_slot = invert_loaded_slot_colors(loaded_slot_colors)
     release_block_camera_before_ring()

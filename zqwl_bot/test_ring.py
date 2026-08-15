@@ -4,7 +4,8 @@
 test_ring.py - 同心圆环视觉定位测试入口
 
 用途：车先靠轮子定位到圆环附近，再用 USB 摄像头识别 50/90/130/170/210mm
-同心圆，自动估算 mm/px，并通过下位机 FINE_MOVE 做 dx/dy 位置修正。
+同心圆，自动估算 mm/px，通过下位机 FINE_MOVE 做 dx/dy 闭环修正；
+对准后的固定前进/后退也使用 FINE_MOVE。
 """
 
 import sys
@@ -119,7 +120,7 @@ RING_TEST_CONFIG = {
     "fine_move_max_step_mm": 30.0,
     "align_tolerance_mm": 2.0,
     "max_align_iterations": 10,
-    "checked_align_max_moves": 10,
+    "checked_align_max_moves": 6,
     "post_align_offset_y_mm": 105,
     "post_align_back_y_mm": 200,
     "auto_forward_after_align": False,

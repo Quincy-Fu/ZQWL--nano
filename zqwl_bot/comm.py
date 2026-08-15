@@ -158,6 +158,8 @@ TYPE_CMD_IMU_CALIB       = 0x2D   # PC->MCU: payload 空
 TYPE_CMD_IMU_CALIB_RESP  = 0x2E   # MCU->PC: payload 1B status (1=IMU帧恢复)
 TYPE_CMD_ARC_ROTATE      = 0x2F   # PC->MCU: 圆弧 + 3个转盘触发点
 TYPE_CMD_ARC_ROTATE_RESP = 0x30   # MCU->PC: payload 1B status
+TYPE_CMD_BODY_POS_MOVE   = 0x31   # PC->MCU: 车体坐标开环相对位移 dx_mm/dy_mm
+TYPE_CMD_BODY_POS_RESP   = 0x32   # MCU->PC: payload 1B status (估算到位)
 
 ROTATE_STATE_SPECIAL_36 = 5
 ROTATE_STATE_MAX = ROTATE_STATE_SPECIAL_36
@@ -180,6 +182,7 @@ _NAV_RESP_TYPES = frozenset({
     TYPE_CMD_VISION_CORRECT_RESP,
     TYPE_CMD_IMU_CALIB_RESP,
     TYPE_CMD_ARC_ROTATE_RESP,
+    TYPE_CMD_BODY_POS_RESP,
 })
 
 FRAME_OVERHEAD = 2 + 1 + 1 + 2  # header + type + len + crc16
@@ -402,6 +405,11 @@ class SerialComm:
     def send_fine_move(self, dx_mm: float, dy_mm: float) -> None:
         self._check_finite(dx_mm, dy_mm)
         self._send_nav(TYPE_CMD_FINE_MOVE, struct.pack("<ff", dx_mm, dy_mm))
+
+    def send_body_pos_move(self, dx_mm: float, dy_mm: float) -> None:
+        """发送开环车体相对位移命令，单位 mm，+X 右移，+Y 前进。"""
+        self._check_finite(dx_mm, dy_mm)
+        self._send_nav(TYPE_CMD_BODY_POS_MOVE, struct.pack("<ff", dx_mm, dy_mm))
 
     def send_sync_pose(self, x: float, y: float, yaw_deg: float | None = None) -> None:
         """同步下位机里程计坐标。
@@ -743,6 +751,16 @@ class SerialComm:
         self.send_vision_correct(dx_mm, dy_mm, target_x, target_y)
         return self.wait_for(TYPE_CMD_VISION_CORRECT_RESP, timeout)
 
+    def body_pos_move(self, dx_mm: float, dy_mm: float,
+                      timeout: float = 3.0) -> bool:
+        """开环车体相对位移，使用下位机四轮 Emm_V5 位置模式。
+
+        用途：ring 对准后的固定前推/后退。它按电机位置模式估算到位时间返回，
+        不走地图位置环，也不替代视觉 dx/dy 闭环微调。
+        """
+        self.send_body_pos_move(dx_mm, dy_mm)
+        return self.wait_for(TYPE_CMD_BODY_POS_RESP, timeout)
+
     def run(self, timeout: float = 5.0) -> bool:
         """启动命令 (模拟按下启动按键).
 
@@ -999,6 +1017,11 @@ def send_fine_move(dx_mm: float, dy_mm: float) -> None:
         raise RuntimeError("serial not initialized")
     _comm.send_fine_move(dx_mm, dy_mm)
 
+def send_body_pos_move(dx_mm: float, dy_mm: float) -> None:
+    if _comm is None:
+        raise RuntimeError("serial not initialized")
+    _comm.send_body_pos_move(dx_mm, dy_mm)
+
 def send_sync_pose(x: float, y: float, yaw_deg: float | None = None) -> None:
     if _comm is None:
         raise RuntimeError("serial not initialized")
@@ -1038,6 +1061,12 @@ def send_vision_correct(dx_mm: float, dy_mm: float,
     if _comm is None:
         raise RuntimeError("serial not initialized")
     _comm.send_vision_correct(dx_mm, dy_mm, target_x, target_y)
+
+def body_pos_move(dx_mm: float, dy_mm: float,
+                  timeout: float = 3.0) -> bool:
+    if _comm is None:
+        raise RuntimeError("serial not initialized, call init() first")
+    return _comm.body_pos_move(dx_mm, dy_mm, timeout)
 
 def send_imu_calib() -> None:
     if _comm is None:
@@ -1255,6 +1284,7 @@ def _self_check() -> None:
             TYPE_CMD_VISION_NUDGE: TYPE_CMD_VISION_NUDGE_RESP,
             TYPE_CMD_VISION_CORRECT: TYPE_CMD_VISION_CORRECT_RESP,
             TYPE_CMD_IMU_CALIB: TYPE_CMD_IMU_CALIB_RESP,
+            TYPE_CMD_BODY_POS_MOVE: TYPE_CMD_BODY_POS_RESP,
         }
 
         def __init__(self, comm):
@@ -1476,6 +1506,11 @@ def _self_check() -> None:
     # 6.21 IMU 零偏校准: 空 payload + IMU_CALIB_RESP 确认
     assert c.imu_calib(timeout=0.1)
     assert c._ser.written[-1] == pack_frame(TYPE_CMD_IMU_CALIB, b"")
+
+    # 6.22 开环车体位移: 8B payload (dx_mm/dy_mm) + BODY_POS_RESP 确认
+    assert c.body_pos_move(0.0, 105.0, timeout=0.1)
+    assert c._ser.written[-1] == pack_frame(
+        TYPE_CMD_BODY_POS_MOVE, struct.pack("<ff", 0.0, 105.0))
 
     print("self-check OK")
 

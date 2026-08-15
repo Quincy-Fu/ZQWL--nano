@@ -21,19 +21,19 @@ CONFIG = {
     "height": 480,
     "fps": 30,
     "thresholds_file": "hsv_thresholds.json",
-    "roi_radius": 140,
+    "roi_radius": 180,
 
     "vote_min_pct": 0.20,
     "motion_vote_min_pct": 0.08,
     "motion_chroma_min_pct": 0.04,
-    "motion_black_min_pct": 0.28,
+    "motion_black_min_pct": 0.16,
     "motion_white_min_pct": 0.82,
     "instant_recent_window_s": 0.80,
     "instant_chroma_min_pct": 0.02,
-    "instant_black_min_pct": 0.18,
+    "instant_black_min_pct": 0.12,
     "instant_white_min_pct": 0.90,
 
-    "black_v_max": 60,
+    "black_v_max": 75,
     "white_v_min": 150,
     "white_s_max": 80,
 

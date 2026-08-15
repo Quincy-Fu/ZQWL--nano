@@ -27,6 +27,7 @@
     n <f|b|l|r|s>      视觉微调 (体坐标系, 慢速) 例: n f
                        f=前进 b=后退 l=左 r=右 s=停止+锁死
     fm <dx> <dy>       诊断: 发送 FINE_MOVE 偏移(mm) 例: fm 30 0
+    bp <dx> <dy>       诊断: 发送 BODY_POS_MOVE 开环位移(mm) 例: bp 0 100
     vc <dx> <dy> [x y] 诊断: 发送 VISION_CORRECT 偏移(mm), 可选同步坐标(m)
                        例: vc 30 0        或 vc 30 0 0.5 0.3
     all                综合测试 (全部子系统按安全顺序跑一遍, 最后回原点)
@@ -300,6 +301,14 @@ def do_fine_move(dx_mm: float, dy_mm: float):
     return timed(f"FINE_MOVE dx={dx_mm:.1f}mm dy={dy_mm:.1f}mm", run)
 
 
+def do_body_pos_move(dx_mm: float, dy_mm: float):
+    """诊断 0x31: 开环车体相对位移，用 Emm_V5 位置模式。"""
+    return timed(
+        f"BODY_POS_MOVE dx={dx_mm:.1f}mm dy={dy_mm:.1f}mm",
+        lambda: comm.body_pos_move(dx_mm, dy_mm, timeout=4.0),
+    )
+
+
 def do_vision_correct(dx_mm: float, dy_mm: float,
                       target_x: float | None = None,
                       target_y: float | None = None):
@@ -366,6 +375,7 @@ HELP = """命令:
     p                  打印当前位姿
     n <f|b|l|r|s>      视觉微调 (f=前 b=后 l=左 r=右 s=停止+锁死)
     fm <dx> <dy>       诊断 FINE_MOVE 偏移(mm), 例: fm 30 0
+    bp <dx> <dy>       诊断 BODY_POS_MOVE 开环位移(mm), 例: bp 0 100
     vc <dx> <dy> [x y] 诊断 VISION_CORRECT 偏移(mm), 可选同步坐标(m)
     all                综合测试
     q                  退出"""
@@ -491,6 +501,11 @@ def main():
                         print("用法: fm <dx_mm> <dy_mm>  例: fm 30 0")
                         continue
                     do_fine_move(float(parts[1]), float(parts[2]))
+                elif cmd in ("bp", "body", "bodypos"):
+                    if len(parts) < 3:
+                        print("用法: bp <dx_mm> <dy_mm>  例: bp 0 100")
+                        continue
+                    do_body_pos_move(float(parts[1]), float(parts[2]))
                 elif cmd == "vc":
                     if len(parts) not in (3, 5):
                         print("用法: vc <dx_mm> <dy_mm> [target_x_m target_y_m]  例: vc 30 0 或 vc 30 0 0.5 0.3")
