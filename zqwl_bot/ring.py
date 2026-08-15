@@ -122,7 +122,7 @@ CONFIG = {
     "dead_zone_px": 0,
     "align_tolerance_mm": 2.0,
     "max_align_iterations": 10,
-    "checked_align_max_moves": 10,
+    "checked_align_max_moves": 3,
     "post_fine_move_settle_s": 0.25,
     "correct_timeout_s": 20.0,
     "fine_move_max_step_mm": 30.0,
@@ -2032,7 +2032,7 @@ def _push_forward_then_back(verbose=True):
 
 
 def align_checked_then_forward(max_moves=None, verbose=True):
-    """A 键流程：闭环微调到位，复检合格后前进固定距离并立刻后退。"""
+    """A 键流程：最多微调几次；未完全对准也继续执行固定前推/后退。"""
     if max_moves is None:
         max_moves = int(CONFIG.get("checked_align_max_moves", 10))
     max_moves = max(1, int(max_moves))
@@ -2047,8 +2047,8 @@ def align_checked_then_forward(max_moves=None, verbose=True):
         offset = detect_offset(verbose=verbose)
         if offset is None:
             if verbose:
-                print("  [FAIL] 当前没有可靠同心圆检测，停止 A 键流程")
-            return False
+                print("  [WARN] 当前没有可靠同心圆检测，跳过继续微调，仍执行前推/后退")
+            break
         final_offset = offset
         if _offset_is_aligned(offset):
             if verbose:
@@ -2056,20 +2056,22 @@ def align_checked_then_forward(max_moves=None, verbose=True):
             break
         if moves_done >= max_moves:
             if verbose:
-                print("  [STOP] 已达到微调次数上限，仍未进容差；不前进，避免反复微调副作用")
-            return False
+                print("  [WARN] 已达到微调次数上限，仍未进容差；停止微调但继续前推/后退")
+            break
         if not _fine_adjust_by_offset(offset, verbose=verbose):
-            return False
+            if verbose:
+                print("  [WARN] 本次微调失败，停止继续微调但仍执行前推/后退")
+            break
         moves_done += 1
         if settle_s > 0.0:
             time.sleep(settle_s)
     else:
-        return False
+        if verbose:
+            print("  [WARN] 微调循环结束，仍继续前推/后退")
 
     if final_offset is None or not _offset_is_aligned(final_offset):
         if verbose:
-            print("  [FAIL] 最终复检未通过，不执行前进/后退")
-        return False
+            print("  [WARN] 最终未确认完全对准，但按流程继续执行前进/后退")
     return _push_forward_then_back(verbose=verbose)
 
 
