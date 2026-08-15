@@ -8,7 +8,10 @@
 """
 
 import logging
+import glob
 import math
+import os
+import re
 import struct
 import threading
 import time
@@ -18,12 +21,93 @@ import serial
 
 log = logging.getLogger("zqwl.serial")
 
+DEFAULT_PORT_CANDIDATES = [
+    "/dev/ttyCH341USB1",
+    "/dev/ttyCH341USB0",
+    "/dev/ttyCH341USB*",
+    "/dev/ttyUSB*",
+    "/dev/ttyACM*",
+]
+
+
+def _split_port_entries(value):
+    """解析串口候选配置，支持单个路径、通配符或逗号/空格分隔列表。"""
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if str(v)]
+    return [v for v in re.split(r"[,;\s]+", str(value).strip()) if v]
+
+
+def _port_sort_key(path: str):
+    """串口候选排序；CH341 优先，同类设备优先试较新的编号。"""
+    name = os.path.basename(path)
+    if name.startswith("ttyCH341USB"):
+        group = 0
+    elif name.startswith("ttyUSB"):
+        group = 1
+    elif name.startswith("ttyACM"):
+        group = 2
+    else:
+        group = 9
+    match = re.search(r"(\d+)$", name)
+    number = int(match.group(1)) if match else -1
+    return group, -number, path
+
+
+def resolve_port_candidates(port=None):
+    """展开串口配置；支持字符串、通配符和候选列表。"""
+    if port is None or port == "":
+        env_ports = (
+            os.environ.get("ZQWL_COMM_PORTS")
+            or os.environ.get("ZQWL_SERIAL_PORTS")
+            or os.environ.get("ZQWL_COMM_PORT")
+            or os.environ.get("ZQWL_SERIAL_PORT")
+        )
+        entries = _split_port_entries(env_ports) or list(DEFAULT_PORT_CANDIDATES)
+    elif isinstance(port, (list, tuple)):
+        entries = _split_port_entries(port)
+    else:
+        entries = _split_port_entries(port)
+
+    # 兼容旧代码里写死 /dev/ttyCH341USB0 的情况：打开失败时还能试同系列设备。
+    expanded_entries = []
+    for entry in entries:
+        expanded_entries.append(str(entry))
+        if re.match(r"^/dev/ttyCH341USB\d+$", str(entry)):
+            expanded_entries.append("/dev/ttyCH341USB*")
+
+    candidates = []
+    seen = set()
+    for entry in expanded_entries:
+        if any(ch in entry for ch in "*?[]"):
+            matches = sorted(glob.glob(entry), key=_port_sort_key)
+            for match in matches:
+                if match not in seen:
+                    candidates.append(match)
+                    seen.add(match)
+        elif entry not in seen:
+            candidates.append(entry)
+            seen.add(entry)
+
+    if not candidates:
+        for entry in DEFAULT_PORT_CANDIDATES:
+            if any(ch in entry for ch in "*?[]"):
+                for match in sorted(glob.glob(entry), key=_port_sort_key):
+                    if match not in seen:
+                        candidates.append(match)
+                        seen.add(match)
+            elif entry not in seen:
+                candidates.append(entry)
+                seen.add(entry)
+    return candidates
+
 HEADER = (0xAA, 0x55)
 
 # 辅助命令
 TYPE_CMD_VEL  = 0x01
 TYPE_POSE     = 0x02   # 下位机50Hz上报位姿, payload 12B [x(f32), y(f32), theta(f32,CW弧度,编码器)]
-TYPE_ROTATE   = 0x03   # 转盘位置切换, payload 1B (0-4)
+TYPE_ROTATE   = 0x03   # 转盘位置切换, payload 1B (0-4槽位, 5=36°特殊状态)
 TYPE_ARM      = 0x04   # 机械臂状态切换, payload 1B (0-7, 0=默认位)
 TYPE_LIGHT    = 0x05   # 补光灯控制, payload 2B [id, on_off] (id: 0=全部, 1-4=单灯, 4=PA3/TIM5)
 TYPE_RUN      = 0x06   # 启动命令(模拟按键PD15), payload 空
@@ -75,6 +159,9 @@ TYPE_CMD_IMU_CALIB_RESP  = 0x2E   # MCU->PC: payload 1B status (1=IMU帧恢复)
 TYPE_CMD_ARC_ROTATE      = 0x2F   # PC->MCU: 圆弧 + 3个转盘触发点
 TYPE_CMD_ARC_ROTATE_RESP = 0x30   # MCU->PC: payload 1B status
 
+ROTATE_STATE_SPECIAL_36 = 5
+ROTATE_STATE_MAX = ROTATE_STATE_SPECIAL_36
+
 # 视觉微调方向码
 NUDGE_STOP     = 0   # 立即停止+电磁锁死
 NUDGE_FORWARD  = 1   # 体坐标系前进 (+Y)
@@ -113,7 +200,7 @@ def pack_frame(msg_type: int, payload: bytes) -> bytes:
 
 
 class SerialComm:
-    def __init__(self, port: str = "/dev/ttyCH341USB0", baudrate: int = 115200, timeout: float = 0.1):
+    def __init__(self, port=None, baudrate: int = 115200, timeout: float = 0.1):
         self._port = port
         self._baudrate = baudrate
         self._timeout = timeout
@@ -135,7 +222,28 @@ class SerialComm:
         self._reset_parser()
 
     def start(self) -> None:
-        self._ser = serial.Serial(self._port, self._baudrate, timeout=self._timeout)
+        errors = []
+        candidates = resolve_port_candidates(self._port)
+        for port in candidates:
+            try:
+                try:
+                    # Linux 下强制独占串口，避免两个上位机程序同时读写导致 CRC 错乱。
+                    self._ser = serial.Serial(port, self._baudrate, timeout=self._timeout, exclusive=True)
+                except TypeError:
+                    # 兼容旧版 pyserial：不支持 exclusive 参数时退回普通打开。
+                    self._ser = serial.Serial(port, self._baudrate, timeout=self._timeout)
+                self._ser.reset_input_buffer()
+                self._ser.reset_output_buffer()
+                self._port = port
+                log.info("serial opened: %s", port)
+                print(f"[comm] 串口已打开: {port}")
+                break
+            except Exception as exc:
+                errors.append(f"{port}: {exc}")
+                self._ser = None
+        if self._ser is None:
+            detail = "; ".join(errors) if errors else "无候选串口"
+            raise RuntimeError(f"无法打开串口，已尝试 {candidates}: {detail}")
         self._stop.clear()
         self._rx_thread = threading.Thread(target=self._rx_loop, name="serial-rx", daemon=True)
         self._rx_thread.start()
@@ -159,8 +267,8 @@ class SerialComm:
     def send_rotate(self, pos: int) -> int:
         if not self._ser:
             raise RuntimeError("serial not started")
-        if not (0 <= pos <= 4):
-            raise ValueError("rotate pos must be 0-4")
+        if not (0 <= pos <= ROTATE_STATE_MAX):
+            raise ValueError("rotate pos must be 0-5 (0-4 slots, 5=36deg special)")
         seen = self._mark_send()
         self._ser.write(pack_frame(TYPE_ROTATE, struct.pack("<B", pos)))
         return seen
@@ -282,8 +390,8 @@ class SerialComm:
         vals = []
         for deg, slot in triggers:
             self._check_finite(float(deg))
-            if not (0 <= int(slot) <= 4):
-                raise ValueError(f"rotate slot must be 0-4, got {slot}")
+            if not (0 <= int(slot) <= ROTATE_STATE_MAX):
+                raise ValueError(f"rotate state must be 0-5 (0-4 slots, 5=36deg special), got {slot}")
             vals.append((float(deg), int(slot)))
         self._send_nav(
             TYPE_CMD_ARC_ROTATE,
@@ -666,7 +774,7 @@ class SerialComm:
         return self.wait_for(TYPE_CMD_IMU_CALIB_RESP, timeout)
 
     def rotate(self, pos: int, timeout: float = 10.0) -> bool:
-        """转盘切槽位 (0-4), 阻塞等待 TYPE_ROTATE_RESP.
+        """转盘切状态 (0-4为槽位, 5为36°特殊状态), 阻塞等待 TYPE_ROTATE_RESP.
 
         下位机收到后移动转盘, 按估算移动时间等待后回响应 (status=1).
         注: 下位机只发不收 CAN, 响应代表"命令已执行+估算时间已到",
@@ -799,7 +907,7 @@ class SerialComm:
 _comm: SerialComm | None = None
 
 
-def init(port: str = "/dev/ttyCH341USB0", baudrate: int = 115200) -> None:
+def init(port=None, baudrate: int = 115200) -> None:
     global _comm
     if _comm is not None:
         _comm.stop()
@@ -1241,10 +1349,12 @@ def _self_check() -> None:
     assert c.run()
     assert c._ser.written[-1] == pack_frame(TYPE_RUN, b"")
 
-    # 6.9 send_rotate 范围校验: 0-4 合法, 越界抛 ValueError
+    # 6.9 send_rotate 范围校验: 0-5 合法(5=36°特殊状态), 越界抛 ValueError
     c.send_rotate(4)
     assert c._ser.written[-1] == pack_frame(TYPE_ROTATE, struct.pack("<B", 4))
-    for badv in (-1, 5, 255):
+    c.send_rotate(5)
+    assert c._ser.written[-1] == pack_frame(TYPE_ROTATE, struct.pack("<B", 5))
+    for badv in (-1, 6, 255):
         try:
             c.send_rotate(badv)
             assert False, "rotate out-of-range must raise"
@@ -1266,8 +1376,10 @@ def _self_check() -> None:
     # 6.11 高层 rotate: 帧 + ROTATE_RESP 确认; 越界抛 ValueError
     assert c.rotate(3)
     assert c._ser.written[-1] == pack_frame(TYPE_ROTATE, struct.pack("<B", 3))
+    assert c.rotate(5)
+    assert c._ser.written[-1] == pack_frame(TYPE_ROTATE, struct.pack("<B", 5))
     try:
-        c.rotate(5)
+        c.rotate(6)
         assert False, "rotate out-of-range must raise"
     except ValueError:
         pass

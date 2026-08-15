@@ -6,22 +6,31 @@ ring.py - 同心圆环识别 + 自动像素比例估算 + dx/dy 定位
 main 里用法:
     import comm
     import ring
-    comm.init("/dev/ttyCH341USB0", 115200)
+    comm.init("/dev/ttyCH341USB*", 115200)
     ring.align_once_to_ring()     # 到附近后: 找同心圆圆心 → 自动估算 mm/px → dx/dy 定位
-    ring.align_to_ring()          # 兼容旧 3 步: 对准 → +100mm → 退后 500px
+    ring.align_to_ring()          # 兼容旧 3 步，内部统一使用 FINE_MOVE
     ring.close()                  # 退出时
 """
 
-import cv2
-import numpy as np
+try:
+    import cv2
+except ModuleNotFoundError:
+    cv2 = None
+try:
+    import numpy as np
+except ModuleNotFoundError:
+    np = None
+import glob
+import os
+import re
 import sys
 import time
 import comm
 
 
 CONFIG = {
-    "usb_device": 0,
-    "usb_devices": [0, 1],
+    "usb_device": 1,
+    "usb_devices": [1, 0],
     "width": 640,
     "height": 480,
     "fps": 30,
@@ -36,6 +45,19 @@ CONFIG = {
     "edge_dilate_px": 1,
     "known_ring_diameters_mm": [50, 90, 130, 170, 210],
     "single_arc_default_diameter_mm": 210,
+    "use_manual_scale": True,
+    "manual_mm_per_px": 0.25,
+    "manual_center_min_diam_ratio": 0.38,
+    "manual_center_min_support": 2,
+    "manual_center_refine_enable": False,
+    "manual_center_refine_search_px": 32,
+    "manual_center_refine_step_px": 3,
+    "manual_center_refine_angles": 72,
+    "manual_center_refine_ring_width_px": 5,
+    "manual_center_refine_hit_thresh": 0.18,
+    "manual_center_refine_min_score": 0.08,
+    "manual_center_refine_min_hits": 2,
+    "manual_center_min_visible_ratio": 0.15,
     "min_candidate_diameter_px": 18,
     "max_candidate_diameter_px": 900,
     "min_arc_len_px": 45,
@@ -43,11 +65,14 @@ CONFIG = {
     "min_eccentricity": 0.30,
     "min_contour_points": 5,
     "center_cluster_px": 80,
-    "diam_merge_abs_px": 10,
-    "diam_merge_rel": 0.055,
+    "diam_merge_abs_px": 28,
+    "diam_merge_rel": 0.075,
     "match_abs_tol_px": 18,
     "match_rel_tol": 0.18,
     "min_scale_matches": 2,
+    "center_reliable_min_diameter_mm": 90,
+    "center_consistency_abs_px": 35,
+    "center_consistency_rel": 0.12,
 
     # RANSAC 圆弧兜底：用于黑环断裂、只看到一段圆弧、字母干扰较重的情况。
     "enable_ransac": False,
@@ -61,14 +86,20 @@ CONFIG = {
     "ransac_edge_low": 40,
     "ransac_edge_high": 120,
 
-    # 径向扫描兜底：直接利用 50/90/130/170/210mm 同心比例搜索圆心。
+    # 径向扫描仅保留作调试兜底；默认不用它选结果，避免把某个圆环误当 5 环比例。
     "enable_radial_scan": False,
     "radial_trigger_confidence": 0.45,
+    "radial_trigger_offset_mm": 30.0,
+    "radial_trigger_match_count": 4,
+    "radial_prefer_confidence_below": 0.70,
+    "radial_prefer_match_count_below": 4,
+    "radial_prefer_min_score": 0.14,
+    "radial_prefer_min_hits": 3,
     "radial_center_search_px": 100,
     "radial_center_step_px": 20,
     "radial_refine_step_px": 4,
     "radial_outer_radius_min_px": 45,
-    "radial_outer_radius_max_px": 260,
+    "radial_outer_radius_max_px": 360,
     "radial_outer_radius_step_px": 8,
     "radial_refine_radius_step_px": 2,
     "radial_angles": 48,
@@ -81,30 +112,35 @@ CONFIG = {
     "ring_actual_radius_m": 0.075,  # 仅作为自动比例失败时的旧兜底
     "calib_step": 0.0,
 
-    "detect_frames": 3,
-    "detect_min_hits": 1,
-    "detect_timeout_s": 0.8,
+    "detect_frames": 5,
+    "detect_min_hits": 2,
+    "detect_timeout_s": 1.2,
     "otsu_smooth_n": 3,
     "consistency_max_diff": 80,
     "last_known_max_age_s": 3.0,
 
     "dead_zone_px": 0,
+    "align_tolerance_mm": 2.0,
+    "max_align_iterations": 10,
+    "checked_align_max_moves": 10,
+    "post_fine_move_settle_s": 0.25,
     "correct_timeout_s": 20.0,
     "fine_move_max_step_mm": 30.0,
     "auto_forward_after_align": False,
     "camera_dx_sign": -1.0,
-    "camera_dy_sign": -1.0,
+    "camera_dy_sign": 1.0,
     "camera_swap_xy": False,
 
     "pre_cmd_sleep_s": 0.3,
-    "comm_port": "/dev/ttyCH341USB0",
+    "comm_port": "/dev/ttyCH341USB*",
     "comm_baud": 115200,
 
     "recover_pose_age_max": 1.0,
     "recover_max_retry": 3,
 
     "step1_to_step2_pause_s": 2.0,
-    "post_align_offset_y_mm": 100,
+    "post_align_offset_y_mm": 105,
+    "post_align_back_y_mm": 200,
     "step2_to_step3_pause_s": 2.0,
     "step3_back_offset_px": 500,
 
@@ -112,11 +148,180 @@ CONFIG = {
     "debug_window_name": "Ring Debug",
     "debug_mask_window_name": "Ring Evidence",
     "debug_max_candidates": 25,
+    "show_candidate_circles": False,
+    "draw_selected_ellipse": False,
+    "draw_manual_reference_rings": False,
+    "draw_observed_fit_rings": True,
     "preview_detect_interval_s": 0.25,
     "preview_result_max_age_s": 1.00,
     "enable_debug_trackbars": True,
     "trackbar_window_name": "Ring Tune",
 }
+
+
+def _port_sort_key(path):
+    """串口候选排序：CH341 优先，同类设备优先尝试编号较大的新设备。"""
+    name = os.path.basename(str(path))
+    if name.startswith("ttyCH341USB"):
+        group = 0
+    elif name.startswith("ttyUSB"):
+        group = 1
+    elif name.startswith("ttyACM"):
+        group = 2
+    else:
+        group = 9
+    match = re.search(r"(\d+)$", name)
+    number = int(match.group(1)) if match else -1
+    return group, -number, str(path)
+
+
+def resolve_comm_port(port=None):
+    """把串口配置解析成真实设备名；统一使用 comm.py 的候选和环境变量逻辑。"""
+    env_override = any(os.environ.get(k) for k in (
+        "ZQWL_COMM_PORTS", "ZQWL_SERIAL_PORTS", "ZQWL_COMM_PORT", "ZQWL_SERIAL_PORT"
+    ))
+    use_default = port is None or port == "" or (env_override and str(port) == "/dev/ttyCH341USB*")
+    candidates = comm.resolve_port_candidates(None if use_default else port)
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    raise FileNotFoundError(
+        "没有找到可用串口；已尝试 " + ", ".join(candidates) +
+        "。请先执行: ls /dev/ttyCH341USB* /dev/ttyUSB* /dev/ttyACM*"
+    )
+
+
+def validate_config():
+    """校验圆环定位关键配置，避免现场调参时出现隐蔽错误。"""
+    diameters = [float(v) for v in CONFIG.get("known_ring_diameters_mm", [])]
+    if len(diameters) < 2:
+        raise ValueError("known_ring_diameters_mm 至少需要 2 个已知直径")
+    if any(v <= 0.0 for v in diameters):
+        raise ValueError("known_ring_diameters_mm 必须全部为正数")
+    if any(b <= a for a, b in zip(diameters, diameters[1:])):
+        raise ValueError("known_ring_diameters_mm 必须按从小到大排列")
+    if float(CONFIG.get("single_arc_default_diameter_mm", 0.0)) <= 0.0:
+        raise ValueError("single_arc_default_diameter_mm 必须为正数")
+    if CONFIG.get("use_manual_scale", True) and float(CONFIG.get("manual_mm_per_px", 0.0)) <= 0.0:
+        raise ValueError("manual_mm_per_px 必须为正数")
+    ratio = float(CONFIG.get("manual_center_min_diam_ratio", 0.38))
+    if ratio <= 0.0 or ratio > 1.0:
+        raise ValueError("manual_center_min_diam_ratio 必须在 0~1 之间")
+    if int(CONFIG.get("manual_center_min_support", 1)) < 1:
+        raise ValueError("manual_center_min_support 至少为 1")
+    if int(CONFIG.get("manual_center_refine_search_px", 1)) < 1:
+        raise ValueError("manual_center_refine_search_px 必须为正数")
+    if int(CONFIG.get("manual_center_refine_step_px", 1)) < 1:
+        raise ValueError("manual_center_refine_step_px 必须为正数")
+    if int(CONFIG.get("manual_center_refine_angles", 8)) < 8:
+        raise ValueError("manual_center_refine_angles 至少为 8")
+    visible_ratio = float(CONFIG.get("manual_center_min_visible_ratio", 0.15))
+    if visible_ratio <= 0.0 or visible_ratio > 1.0:
+        raise ValueError("manual_center_min_visible_ratio 必须在 0~1 之间")
+    if int(CONFIG.get("detect_min_hits", 1)) > int(CONFIG.get("detect_frames", 1)):
+        raise ValueError("detect_min_hits 不能大于 detect_frames")
+    if int(CONFIG.get("checked_align_max_moves", 1)) < 1:
+        raise ValueError("checked_align_max_moves 至少为 1")
+    if float(CONFIG.get("post_align_offset_y_mm", 0.0)) <= 0.0:
+        raise ValueError("post_align_offset_y_mm 必须为正数")
+    if float(CONFIG.get("post_align_back_y_mm", 0.0)) < 0.0:
+        raise ValueError("post_align_back_y_mm 不能为负数")
+    if float(CONFIG.get("min_candidate_diameter_px", 0.0)) >= float(CONFIG.get("max_candidate_diameter_px", 0.0)):
+        raise ValueError("min_candidate_diameter_px 必须小于 max_candidate_diameter_px")
+    for key in ("camera_dx_sign", "camera_dy_sign"):
+        value = float(CONFIG.get(key, 0.0))
+        if value not in (-1.0, 1.0):
+            raise ValueError(f"{key} 只能是 +1.0 或 -1.0")
+    if float(CONFIG.get("fine_move_max_step_mm", 0.0)) <= 0.0:
+        raise ValueError("fine_move_max_step_mm 必须为正数")
+    return True
+
+
+def configure(overrides=None, **kwargs):
+    """统一更新圆环定位配置；测试脚本和主流程都从这里进入。"""
+    if overrides:
+        CONFIG.update(overrides)
+    if kwargs:
+        CONFIG.update(kwargs)
+    validate_config()
+    return CONFIG
+
+
+def _parse_device_list(value):
+    """解析 USB 设备号列表，支持 "1,0" / "1 0" 这类写法。"""
+    if value is None or value == "":
+        return []
+    if isinstance(value, int):
+        return [int(value)]
+    if isinstance(value, (list, tuple)):
+        return [int(v) for v in value]
+    items = re.split(r"[,;\s]+", str(value).strip())
+    return [int(v) for v in items if v != ""]
+
+
+def configure_usb(device=None, devices=None):
+    """配置 USB 摄像头候选顺序；默认优先 1，再回退 0。"""
+    ordered = []
+    if device is not None:
+        ordered.extend(_parse_device_list(device))
+    if devices is not None:
+        ordered.extend(_parse_device_list(devices))
+    ordered.extend([1, 0])
+
+    unique = []
+    for dev in ordered:
+        if dev not in unique:
+            unique.append(dev)
+    CONFIG["usb_device"] = unique[0]
+    CONFIG["usb_devices"] = unique
+    return unique
+
+
+def apply_usb_env(prefix="ZQWL_RING"):
+    """从环境变量覆盖 USB 设备号；专用变量优先，通用变量兜底。"""
+    device = os.environ.get(f"{prefix}_USB_DEVICE", os.environ.get("ZQWL_USB_DEVICE"))
+    devices = os.environ.get(f"{prefix}_USB_DEVICES", os.environ.get("ZQWL_USB_DEVICES"))
+    if device is not None or devices is not None:
+        return configure_usb(device=device, devices=devices)
+    return configure_usb(CONFIG.get("usb_device", 1), CONFIG.get("usb_devices", [1, 0]))
+
+
+def set_camera_mapping(dx_sign=None, dy_sign=None, swap_xy=None):
+    """设置图像偏差到车体 dx/dy 的映射；dx=右移，dy=前进。"""
+    if dx_sign is not None:
+        CONFIG["camera_dx_sign"] = 1.0 if float(dx_sign) >= 0.0 else -1.0
+    if dy_sign is not None:
+        CONFIG["camera_dy_sign"] = 1.0 if float(dy_sign) >= 0.0 else -1.0
+    if swap_xy is not None:
+        CONFIG["camera_swap_xy"] = bool(swap_xy)
+    validate_config()
+    return {
+        "camera_dx_sign": CONFIG["camera_dx_sign"],
+        "camera_dy_sign": CONFIG["camera_dy_sign"],
+        "camera_swap_xy": CONFIG["camera_swap_xy"],
+    }
+
+
+def pixel_offset_to_body_mm(dx_px, dy_px, mm_per_px):
+    """把图像像素偏差转换成下位机 FINE_MOVE 使用的车体 dx/dy。"""
+    raw_dx_mm = float(dx_px) * float(mm_per_px)
+    raw_dy_mm = float(dy_px) * float(mm_per_px)
+    if CONFIG.get("camera_swap_xy", False):
+        raw_dx_mm, raw_dy_mm = raw_dy_mm, raw_dx_mm
+    return {
+        "dx_mm": raw_dx_mm * float(CONFIG["camera_dx_sign"]),
+        "dy_mm": raw_dy_mm * float(CONFIG["camera_dy_sign"]),
+        "raw_dx_mm": raw_dx_mm,
+        "raw_dy_mm": raw_dy_mm,
+    }
+
+
+def _require_cv2():
+    """需要摄像头/图像处理时再检查视觉依赖，方便无硬件配置自检。"""
+    if cv2 is None:
+        raise RuntimeError("当前 Python 环境缺少 OpenCV(cv2)，只能做 mapping/selftest，不能打开视觉识别")
+    if np is None:
+        raise RuntimeError("当前 Python 环境缺少 numpy，只能做 mapping/selftest，不能打开视觉识别")
 
 
 # ============ 摄像头 ============
@@ -129,6 +334,7 @@ class USBCamera:
         self.cap = None
 
     def start(self):
+        _require_cv2()
         self.cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
@@ -173,6 +379,7 @@ def _build_ring_evidence(frame):
     这里不追求把 mask 调到“只剩黑线”。黑环的第一性原理是：它在局部邻域里
     是一条暗线，并且两侧有边缘；最终是否为圆环交给几何一致性判断。
     """
+    _require_cv2()
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray_eq = clahe.apply(gray)
@@ -211,6 +418,7 @@ def _build_ring_evidence(frame):
 
 def _threshold_dark(frame):
     """兼容旧调用：返回黑环证据二值图，而不是纯黑度阈值图。"""
+    _require_cv2()
     mask, _, _ = _build_ring_evidence(frame)
     return mask
 
@@ -280,6 +488,9 @@ def _extract_ring_candidates(frame, dark=None):
             "cy": float(cy),
             "diam_px": float(diameter_px),
             "radius_px": float(diameter_px) / 2.0,
+            "ellipse_w": float(ew),
+            "ellipse_h": float(eh),
+            "ellipse_angle": float(angle),
             "axis_major": axis_major,
             "axis_minor": axis_minor,
             "eccentricity": float(eccentricity),
@@ -330,15 +541,66 @@ def _merge_similar_diameters(items):
     for group in merged:
         group_items = group["items"]
         weight_sum = sum(i["score"] for i in group_items)
+        best_item = max(group_items, key=lambda i: i["score"])
         out.append({
             "cx": sum(i["cx"] * i["score"] for i in group_items) / weight_sum,
             "cy": sum(i["cy"] * i["score"] for i in group_items) / weight_sum,
             "diam_px": sum(i["diam_px"] * i["score"] for i in group_items) / weight_sum,
+            "ellipse_w": float(best_item.get("ellipse_w", best_item.get("diam_px", 0.0))),
+            "ellipse_h": float(best_item.get("ellipse_h", best_item.get("diam_px", 0.0))),
+            "ellipse_angle": float(best_item.get("ellipse_angle", 0.0)),
             "score": weight_sum,
             "coverage": max(i["coverage"] for i in group_items),
             "count": len(group_items),
         })
     return out
+
+
+def _weighted_match_center(matches):
+    """用大直径和高分候选加权估计圆心，降低中心字母闭合轮廓的影响。"""
+    weight_sum = 0.0
+    sx = 0.0
+    sy = 0.0
+    for m in matches:
+        diameter_mm = max(float(m.get("known_mm", 1.0)), 1.0)
+        weight = max(float(m.get("score", 1.0)), 1.0) * diameter_mm * diameter_mm
+        weight_sum += weight
+        sx += float(m["cx"]) * weight
+        sy += float(m["cy"]) * weight
+    if weight_sum <= 0.0:
+        return None
+    return sx / weight_sum, sy / weight_sum
+
+
+def _filter_center_consistent_matches(matches, px_per_mm):
+    """剔除中心明显偏离大圆中心的小圆候选，典型来源是圆环内部字母。"""
+    if not matches:
+        return [], []
+
+    min_reliable = float(CONFIG.get("center_reliable_min_diameter_mm", 90.0))
+    reliable = [m for m in matches if float(m.get("known_mm", 0.0)) >= min_reliable]
+    base_center = _weighted_match_center(reliable)
+    if base_center is None:
+        return matches, []
+
+    bx, by = base_center
+    kept = []
+    rejected = []
+    for m in matches:
+        known_mm = float(m.get("known_mm", 0.0))
+        dev = ((float(m["cx"]) - bx) ** 2 + (float(m["cy"]) - by) ** 2) ** 0.5
+        diam_px = known_mm * float(px_per_mm)
+        tol = max(float(CONFIG.get("center_consistency_abs_px", 35.0)),
+                  diam_px * float(CONFIG.get("center_consistency_rel", 0.12)))
+        if known_mm < min_reliable and dev > tol:
+            bad = dict(m)
+            bad["center_dev_px"] = float(dev)
+            bad["center_tol_px"] = float(tol)
+            rejected.append(bad)
+            continue
+        kept.append(m)
+
+    return kept if kept else reliable, rejected
 
 
 def _fit_scale_for_cluster(cluster):
@@ -380,16 +642,24 @@ def _fit_scale_for_cluster(cluster):
                             "score": item_score,
                             "cx": obs2["cx"],
                             "cy": obs2["cy"],
+                            "ellipse_w": obs2.get("ellipse_w", obs2["diam_px"]),
+                            "ellipse_h": obs2.get("ellipse_h", obs2["diam_px"]),
+                            "ellipse_angle": obs2.get("ellipse_angle", 0.0),
                         }
                     score += item_score
 
-            match_count = len(matches_by_known)
-            total_score = match_count * 100000.0 + score
+            raw_matches = list(matches_by_known.values())
+            trusted_matches, rejected_matches = _filter_center_consistent_matches(raw_matches, px_per_mm)
+            match_count = len(trusted_matches)
+            trusted_score = sum(m["score"] for m in trusted_matches)
+            total_score = match_count * 100000.0 + trusted_score
             if best is None or total_score > best["total_score"]:
                 best = {
                     "px_per_mm": px_per_mm,
                     "mm_per_px": 1.0 / px_per_mm,
-                    "matches": list(matches_by_known.values()),
+                    "matches": trusted_matches,
+                    "rejected_matches": rejected_matches,
+                    "raw_match_count": len(raw_matches),
                     "match_count": match_count,
                     "total_score": total_score,
                     "observed": observed,
@@ -411,10 +681,15 @@ def _fit_scale_for_cluster(cluster):
                 "score": largest["score"],
                 "cx": largest["cx"],
                 "cy": largest["cy"],
+                "ellipse_w": largest.get("ellipse_w", largest["diam_px"]),
+                "ellipse_h": largest.get("ellipse_h", largest["diam_px"]),
+                "ellipse_angle": largest.get("ellipse_angle", 0.0),
             }],
             "match_count": 1,
             "total_score": largest["score"],
             "observed": observed,
+            "rejected_matches": [],
+            "raw_match_count": 1,
             "fallback_single": True,
         }
     else:
@@ -422,22 +697,318 @@ def _fit_scale_for_cluster(cluster):
 
     matched = best["matches"]
     if matched:
-        weight_sum = sum(max(m["score"], 1.0) for m in matched)
-        cx = sum(m["cx"] * max(m["score"], 1.0) for m in matched) / weight_sum
-        cy = sum(m["cy"] * max(m["score"], 1.0) for m in matched) / weight_sum
+        center = _weighted_match_center(matched)
+        if center is None:
+            cx, cy = cluster["cx"], cluster["cy"]
+        else:
+            cx, cy = center
         outer = max(matched, key=lambda m: m["known_mm"])
         radius_px = outer["diam_px"] / 2.0
+        debug_ellipse = {
+            "cx": float(outer.get("cx", cx)),
+            "cy": float(outer.get("cy", cy)),
+            "w": float(outer.get("ellipse_w", outer["diam_px"])),
+            "h": float(outer.get("ellipse_h", outer["diam_px"])),
+            "angle": float(outer.get("ellipse_angle", 0.0)),
+        }
     else:
         cx, cy = cluster["cx"], cluster["cy"]
         radius_px = max(o["diam_px"] for o in observed) / 2.0
+        debug_ellipse = None
 
     best.update({
         "cx": float(cx),
         "cy": float(cy),
         "radius_px": float(radius_px),
+        "debug_ellipse": debug_ellipse,
         "confidence": min(1.0, best["match_count"] / float(len(known)))
     })
     return best
+
+
+def _ellipse_shape_from_support(support):
+    """从大圆候选估计透视下的椭圆形状；只估形状，不用它决定圆心。"""
+    if not support:
+        return 1.0, 1.0, 0.0
+
+    best = max(support, key=lambda o: float(o.get("score", 0.0)) * float(o.get("diam_px", 0.0)))
+    ew = max(2.0, float(best.get("ellipse_w", best.get("diam_px", 1.0))))
+    eh = max(2.0, float(best.get("ellipse_h", best.get("diam_px", 1.0))))
+    major = max(ew, eh)
+    if major <= 2.0:
+        return 1.0, 1.0, 0.0
+    return ew / major, eh / major, float(best.get("ellipse_angle", 0.0))
+
+
+def _robust_observed_center(support):
+    """只根据图像中实际拟合到的圆/圆弧估计圆心，不使用物理直径和像素比例。"""
+    if not support:
+        return None, []
+
+    items = list(support)
+    if len(items) <= 2:
+        kept = items
+    else:
+        def item_weight(item):
+            diam = max(float(item.get("diam_px", 1.0)), 1.0)
+            score = max(float(item.get("score", 1.0)), 1.0)
+            coverage = max(float(item.get("coverage", 0.05)), 0.05)
+            return score * diam * diam * coverage
+
+        weight_sum = sum(item_weight(item) for item in items)
+        seed_x = sum(float(item["cx"]) * item_weight(item) for item in items) / max(weight_sum, 1e-6)
+        seed_y = sum(float(item["cy"]) * item_weight(item) for item in items) / max(weight_sum, 1e-6)
+        dists = [((float(item["cx"]) - seed_x) ** 2 + (float(item["cy"]) - seed_y) ** 2) ** 0.5 for item in items]
+        med = float(np.median(np.array(dists, dtype=np.float32)))
+        mad = float(np.median(np.abs(np.array(dists, dtype=np.float32) - med)))
+        tol = max(18.0, med + 2.5 * max(mad, 1.0), float(CONFIG.get("center_cluster_px", 80)) * 0.45)
+        kept = [item for item, dist in zip(items, dists) if dist <= tol]
+        if len(kept) < 2:
+            kept = sorted(items, key=item_weight, reverse=True)[:2]
+
+    weight_sum = 0.0
+    sx = 0.0
+    sy = 0.0
+    for item in kept:
+        diam = max(float(item.get("diam_px", 1.0)), 1.0)
+        score = max(float(item.get("score", 1.0)), 1.0)
+        coverage = max(float(item.get("coverage", 0.05)), 0.05)
+        weight = score * diam * diam * coverage
+        weight_sum += weight
+        sx += float(item["cx"]) * weight
+        sy += float(item["cy"]) * weight
+    if weight_sum <= 0.0:
+        return None, []
+    return (sx / weight_sum, sy / weight_sum), kept
+
+
+def _score_fixed_scale_center(mask_norm, cx, cy, radii_px, cos_a, sin_a, ellipse_shape=(1.0, 1.0, 0.0)):
+    """固定半径下给圆心打分；大半径权重更高，中心字母影响自然降低。"""
+    h, w = mask_norm.shape[:2]
+    ring_width = max(1.0, float(CONFIG.get("manual_center_refine_ring_width_px", 5)))
+    hit_thresh = float(CONFIG.get("manual_center_refine_hit_thresh", 0.18))
+    min_visible_ratio = float(CONFIG.get("manual_center_min_visible_ratio", 0.15))
+    offsets = np.array([-ring_width, 0.0, ring_width], dtype=np.float32)
+    axis_w_scale, axis_h_scale, angle_deg = ellipse_shape
+    axis_w_scale = max(0.20, float(axis_w_scale))
+    axis_h_scale = max(0.20, float(axis_h_scale))
+    angle_rad = np.deg2rad(float(angle_deg))
+    rot_c = float(np.cos(angle_rad))
+    rot_s = float(np.sin(angle_rad))
+
+    total_weight = 0.0
+    total_score = 0.0
+    ring_scores = []
+    visible_flags = []
+    visible_count = 0
+    hit_count = 0
+    for radius in radii_px:
+        r = float(radius)
+        if r <= 1.0:
+            ring_scores.append(0.0)
+            visible_flags.append(False)
+            continue
+
+        per_offset_vals = []
+        valid_count = 0
+        total_count = 0
+        for off in offsets:
+            rx = max(1.0, r * axis_w_scale + float(off))
+            ry = max(1.0, r * axis_h_scale + float(off))
+            local_x = rx * cos_a
+            local_y = ry * sin_a
+            xs = np.rint(cx + local_x * rot_c - local_y * rot_s).astype(np.int32)
+            ys = np.rint(cy + local_x * rot_s + local_y * rot_c).astype(np.int32)
+            valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+            vals = np.zeros_like(cos_a, dtype=np.float32)
+            vals[valid] = mask_norm[ys[valid], xs[valid]]
+            per_offset_vals.append(vals)
+            valid_count += int(np.count_nonzero(valid))
+            total_count += int(len(valid))
+
+        valid_ratio = valid_count / float(max(total_count, 1))
+        if valid_ratio < min_visible_ratio:
+            ring_scores.append(0.0)
+            visible_flags.append(False)
+            continue
+        visible_flags.append(True)
+        visible_count += 1
+
+        vals = np.max(np.vstack(per_offset_vals), axis=0)
+        mean_dark = float(np.mean(vals))
+        hit_ratio = float(np.mean(vals >= hit_thresh))
+        ring_score = (0.60 * mean_dark + 0.40 * hit_ratio) * valid_ratio
+        ring_scores.append(ring_score)
+        if ring_score >= float(CONFIG.get("manual_center_refine_min_score", 0.08)):
+            hit_count += 1
+
+        weight = r * r
+        total_weight += weight
+        total_score += ring_score * weight
+
+    if total_weight <= 0.0:
+        return 0.0, ring_scores, hit_count, visible_count, visible_flags
+    return total_score / total_weight, ring_scores, hit_count, visible_count, visible_flags
+
+
+def _refine_manual_center_by_fixed_radii(mask, cx0, cy0, ellipse_shape=(1.0, 1.0, 0.0)):
+    """手动比例模式下，只优化圆心；物理半径由已知圆环直径和 manual_mm_per_px 固定。"""
+    if not CONFIG.get("manual_center_refine_enable", True):
+        return float(cx0), float(cy0), 0.0, [], 0, 0, []
+
+    manual_scale = float(CONFIG["manual_mm_per_px"])
+    if manual_scale <= 0.0:
+        return float(cx0), float(cy0), 0.0, [], 0, 0, []
+
+    known = np.array(CONFIG["known_ring_diameters_mm"], dtype=np.float32)
+    radii_px = known / manual_scale / 2.0
+    mask_norm = mask.astype(np.float32) / 255.0
+    h, w = mask.shape[:2]
+    search = int(CONFIG.get("manual_center_refine_search_px", 32))
+    step = max(1, int(CONFIG.get("manual_center_refine_step_px", 3)))
+    angle_count = int(CONFIG.get("manual_center_refine_angles", 72))
+    angles = np.linspace(0.0, 2.0 * np.pi, angle_count, endpoint=False)
+    cos_a = np.cos(angles).astype(np.float32)
+    sin_a = np.sin(angles).astype(np.float32)
+
+    best = {
+        "cx": float(cx0),
+        "cy": float(cy0),
+        "score": -1.0,
+        "ring_scores": [],
+        "hits": 0,
+        "visible_count": 0,
+        "visible_flags": [],
+    }
+
+    x_min = max(-int(0.2 * w), int(round(cx0 - search)))
+    x_max = min(int(1.2 * w), int(round(cx0 + search)))
+    y_min = max(-int(0.2 * h), int(round(cy0 - search)))
+    y_max = min(int(1.2 * h), int(round(cy0 + search)))
+    for yy in range(y_min, y_max + 1, step):
+        for xx in range(x_min, x_max + 1, step):
+            score, ring_scores, hits, visible_count, visible_flags = _score_fixed_scale_center(
+                mask_norm, float(xx), float(yy), radii_px, cos_a, sin_a, ellipse_shape
+            )
+            if score > best["score"]:
+                best = {
+                    "cx": float(xx),
+                    "cy": float(yy),
+                    "score": float(score),
+                    "ring_scores": ring_scores,
+                    "hits": int(hits),
+                    "visible_count": int(visible_count),
+                    "visible_flags": visible_flags,
+                }
+
+    refine_step = 1
+    local = best.copy()
+    for yy in range(int(best["cy"] - step), int(best["cy"] + step) + 1, refine_step):
+        for xx in range(int(best["cx"] - step), int(best["cx"] + step) + 1, refine_step):
+            score, ring_scores, hits, visible_count, visible_flags = _score_fixed_scale_center(
+                mask_norm, float(xx), float(yy), radii_px, cos_a, sin_a, ellipse_shape
+            )
+            if score > local["score"]:
+                local = {
+                    "cx": float(xx),
+                    "cy": float(yy),
+                    "score": float(score),
+                    "ring_scores": ring_scores,
+                    "hits": int(hits),
+                    "visible_count": int(visible_count),
+                    "visible_flags": visible_flags,
+                }
+
+    return (local["cx"], local["cy"], local["score"], local["ring_scores"], local["hits"],
+            local["visible_count"], local["visible_flags"])
+
+
+def _fit_manual_center_for_cluster(cluster, mask=None):
+    """只拟合圆心，不自动判断物理圆环编号；像素比例由 manual_mm_per_px 给定。"""
+    observed = _merge_similar_diameters(cluster["items"])
+    if not observed:
+        return None
+
+    largest = max(observed, key=lambda o: o["diam_px"])
+    largest_diam = float(largest["diam_px"])
+    min_ratio = float(CONFIG.get("manual_center_min_diam_ratio", 0.38))
+    min_support = int(CONFIG.get("manual_center_min_support", 2))
+
+    # 第一性原理：同心圆中心由大半径圆环约束更强，中心字母/小闭合块半径小，不能参与圆心加权。
+    support = [o for o in observed if float(o["diam_px"]) >= largest_diam * min_ratio]
+    if len(support) < min_support:
+        support = sorted(observed, key=lambda o: o["score"] * o["diam_px"] * o["diam_px"], reverse=True)[:min_support]
+
+    center, center_support = _robust_observed_center(support)
+    if center is None:
+        return None
+    cx, cy = center
+    if center_support:
+        support = center_support
+
+    fixed_score = 0.0
+    fixed_ring_scores = []
+    fixed_hits = 0
+    fixed_visible_count = 0
+    fixed_visible_flags = []
+    if mask is not None:
+        ellipse_shape = _ellipse_shape_from_support(support)
+        (rcx, rcy, fixed_score, fixed_ring_scores, fixed_hits,
+         fixed_visible_count, fixed_visible_flags) = _refine_manual_center_by_fixed_radii(
+            mask, cx, cy, ellipse_shape
+        )
+        required_hits = min(int(CONFIG.get("manual_center_refine_min_hits", 2)), fixed_visible_count)
+        if (fixed_visible_count >= 2 and fixed_hits >= required_hits and
+                fixed_score >= float(CONFIG.get("manual_center_refine_min_score", 0.08))):
+            cx, cy = rcx, rcy
+    outer = max(support, key=lambda o: o["diam_px"])
+    support_score = sum(float(o.get("score", 0.0)) for o in support)
+    avg_coverage = sum(float(o.get("coverage", 0.0)) for o in support) / max(len(support), 1)
+    confidence = min(1.0, 0.20 + len(support) * 0.18 + avg_coverage * 0.45 + fixed_score * 0.40)
+    manual_scale = float(CONFIG["manual_mm_per_px"])
+
+    matches = []
+    for item in support:
+        matches.append({
+            "diam_px": float(item["diam_px"]),
+            "score": float(item.get("score", 0.0)),
+            "cx": float(item["cx"]),
+            "cy": float(item["cy"]),
+            "ellipse_w": float(item.get("ellipse_w", item["diam_px"])),
+            "ellipse_h": float(item.get("ellipse_h", item["diam_px"])),
+            "ellipse_angle": float(item.get("ellipse_angle", 0.0)),
+            "coverage": float(item.get("coverage", 0.0)),
+        })
+
+    return {
+        "px_per_mm": 1.0 / manual_scale,
+        "mm_per_px": manual_scale,
+        "scale_source": "manual",
+        "matches": matches,
+        "match_count": len(matches),
+        "raw_match_count": len(observed),
+        "observed_count": len(observed),
+        "rejected_matches": [],
+        "fallback_single": False,
+        "total_score": len(matches) * 100000.0 + support_score + largest_diam * 1000.0,
+        "observed": observed,
+        "cx": float(cx),
+        "cy": float(cy),
+        "radius_px": float(outer["diam_px"]) / 2.0,
+        "fixed_center_score": float(fixed_score),
+        "fixed_center_hits": int(fixed_hits),
+        "fixed_ring_visible_count": int(fixed_visible_count),
+        "fixed_ring_visible_flags": fixed_visible_flags,
+        "fixed_ring_scores": fixed_ring_scores,
+        "debug_ellipse": {
+            "cx": float(cx),
+            "cy": float(cy),
+            "w": float(outer.get("ellipse_w", outer["diam_px"])),
+            "h": float(outer.get("ellipse_h", outer["diam_px"])),
+            "angle": float(outer.get("ellipse_angle", 0.0)),
+        },
+        "confidence": float(confidence),
+    }
 
 
 def _best_fit_from_candidates(candidates, dark, method):
@@ -447,7 +1018,10 @@ def _best_fit_from_candidates(candidates, dark, method):
 
     best = None
     for cluster in _cluster_by_center(candidates):
-        fit = _fit_scale_for_cluster(cluster)
+        if CONFIG.get("use_manual_scale", True):
+            fit = _fit_manual_center_for_cluster(cluster, dark)
+        else:
+            fit = _fit_scale_for_cluster(cluster)
         if fit is None:
             continue
         cluster_score = fit["total_score"] + len(cluster["items"]) * 1000.0
@@ -783,11 +1357,64 @@ def _rank_result(result):
     return confidence + match_bonus + method_bonus + fallback_penalty, float(result.get("cluster_score", 0.0))
 
 
+def _result_offset_mm(result, frame_shape):
+    """估算当前结果相对画面中心的偏差距离，用于决定是否启用慢速校验。"""
+    h, w = frame_shape[:2]
+    dx_px = float(result.get("cx", w * 0.5)) - w * 0.5
+    dy_px = float(result.get("cy", h * 0.5)) - h * 0.5
+    return ((dx_px * dx_px + dy_px * dy_px) ** 0.5) * float(result.get("mm_per_px", 0.0))
+
+
+def _should_verify_with_radial(result, frame_shape):
+    """字母干扰/远偏时，椭圆拟合可能看似有结果但中心不稳，需要径向同心校验。"""
+    if result is None:
+        return True
+    if result.get("fallback_single"):
+        return True
+    if float(result.get("confidence", 0.0)) < float(CONFIG.get("radial_trigger_confidence", 0.45)):
+        return True
+    if int(result.get("match_count", 0)) < int(CONFIG.get("radial_trigger_match_count", 4)):
+        return True
+    return _result_offset_mm(result, frame_shape) >= float(CONFIG.get("radial_trigger_offset_mm", 30.0))
+
+
+def _select_best_result(results):
+    """在普通候选和径向同心校验之间选最终结果。"""
+    if not results:
+        return None
+
+    ranked_best = max(results, key=_rank_result)
+    radial_results = [r for r in results if r.get("method") == "radial"]
+    if not radial_results:
+        return ranked_best
+
+    radial_best = max(radial_results, key=_rank_result)
+    non_radial = [r for r in results if r.get("method") != "radial"]
+    normal_best = max(non_radial, key=_rank_result) if non_radial else None
+    if normal_best is None:
+        return radial_best
+
+    normal_weak = (
+        normal_best.get("fallback_single") or
+        float(normal_best.get("confidence", 0.0)) < float(CONFIG.get("radial_prefer_confidence_below", 0.70)) or
+        int(normal_best.get("match_count", 0)) < int(CONFIG.get("radial_prefer_match_count_below", 4))
+    )
+    radial_good = (
+        float(radial_best.get("radial_score", 0.0)) >= float(CONFIG.get("radial_prefer_min_score", 0.14)) and
+        int(radial_best.get("match_count", 0)) >= int(CONFIG.get("radial_prefer_min_hits", 3))
+    )
+    if normal_weak and radial_good:
+        return radial_best
+
+    return ranked_best
+
+
 def find_ring_center(frame, dark=None, evidence=None):
     """返回同心圆中心和自动比例估算结果。
 
     识别顺序：轮廓椭圆拟合 → RANSAC 圆弧拟合 → 径向同心比例扫描。
     """
+    _require_cv2()
     if dark is None or evidence is None:
         built_mask, built_evidence, _ = _build_ring_evidence(frame)
         if dark is None:
@@ -803,10 +1430,14 @@ def find_ring_center(frame, dark=None, evidence=None):
     if ellipse_best is not None:
         results.append(ellipse_best)
 
-    best_now = max(results, key=_rank_result) if results else None
+    best_now = _select_best_result(results)
+    far_offset = (
+        best_now is not None and
+        _result_offset_mm(best_now, frame.shape) >= float(CONFIG.get("radial_trigger_offset_mm", 30.0))
+    )
     need_ransac = CONFIG.get("enable_ransac", True) and (
         best_now is None or best_now.get("fallback_single") or
-        best_now.get("confidence", 0.0) < 0.65
+        best_now.get("confidence", 0.0) < 0.65 or far_offset
     )
     if need_ransac:
         ransac_candidates, _ = _extract_ransac_candidates(evidence)
@@ -816,11 +1447,8 @@ def find_ring_center(frame, dark=None, evidence=None):
             if ransac_best is not None:
                 results.append(ransac_best)
 
-    best_now = max(results, key=_rank_result) if results else None
-    need_radial = CONFIG.get("enable_radial_scan", True) and (
-        best_now is None or best_now.get("fallback_single") or
-        best_now.get("confidence", 0.0) < CONFIG["radial_trigger_confidence"]
-    )
+    best_now = _select_best_result(results)
+    need_radial = CONFIG.get("enable_radial_scan", True) and _should_verify_with_radial(best_now, frame.shape)
     if need_radial:
         radial_best = _radial_scan_result(evidence, seed_candidates=all_candidates)
         if radial_best is not None:
@@ -829,10 +1457,88 @@ def find_ring_center(frame, dark=None, evidence=None):
     if not results:
         return None
 
-    best = max(results, key=_rank_result)
+    best = _select_best_result(results)
     best["candidates"] = all_candidates
     best["mask"] = evidence
     return best
+
+
+def _reference_ring_axes(result, diam_mm, mm_per_px):
+    """按最终圆心画固定物理直径参考环；有椭圆候选时沿用现场透视形状。"""
+    if mm_per_px <= 0.0:
+        return None
+
+    nominal_diam_px = float(diam_mm) / float(mm_per_px)
+    if nominal_diam_px <= 2.0:
+        return None
+
+    debug_ellipse = result.get("debug_ellipse") if result else None
+    if debug_ellipse:
+        ew = max(2.0, float(debug_ellipse.get("w", nominal_diam_px)))
+        eh = max(2.0, float(debug_ellipse.get("h", nominal_diam_px)))
+        major = max(ew, eh)
+        if major > 2.0:
+            axis_w = nominal_diam_px * ew / major / 2.0
+            axis_h = nominal_diam_px * eh / major / 2.0
+            return max(2, int(round(axis_w))), max(2, int(round(axis_h))), float(debug_ellipse.get("angle", 0.0))
+
+    r = max(2, int(round(nominal_diam_px / 2.0)))
+    return r, r, 0.0
+
+
+def _draw_observed_fit_rings(display, result):
+    """画图像里真实拟合到的圆/椭圆候选；绿色线只代表视觉拟合，不代表物理比例。"""
+    if not CONFIG.get("draw_observed_fit_rings", True):
+        return False
+
+    matches = result.get("matches", []) if result else []
+    if not matches:
+        return False
+
+    for item in sorted(matches, key=lambda m: float(m.get("diam_px", 0.0))):
+        cx = int(round(float(item.get("cx", result["cx"]))))
+        cy = int(round(float(item.get("cy", result["cy"]))))
+        ew = max(2, int(round(float(item.get("ellipse_w", item.get("diam_px", 0.0))) / 2.0)))
+        eh = max(2, int(round(float(item.get("ellipse_h", item.get("diam_px", 0.0))) / 2.0)))
+        angle = float(item.get("ellipse_angle", 0.0))
+        cv2.ellipse(display, (cx, cy), (ew, eh), angle, 0, 360, (0, 255, 0), 2)
+        cv2.circle(display, (cx, cy), 2, (0, 200, 0), -1)
+    return True
+
+
+def _draw_manual_reference_rings(display, result):
+    """只用于调试判断：以最终圆心为中心画 5 个已知直径参考环，不代表候选匹配数量。"""
+    if not CONFIG.get("draw_manual_reference_rings", True):
+        return
+    if not result or result.get("scale_source") != "manual":
+        return
+
+    mm_per_px = float(result.get("mm_per_px", CONFIG.get("manual_mm_per_px", 0.0)))
+    if mm_per_px <= 0.0:
+        return
+
+    cx = int(round(result["cx"]))
+    cy = int(round(result["cy"]))
+    scores = list(result.get("fixed_ring_scores", []))
+    visible_flags = list(result.get("fixed_ring_visible_flags", []))
+    min_score = float(CONFIG.get("manual_center_refine_min_score", 0.08))
+
+    for idx, diam_mm in enumerate(CONFIG.get("known_ring_diameters_mm", [])):
+        if idx < len(visible_flags) and not visible_flags[idx]:
+            continue
+        axes = _reference_ring_axes(result, float(diam_mm), mm_per_px)
+        if axes is None:
+            continue
+        ax, ay, angle = axes
+        score = scores[idx] if idx < len(scores) else 0.0
+        color = (0, 255, 0) if score >= min_score else (0, 165, 255)
+        thickness = 2 if score >= min_score else 1
+        cv2.ellipse(display, (cx, cy), (ax, ay), angle, 0, 360, color, thickness)
+
+        label_x = min(max(cx + ax + 4, 0), display.shape[1] - 52)
+        label_y = min(max(cy - ay + 14, 14), display.shape[0] - 6)
+        cv2.putText(display, f"{int(diam_mm)}", (label_x, label_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
 
 
 def _draw_debug(frame, result=None, candidates=None):
@@ -843,7 +1549,7 @@ def _draw_debug(frame, result=None, candidates=None):
     cv2.line(display, (w // 2, h // 2 - 18), (w // 2, h // 2 + 18), (255, 255, 0), 1)
     cv2.circle(display, (w // 2, h // 2), 5, (255, 255, 0), -1)
 
-    if candidates:
+    if candidates and CONFIG.get("show_candidate_circles", False):
         for cand in sorted(candidates, key=lambda c: c["score"], reverse=True)[:CONFIG["debug_max_candidates"]]:
             cx = int(round(cand["cx"]))
             cy = int(round(cand["cy"]))
@@ -856,19 +1562,49 @@ def _draw_debug(frame, result=None, candidates=None):
         cy = int(round(result["cy"]))
         r = int(round(result["radius_px"]))
         method = result.get("method", "unknown")
-        cv2.circle(display, (cx, cy), max(2, r), (0, 255, 0), 2)
+        debug_ellipse = result.get("debug_ellipse")
+        if result.get("scale_source") == "manual" and _draw_observed_fit_rings(display, result):
+            pass
+        elif result.get("scale_source") == "manual" and CONFIG.get("draw_manual_reference_rings", True):
+            _draw_manual_reference_rings(display, result)
+        elif CONFIG.get("draw_selected_ellipse", True) and debug_ellipse:
+            ex = int(round(debug_ellipse["cx"]))
+            ey = int(round(debug_ellipse["cy"]))
+            ew = max(2, int(round(debug_ellipse["w"] / 2.0)))
+            eh = max(2, int(round(debug_ellipse["h"] / 2.0)))
+            cv2.ellipse(display, (ex, ey), (ew, eh), float(debug_ellipse["angle"]),
+                        0, 360, (0, 255, 0), 2)
+        elif result.get("scale_source") != "manual":
+            cv2.circle(display, (cx, cy), max(2, r), (0, 255, 0), 2)
         cv2.circle(display, (cx, cy), 6, (0, 0, 255), -1)
         cv2.line(display, (w // 2, h // 2), (cx, cy), (0, 255, 255), 2)
         offset = _offset_from_result(result)
         cv2.putText(display, f"dx={offset['dx_mm']:+.1f}mm dy={offset['dy_mm']:+.1f}mm",
                     (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.putText(display, f"scale={offset['mm_per_px']:.3f} mm/px match={offset['match_count']}",
-                    (10, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv2.putText(display, f"method={method} conf={offset['confidence']:.2f}",
-                    (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        if offset.get("scale_source") == "manual":
+            support_text = ",".join(f"{m['diam_px']:.0f}px" for m in sorted(offset["matches"], key=lambda x: x["diam_px"]))
+            cv2.putText(display, f"scale={offset['mm_per_px']:.3f} mm/px convert-only",
+                        (10, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        else:
+            diam_text = ",".join(str(int(m["known_mm"])) for m in sorted(offset["matches"], key=lambda x: x["known_mm"]))
+            cv2.putText(display, f"scale={offset['mm_per_px']:.3f} mm/px rings={offset['match_count']}",
+                        (10, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        if offset.get("scale_source") == "manual":
+            cv2.putText(display, f"method={method} conf={offset['confidence']:.2f} support=[{support_text}]",
+                        (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        else:
+            cv2.putText(display, f"method={method} conf={offset['confidence']:.2f} [{diam_text}]",
+                        (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         if offset["fallback_single"]:
             cv2.putText(display, "fallback: 210mm outer arc",
                         (10, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 180, 255), 2)
+        elif offset.get("scale_source") == "manual":
+            if offset.get("fixed_ring_visible_count", 0) > 0:
+                cv2.putText(display, f"center={offset.get('fixed_center_score', 0.0):.2f} hits={offset.get('fixed_center_hits', 0)}/{offset.get('fixed_ring_visible_count', 0)}",
+                            (10, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 180, 255), 2)
+            else:
+                cv2.putText(display, f"fit support={offset.get('match_count', 0)}",
+                            (10, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 180, 255), 2)
         elif method == "radial":
             cv2.putText(display, f"radial={result.get('radial_score', 0.0):.2f}",
                         (10, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 180, 255), 2)
@@ -885,11 +1621,7 @@ _last_known = {"result": None, "time": 0.0}
 
 def _get_cam():
     if _cam_cache["cam"] is None:
-        devices = CONFIG.get("usb_devices") or [CONFIG.get("usb_device", 0)]
-        ordered_devices = []
-        for dev in [CONFIG.get("usb_device", 0), *devices, 0, 1]:
-            if dev not in ordered_devices:
-                ordered_devices.append(dev)
+        ordered_devices = apply_usb_env()
 
         last_error = None
         for dev in ordered_devices:
@@ -957,8 +1689,15 @@ def detect():
                 return _last_known["result"]
             return None
 
-    # 取与中位数 mm_per_px 最接近的一帧作为匹配明细来源，便于调试输出。
-    detail = min(hits, key=lambda h: abs(h["mm_per_px"] - mm_per_px))
+    # 取与中位圆心最接近的一帧作为匹配明细来源，避免 P 打印的 hits/可见环数和实际圆心错帧。
+    detail = min(
+        hits,
+        key=lambda h: (
+            (float(h["cx"]) - float(cx)) ** 2 +
+            (float(h["cy"]) - float(cy)) ** 2 +
+            0.05 * (float(h["radius_px"]) - float(r)) ** 2
+        )
+    )
     result = {
         "cx": int(round(cx)),
         "cy": int(round(cy)),
@@ -966,12 +1705,22 @@ def detect():
         "mm_per_px": float(mm_per_px),
         "confidence": float(confidence),
         "method": detail.get("method", "unknown"),
+        "scale_source": detail.get("scale_source", "auto"),
         "match_count": int(detail.get("match_count", 0)),
         "matches": detail.get("matches", []),
+        "rejected_matches": detail.get("rejected_matches", []),
+        "raw_match_count": int(detail.get("raw_match_count", detail.get("match_count", 0))),
+        "observed_count": int(detail.get("observed_count", detail.get("raw_match_count", detail.get("match_count", 0)))),
+        "fixed_center_score": float(detail.get("fixed_center_score", 0.0)),
+        "fixed_center_hits": int(detail.get("fixed_center_hits", 0)),
+        "fixed_ring_visible_count": int(detail.get("fixed_ring_visible_count", 0)),
+        "fixed_ring_visible_flags": detail.get("fixed_ring_visible_flags", []),
+        "fixed_ring_scores": detail.get("fixed_ring_scores", []),
         "fallback_single": bool(detail.get("fallback_single", False)),
         "candidate_count": int(detail.get("candidate_count", 0)),
         "radial_score": float(detail.get("radial_score", 0.0)),
         "ring_scores": detail.get("ring_scores", []),
+        "debug_ellipse": detail.get("debug_ellipse"),
     }
     _last_known["result"] = result
     _last_known["time"] = time.time()
@@ -999,7 +1748,11 @@ def _recover_comm(verbose=True):
     if verbose:
         print("  [recover] 重开 comm...")
     try:
-        comm.init(CONFIG["comm_port"], CONFIG["comm_baud"])
+        port = resolve_comm_port(CONFIG.get("comm_port"))
+        CONFIG["comm_port"] = port
+        if verbose:
+            print(f"  [recover] 串口 = {port}")
+        comm.init(port, CONFIG["comm_baud"])
     except Exception as e:
         if verbose:
             print(f"  [recover] init err: {e}")
@@ -1107,30 +1860,33 @@ def _offset_from_result(result):
     dy_px = cy - cy_target
     mm_per_px = float(result["mm_per_px"])
 
-    raw_dx_mm = dx_px * mm_per_px
-    raw_dy_mm = dy_px * mm_per_px
-    if CONFIG.get("camera_swap_xy", False):
-        raw_dx_mm, raw_dy_mm = raw_dy_mm, raw_dx_mm
-
-    # 约定: 下位机 FINE_MOVE 使用体坐标，dx=右移，dy=前进。
+    # 约定: 下位机 FINE_MOVE 使用车体坐标，dx=右移，dy=前进。
     # 摄像头安装方向未标定时，现场可用 X/Y/S 热键翻转符号或交换轴。
-    dx_mm = raw_dx_mm * float(CONFIG["camera_dx_sign"])
-    dy_mm = raw_dy_mm * float(CONFIG["camera_dy_sign"])
+    mapped = pixel_offset_to_body_mm(dx_px, dy_px, mm_per_px)
     return {
         "cx": cx,
         "cy": cy,
         "radius_px": float(result["radius_px"]),
         "dx_px": int(dx_px),
         "dy_px": int(dy_px),
-        "dx_mm": float(dx_mm),
-        "dy_mm": float(dy_mm),
-        "raw_dx_mm": float(raw_dx_mm),
-        "raw_dy_mm": float(raw_dy_mm),
+        "dx_mm": float(mapped["dx_mm"]),
+        "dy_mm": float(mapped["dy_mm"]),
+        "raw_dx_mm": float(mapped["raw_dx_mm"]),
+        "raw_dy_mm": float(mapped["raw_dy_mm"]),
         "mm_per_px": mm_per_px,
         "confidence": float(result.get("confidence", 0.0)),
         "method": result.get("method", "unknown"),
+        "scale_source": result.get("scale_source", "auto"),
         "match_count": int(result.get("match_count", 0)),
         "matches": result.get("matches", []),
+        "rejected_matches": result.get("rejected_matches", []),
+        "raw_match_count": int(result.get("raw_match_count", result.get("match_count", 0))),
+        "observed_count": int(result.get("observed_count", result.get("raw_match_count", result.get("match_count", 0)))),
+        "fixed_center_score": float(result.get("fixed_center_score", 0.0)),
+        "fixed_center_hits": int(result.get("fixed_center_hits", 0)),
+        "fixed_ring_visible_count": int(result.get("fixed_ring_visible_count", 0)),
+        "fixed_ring_visible_flags": result.get("fixed_ring_visible_flags", []),
+        "fixed_ring_scores": result.get("fixed_ring_scores", []),
         "fallback_single": bool(result.get("fallback_single", False)),
         "radial_score": float(result.get("radial_score", 0.0)),
         "ring_scores": result.get("ring_scores", []),
@@ -1158,40 +1914,57 @@ def _limited_dxdy(dx_mm, dy_mm):
     return float(dx_mm * scale), float(dy_mm * scale), float(scale)
 
 
-def _move_by_offset(offset, verbose=True):
-    """按检测得到的 dx/dy 微调；是否前进由配置控制。"""
-    align_ok = True
-    if abs(offset["dx_px"]) <= CONFIG["dead_zone_px"] and \
-       abs(offset["dy_px"]) <= CONFIG["dead_zone_px"]:
-        if verbose:
-            print("  [OK] 已在死区内，无需移动")
-    else:
-        if not ensure_comm_alive(verbose=verbose):
-            return False
-
-        if verbose:
-            print("\n  === 单次同心圆 dx/dy 微调 ===")
-        cmd_dx, cmd_dy, scale = _limited_dxdy(offset["dx_mm"], offset["dy_mm"])
-        if verbose:
-            print(f"  计算微调    = dx {offset['dx_mm']:+.1f} mm, dy {offset['dy_mm']:+.1f} mm")
-            if scale < 0.999:
-                print(f"  限幅后下发  = dx {cmd_dx:+.1f} mm, dy {cmd_dy:+.1f} mm")
-            else:
-                print(f"  下发微调    = dx {cmd_dx:+.1f} mm, dy {cmd_dy:+.1f} mm")
-
-        align_ok = _safe_fine_move(cmd_dx, cmd_dy,
-                                   timeout=CONFIG["correct_timeout_s"])
-        if verbose:
-            print(f"  [fine move] {'OK' if align_ok else 'FAIL'}")
-        if not align_ok:
-            return False
-
-    if not CONFIG.get("auto_forward_after_align", False):
-        if verbose:
-            print("  [safe] 自动 dy+100 已关闭；需要前进时按 F")
+def _offset_is_aligned(offset):
+    """判断圆心偏差是否已经足够小；毫米阈值比纯像素阈值更稳定。"""
+    dead_px = int(CONFIG.get("dead_zone_px", 0))
+    if dead_px > 0 and abs(offset["dx_px"]) <= dead_px and abs(offset["dy_px"]) <= dead_px:
         return True
 
+    tolerance_mm = float(CONFIG.get("align_tolerance_mm", 0.0))
+    if tolerance_mm <= 0.0:
+        return False
+    dist_mm = float((offset["dx_mm"] * offset["dx_mm"] + offset["dy_mm"] * offset["dy_mm"]) ** 0.5)
+    return dist_mm <= tolerance_mm
+
+
+def _fine_adjust_by_offset(offset, verbose=True):
+    """只按检测得到的 dx/dy 做一次微调，不附带前进动作。"""
+    if _offset_is_aligned(offset):
+        if verbose:
+            print("  [OK] 已在允许误差内，无需移动")
+        return True
+
+    if not ensure_comm_alive(verbose=verbose):
+        return False
+
+    if verbose:
+        print("\n  === 单次同心圆 dx/dy 微调 ===")
+    cmd_dx, cmd_dy, scale = _limited_dxdy(offset["dx_mm"], offset["dy_mm"])
+    if verbose:
+        print(f"  计算微调    = dx {offset['dx_mm']:+.1f} mm, dy {offset['dy_mm']:+.1f} mm")
+        if scale < 0.999:
+            print(f"  限幅后下发  = dx {cmd_dx:+.1f} mm, dy {cmd_dy:+.1f} mm")
+        else:
+            print(f"  下发微调    = dx {cmd_dx:+.1f} mm, dy {cmd_dy:+.1f} mm")
+
+    align_ok = _safe_fine_move(cmd_dx, cmd_dy,
+                               timeout=CONFIG["correct_timeout_s"])
+    if verbose:
+        print(f"  [fine move] {'OK' if align_ok else 'FAIL'}")
+    return bool(align_ok)
+
+
+def _move_by_offset(offset, verbose=True):
+    """按检测得到的 dx/dy 微调；是否前进由配置控制。"""
+    if not _fine_adjust_by_offset(offset, verbose=verbose):
+        return False
+
     forward_mm = float(CONFIG["post_align_offset_y_mm"])
+    if not CONFIG.get("auto_forward_after_align", False):
+        if verbose:
+            print(f"  [safe] 自动 dy+{forward_mm:.0f} 已关闭；需要前进时按 F")
+        return True
+
     if not ensure_comm_alive(verbose=verbose):
         return False
     if verbose:
@@ -1200,6 +1973,104 @@ def _move_by_offset(offset, verbose=True):
     if verbose:
         print(f"  [forward dy] {'OK' if ok else 'FAIL'}")
     return ok
+
+
+def align_iterative_to_ring(max_iterations=None, verbose=True):
+    """多帧识别 + 限幅微调 + 再识别，适合到达三环附近后的最终定位。"""
+    if max_iterations is None:
+        max_iterations = int(CONFIG.get("max_align_iterations", 10))
+    max_iterations = max(1, int(max_iterations))
+
+    for i in range(max_iterations):
+        if verbose:
+            print(f"\n[ring] 视觉定位迭代 {i + 1}/{max_iterations}")
+        offset = detect_offset(verbose=verbose)
+        if offset is None:
+            if verbose:
+                print("  [FAIL] 未检测到可靠同心圆")
+            return False
+        if _offset_is_aligned(offset):
+            if verbose:
+                print("  [OK] 圆心已经对齐")
+            return True
+        if not _fine_adjust_by_offset(offset, verbose=verbose):
+            return False
+        time.sleep(float(CONFIG.get("post_fine_move_settle_s", 0.25)))
+
+    if verbose:
+        print("\n[ring] 末次复查")
+    offset = detect_offset(verbose=verbose)
+    if offset is None:
+        return False
+    ok = _offset_is_aligned(offset)
+    if verbose:
+        print(f"  [final check] {'OK' if ok else '仍有偏差，建议再次执行'}")
+    return ok
+
+
+def _push_forward_then_back(verbose=True):
+    """对准后执行固定推送：先前进，再立刻后退。"""
+    forward_mm = float(CONFIG["post_align_offset_y_mm"])
+    back_mm = float(CONFIG.get("post_align_back_y_mm", 0.0))
+    if not ensure_comm_alive(verbose=verbose):
+        return False
+    if verbose:
+        print(f"\n  === 对准完成，车体 dy 方向前进 +{forward_mm:.0f}mm ===")
+    ok = _safe_fine_move(0.0, forward_mm, timeout=CONFIG["correct_timeout_s"])
+    if verbose:
+        print(f"  [forward dy] {'OK' if ok else 'FAIL'}")
+    if not ok:
+        return False
+    if back_mm <= 0.0:
+        return True
+    if verbose:
+        print(f"\n  === 前进完成，立刻后退 dy -{back_mm:.0f}mm ===")
+    ok = _safe_fine_move(0.0, -back_mm, timeout=CONFIG["correct_timeout_s"])
+    if verbose:
+        print(f"  [backward dy] {'OK' if ok else 'FAIL'}")
+    return bool(ok)
+
+
+def align_checked_then_forward(max_moves=None, verbose=True):
+    """A 键流程：闭环微调到位，复检合格后前进固定距离并立刻后退。"""
+    if max_moves is None:
+        max_moves = int(CONFIG.get("checked_align_max_moves", 10))
+    max_moves = max(1, int(max_moves))
+    settle_s = float(CONFIG.get("post_fine_move_settle_s", 0.25))
+
+    time.sleep(float(CONFIG.get("pre_cmd_sleep_s", 0.0)))
+    moves_done = 0
+    final_offset = None
+    for check_idx in range(max_moves + 1):
+        if verbose:
+            print(f"\n[ring] A 键定位复检 {check_idx + 1}/{max_moves + 1}，已微调 {moves_done}/{max_moves} 次")
+        offset = detect_offset(verbose=verbose)
+        if offset is None:
+            if verbose:
+                print("  [FAIL] 当前没有可靠同心圆检测，停止 A 键流程")
+            return False
+        final_offset = offset
+        if _offset_is_aligned(offset):
+            if verbose:
+                print("  [OK] 复检通过，圆心已对准")
+            break
+        if moves_done >= max_moves:
+            if verbose:
+                print("  [STOP] 已达到微调次数上限，仍未进容差；不前进，避免反复微调副作用")
+            return False
+        if not _fine_adjust_by_offset(offset, verbose=verbose):
+            return False
+        moves_done += 1
+        if settle_s > 0.0:
+            time.sleep(settle_s)
+    else:
+        return False
+
+    if final_offset is None or not _offset_is_aligned(final_offset):
+        if verbose:
+            print("  [FAIL] 最终复检未通过，不执行前进/后退")
+        return False
+    return _push_forward_then_back(verbose=verbose)
 
 
 _trackbars_ready = False
@@ -1250,7 +2121,8 @@ def _print_mapping():
         f"dy_sign={CONFIG['camera_dy_sign']:+.0f}, "
         f"swap_xy={CONFIG['camera_swap_xy']}, "
         f"单次限幅={CONFIG['fine_move_max_step_mm']:.0f}mm, "
-        f"ransac={CONFIG['enable_ransac']}, radial={CONFIG['enable_radial_scan']}"
+        f"ransac={CONFIG['enable_ransac']}, radial={CONFIG['enable_radial_scan']}, "
+        f"候选圆={'显示' if CONFIG.get('show_candidate_circles', False) else '隐藏'}"
     )
 
 
@@ -1269,11 +2141,13 @@ def _forward_after_align(verbose=True):
 
 def preview():
     """实时显示圆环识别画面，并提供现场校准热键。"""
+    _require_cv2()
     cam = _get_cam()
     cv2.namedWindow(CONFIG["debug_window_name"], cv2.WINDOW_NORMAL)
     cv2.namedWindow(CONFIG["debug_mask_window_name"], cv2.WINDOW_NORMAL)
     _setup_debug_trackbars()
-    print("[ring] 预览已启动: q退出, p打印, A限幅微调, F前进100mm, G微调+前进, X/Y翻符号, S交换轴, R/D开慢兜底")
+    print("[ring] 预览已启动: q退出, p打印, A微调到位+前进105mm+后退200mm, M多次定位不前进, F前进105mm, G单次微调+前进")
+    print("[ring] 调参热键: X/Y翻符号, S交换轴, C显示/隐藏候选圆, R/D开关兜底")
     print("[ring] Ring Evidence 是局部暗线证据图，不要求画面只剩黑线")
     _print_mapping()
     last_result = None
@@ -1322,13 +2196,16 @@ def preview():
                 _print_detection(_offset_from_result(display_result))
                 _print_mapping()
         if key in (ord('x'), ord('X')):
-            CONFIG["camera_dx_sign"] *= -1.0
+            set_camera_mapping(dx_sign=-float(CONFIG["camera_dx_sign"]))
             _print_mapping()
         if key in (ord('y'), ord('Y')):
-            CONFIG["camera_dy_sign"] *= -1.0
+            set_camera_mapping(dy_sign=-float(CONFIG["camera_dy_sign"]))
             _print_mapping()
         if key in (ord('s'), ord('S')):
-            CONFIG["camera_swap_xy"] = not CONFIG.get("camera_swap_xy", False)
+            set_camera_mapping(swap_xy=not CONFIG.get("camera_swap_xy", False))
+            _print_mapping()
+        if key in (ord('c'), ord('C')):
+            CONFIG["show_candidate_circles"] = not CONFIG.get("show_candidate_circles", False)
             _print_mapping()
         if key in (ord('r'), ord('R')):
             CONFIG["enable_ransac"] = not CONFIG.get("enable_ransac", False)
@@ -1339,31 +2216,17 @@ def preview():
         if key in (ord('f'), ord('F')):
             ok = _forward_after_align(verbose=True)
             print(f"[ring] F键前进 {'OK' if ok else 'FAIL'}")
+        if key in (ord('m'), ord('M')):
+            ok = align_iterative_to_ring(verbose=True)
+            print(f"[ring] M键多次定位 {'OK' if ok else 'FAIL'}")
         if key in (ord('a'), ord('A')):
-            # 按键动作必须用当前画面重新识别一次，避免用过期圆心移动。
-            fresh_mask, fresh_evidence, _ = _build_ring_evidence(frame)
-            fresh_result = find_ring_center(frame, dark=fresh_mask, evidence=fresh_evidence)
-            if fresh_result is None:
-                print("[ring] 当前没有有效检测，不能移动")
-            else:
-                last_result = fresh_result
-                last_candidates = fresh_result.get("candidates", [])
-                last_result_time = time.time()
-                offset = _offset_from_result(last_result)
-                _print_detection(offset)
-                ok = _move_by_offset(offset, verbose=True)
-                print(f"[ring] A键微调 {'OK' if ok else 'FAIL'}")
+            ok = align_checked_then_forward(verbose=True)
+            print(f"[ring] A键微调到位+前进+后退 {'OK' if ok else 'FAIL'}")
         if key in (ord('g'), ord('G')):
-            fresh_mask, fresh_evidence, _ = _build_ring_evidence(frame)
-            fresh_result = find_ring_center(frame, dark=fresh_mask, evidence=fresh_evidence)
-            if fresh_result is None:
-                print("[ring] 当前没有有效检测，不能移动")
+            offset = detect_offset(verbose=True)
+            if offset is None:
+                print("[ring] 当前没有可靠检测，不能移动")
             else:
-                last_result = fresh_result
-                last_candidates = fresh_result.get("candidates", [])
-                last_result_time = time.time()
-                offset = _offset_from_result(last_result)
-                _print_detection(offset)
                 old_auto = CONFIG.get("auto_forward_after_align", False)
                 CONFIG["auto_forward_after_align"] = True
                 try:
@@ -1383,17 +2246,60 @@ def _print_detection(offset):
     print(f"  ring center = ({offset['cx']}, {offset['cy']})")
     print(f"  ring radius = {offset['radius_px']:.1f} px")
     print(f"  像素偏差    = dx {offset['dx_px']:+d} px, dy {offset['dy_px']:+d} px")
-    print(f"  自动比例    = {offset['mm_per_px']:.3f} mm/px, confidence={offset['confidence']:.2f}")
+    if offset.get("scale_source") == "manual":
+        print(f"  手动比例    = {offset['mm_per_px']:.3f} mm/px，仅用于 dx/dy 换算，未参与圆心拟合")
+        if offset.get("matches"):
+            desc = ", ".join(f"{m['diam_px']:.1f}px" for m in sorted(offset["matches"], key=lambda x: x["diam_px"]))
+            print(f"  图像拟合支撑 = {offset['match_count']}/{offset.get('observed_count', offset['raw_match_count'])} 个候选: {desc}")
+        if offset.get("fixed_ring_visible_count", 0) > 0 and offset.get("fixed_ring_scores"):
+            scores = ", ".join(f"{s:.2f}" for s in offset["fixed_ring_scores"])
+            print(
+                f"  固定比例兜底 = score {offset.get('fixed_center_score', 0.0):.2f}, "
+                f"hits {offset.get('fixed_center_hits', 0)}/{offset.get('fixed_ring_visible_count', 0)}, "
+                f"rings [{scores}]"
+            )
+    else:
+        print(f"  自动比例    = {offset['mm_per_px']:.3f} mm/px, confidence={offset['confidence']:.2f}")
     if offset["fallback_single"]:
         print(f"  比例来源    = 单段圆弧兜底，按 {CONFIG['single_arc_default_diameter_mm']}mm 外圈处理")
-    elif offset["matches"]:
+    elif offset["matches"] and offset.get("scale_source") != "manual":
         desc = []
         for m in sorted(offset["matches"], key=lambda x: x["known_mm"]):
             desc.append(f"{int(m['known_mm'])}mm≈{m['diam_px']:.1f}px")
         print("  直径匹配    = " + ", ".join(desc))
+        if offset.get("raw_match_count", offset["match_count"]) != offset["match_count"]:
+            print(f"  有效匹配    = {offset['match_count']}/{offset['raw_match_count']} 个直径")
+    if offset.get("rejected_matches"):
+        desc = []
+        for m in sorted(offset["rejected_matches"], key=lambda x: x["known_mm"]):
+            desc.append(
+                f"{int(m['known_mm'])}mm(dev={m.get('center_dev_px', 0.0):.1f}px>"
+                f"{m.get('center_tol_px', 0.0):.1f}px)"
+            )
+        print("  剔除候选    = " + ", ".join(desc) + "，疑似内部字母/假圆")
     if offset.get("method") == "radial" and offset.get("ring_scores"):
         scores = ", ".join(f"{s:.2f}" for s in offset["ring_scores"])
         print(f"  径向得分    = {offset.get('radial_score', 0.0):.2f} [{scores}]")
+
+
+def _print_manual_scale_trials(offset):
+    """按候选像素直径列出手动比例试算值；只辅助人工标定，不参与自动控制。"""
+    matches = offset.get("matches") or []
+    if not matches:
+        return
+    known = [float(v) for v in CONFIG.get("known_ring_diameters_mm", [])]
+    if not known:
+        return
+
+    print("  比例试算    = 肉眼确认该候选是哪一圈后，取对应 mm/px")
+    for item in sorted(matches, key=lambda x: x.get("diam_px", 0.0)):
+        diam_px = float(item.get("diam_px", 0.0))
+        if diam_px <= 1.0:
+            continue
+        trials = []
+        for known_mm in known:
+            trials.append(f"{int(known_mm)}mm:{known_mm / diam_px:.3f}")
+        print(f"    {diam_px:.1f}px -> " + ", ".join(trials))
 
 
 def align_once_to_ring(verbose=True):
@@ -1410,10 +2316,10 @@ def align_once_to_ring(verbose=True):
 # ============ ★ 公共 API: 3 步对齐 ============
 def align_to_ring(verbose=True):
     """
-    3 步对齐流程:
-      1. 检测圆环, 一次性 goto 对准画面中心
-      2. 等 2 秒, y +100mm
-      3. 等 2 秒, 退后 500 像素
+    兼容旧 3 步对齐流程；内部统一使用下位机 FINE_MOVE 微调。
+      1. 检测圆环，按画面中心偏差做一次限幅 dx/dy 对准
+      2. 等 2 秒，沿车体 dy 正方向前进固定距离
+      3. 等 2 秒，再沿车体 dy 负方向退回指定像素对应距离
 
     返回 True=全部成功, False=某步失败
     """
@@ -1421,94 +2327,55 @@ def align_to_ring(verbose=True):
         return False
 
     time.sleep(CONFIG["pre_cmd_sleep_s"])
-
-    result = detect()
-    if result is None:
+    offset = detect_offset(verbose=verbose)
+    if offset is None:
         if verbose:
-            print("  [圆环没找到, 试着重连]")
-        if not ensure_comm_alive(verbose=False):
-            return False
-        result = detect()
-        if result is None:
-            if verbose:
-                print("  [FAIL] 没找到圆环")
-            return False
-
-    offset = _offset_from_result(result)
+            print("  [FAIL] 没找到同心圆环")
+        return False
     if verbose:
-        _print_detection(offset)
+        print("\n  === 步骤 1: 视觉 dx/dy 对准 ===")
+    if not _move_by_offset(offset, verbose=verbose):
+        if verbose:
+            print("  [step 1] FAIL")
+        return False
+    if verbose:
+        print("  [step 1] OK")
 
     if offset["radius_px"] <= 0 or offset["mm_per_px"] <= 0:
         return False
 
     k_mm_per_px = offset["mm_per_px"]
 
-    # === 步骤 1: 对准 ===
-    dx_mm = offset["dx_mm"]
-    dy_mm = offset["dy_mm"]
-    dx_m = dx_mm / 1000.0
-    dy_m_align = dy_mm / 1000.0
-
-    pose = comm.get_pose(max_age=1.0)
-    if pose is None:
-        if verbose:
-            print("  [FAIL] 没拿到位姿")
-        return False
-
-    x_now, y_now, _ = pose
-    target_x_align = x_now + dx_m
-    target_y_align = y_now + dy_m_align
-
-    if verbose:
-        print(f"\n  === 步骤 1: 对准 ===")
-        print(f"  标定系数    = {k_mm_per_px:.3f} mm/px (auto diameter match)")
-        print(f"  移动        = dx {dx_mm:+.1f} mm, dy {dy_mm:+.1f} mm")
-        print(f"  目标位置    = ({target_x_align:.3f}, {target_y_align:.3f}) m")
-
-    ok = _safe_goto(target_x_align, target_y_align,
-                    timeout=CONFIG["correct_timeout_s"])
-    if not ok:
-        if verbose:
-            print("  [step 1] FAIL")
-        return False
-    if verbose:
-        print(f"  [step 1] OK")
-
     # === 等 1→2 ===
     _wait(CONFIG["step1_to_step2_pause_s"], "步骤1→2 等待", verbose)
 
-    # === 步骤 2: y +100mm ===
-    target_y_step2 = target_y_align + CONFIG["post_align_offset_y_mm"] / 1000.0
+    # === 步骤 2: y 正方向前进固定距离 ===
+    forward_mm = float(CONFIG["post_align_offset_y_mm"])
 
     if verbose:
-        print(f"\n  === 步骤 2: y +{CONFIG['post_align_offset_y_mm']}mm ===")
-        print(f"  目标位置    = ({target_x_align:.3f}, {target_y_step2:.3f}) m")
+        print(f"\n  === 步骤 2: 车体 dy +{forward_mm:.0f}mm ===")
 
     time.sleep(CONFIG["pre_cmd_sleep_s"])
-    ok = _safe_goto(target_x_align, target_y_step2,
-                    timeout=CONFIG["correct_timeout_s"])
+    ok = _safe_fine_move(0.0, forward_mm, timeout=CONFIG["correct_timeout_s"])
     if not ok:
         if verbose:
             print("  [step 2] FAIL")
         return False
     if verbose:
-        print(f"  [step 2] OK")
+        print("  [step 2] OK")
 
     # === 等 2→3 ===
     _wait(CONFIG["step2_to_step3_pause_s"], "步骤2→3 等待", verbose)
 
     # === 步骤 3: 退后 500 像素 ===
     back_offset_mm = CONFIG["step3_back_offset_px"] * k_mm_per_px
-    target_y_step3 = target_y_step2 - back_offset_mm / 1000.0
 
     if verbose:
         print(f"\n  === 步骤 3: 退后 {CONFIG['step3_back_offset_px']} 像素 ===")
         print(f"  {CONFIG['step3_back_offset_px']}px 实际  = {back_offset_mm:.1f} mm")
-        print(f"  目标位置    = ({target_x_align:.3f}, {target_y_step3:.3f}) m")
 
     time.sleep(CONFIG["pre_cmd_sleep_s"])
-    ok = _safe_goto(target_x_align, target_y_step3,
-                    timeout=CONFIG["correct_timeout_s"])
+    ok = _safe_fine_move(0.0, -back_offset_mm, timeout=CONFIG["correct_timeout_s"])
     if verbose:
         print(f"  [step 3] {'OK' if ok else 'FAIL'}")
     return ok

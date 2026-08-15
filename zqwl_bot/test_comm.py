@@ -3,12 +3,12 @@
 启动一次, 然后在提示符下输入命令即可, 类似 Windows 时的 nav_test.py.
 
 用法:
-    python3 test_comm.py                    # 默认 TTL: /dev/ttyCH341USB0
+    python3 test_comm.py                    # 默认自动匹配 /dev/ttyCH341USB*
     python3 test_comm.py /dev/ttyUSB0       # 换串口
 
 命令:
-    r <pos>            转盘槽位 0-4           例: r 2
-    r all              转盘依次走完 5 个槽位
+    r <pos>            转盘状态 0-5 (0-4槽位, 5=36°特殊状态) 例: r 5
+    r all              转盘依次走完 0-4 五个槽位
     a <state>          机械臂姿态 0-7 (0=默认) 例: a 1
     l <id> on|off      补光灯 (0=全部, 1-4)    例: l 1 on
     run                启动按键 (PD15 500ms 脉冲)
@@ -100,7 +100,8 @@ def do_rotate(pos) -> bool:
         for p in range(5):
             ok &= timed(f"ROTATE 槽位 {p}", lambda p=p: comm.rotate(p, 12.0))
         return ok
-    return timed(f"ROTATE 槽位 {pos}", lambda: comm.rotate(pos, 12.0))
+    label = "36°特殊状态" if pos == 5 else f"槽位 {pos}"
+    return timed(f"ROTATE {label}", lambda: comm.rotate(pos, 12.0))
 
 def do_axis(axis: str, target: float):
     name = "X (锁Y)" if axis == 'x' else "Y (锁X)"
@@ -347,8 +348,8 @@ def do_all() -> bool:
 
 
 HELP = """命令:
-    r <pos>            转盘槽位 0-4           例: r 2
-    r all              转盘依次走完 5 个槽位
+    r <pos>            转盘状态 0-5 (0-4槽位, 5=36°特殊状态) 例: r 5
+    r all              转盘依次走完 0-4 五个槽位
     a <state>          机械臂姿态 0-7 (0=默认) 例: a 1
     l <id> on|off      补光灯 (0=全部, 1-4)    例: l 1 on
     run                启动按键 (PD15 脉冲)
@@ -373,9 +374,9 @@ HELP = """命令:
 # ── 主循环 ──
 
 def main():
-    port = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyCH341USB0"
+    port = sys.argv[1] if len(sys.argv) > 1 else None
 
-    print(f"连接 {port} @ 115200 ...")
+    print(f"连接 {port or 'AUTO(/dev/ttyCH341USB*)'} @ 115200 ...")
     try:
         comm.init(port, 115200)
     except Exception as e:

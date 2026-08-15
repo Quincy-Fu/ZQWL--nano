@@ -3,14 +3,15 @@
 """
 test_A_B.py - 阶段 A 装载 + 阶段 B 圆环放置 测试
 1. 阶段 A: 走逆时针圆弧, 装载到转盘
-2. 阶段 B: 3 个圆环放置 (简化, 不调 ring)
+2. 阶段 B: 3 个圆环放置，调用 ring 完成微调放置
 """
 import math
+import sys
 import time
 import threading
 
 import comm
-import qr2, block
+import qr2, block, ring
 
 
 # ============== 配置 ==============
@@ -23,13 +24,11 @@ INIT_YAW_D = 90.0
 SPLIT_THRESHOLD = 0.03
 
 # 冠亚季点位。按用户说明: 冠/亚/季 对应 A/B/C。
-RANK_TARGETS = [
-    ("亚军", "B", 0.25, 1.779, 3, 2),
-    ("冠军", "A", -0.02, 1.779, 4, 2),
-    ("季军", "C", -0.30, 1.779, 1, 0),
-]
-# 季军放置后回起点路径：显式拆成直行/横移路点，避免斜移。
-RETURN_POINTS = [(-0.30, 0.10), (-0.15, 0.10), (-0.05, 0.10), (0.0, 0.10), (0.0, 0.0)]
+RANK_PLACE_POINTS = {
+    "亚军": ("B", 0.40, 1.779, 3, 0.25, 1.67),
+    "冠军": ("A", 0.00, 1.779, 4, 0.00, 1.66),
+    "季军": ("C", -0.25, 1.779, 1, -0.25, 1.67),
+}
 
 # QR2 返回的 3 个字母对应位置 1、2、3 上的物块顺序。
 # 圆弧过程中实际依次经过 3、2、1，切换触发点由下位机按实际弧进度执行。
@@ -145,6 +144,25 @@ def arm_and_rotate(arm_state, slot):
     return arm_ok and rotate_ok
 
 
+def arm_light_rotate(arm_state, slot, light_id=4, light_on=True):
+    """机械臂、补光灯和转盘同时下发，全部确认后再进入 ring 放置。"""
+    print(f"  ARM {arm_state} + LIGHT {light_id} {'ON' if light_on else 'OFF'} + ROTATE {slot} (等待到位)")
+    seen = comm.response_seq()
+    comm.send_arm(arm_state)
+    comm.send_light(light_id, light_on)
+    comm.send_rotate(slot)
+    arm_ok = comm.wait_for_after(comm.TYPE_ARM_RESP, seen, 6.0)
+    light_ok = comm.wait_for_after(comm.TYPE_LIGHT_RESP, seen, 5.0)
+    rotate_ok = comm.wait_for_after(comm.TYPE_ROTATE_RESP, seen, 12.0)
+    if not arm_ok:
+        print("  !! 机械臂响应超时或失败")
+    if not light_ok:
+        print("  !! 补光灯响应超时或失败")
+    if not rotate_ok:
+        print("  !! 转盘响应超时或失败")
+    return arm_ok and light_ok and rotate_ok
+
+
 def arm_async(state):
     """发送机械臂命令但不等待响应，用于后退时同步切状态。"""
     print(f"  ARM {state} (不等待, 与后退动作衔接)")
@@ -153,7 +171,10 @@ def arm_async(state):
 
 
 def sync_pose(x, y, yaw):
-    print(f"  SYNC POSE ({x:.4f}, {y:.4f}, yaw={yaw:.1f}°)")
+    if yaw is None:
+        print(f"  SYNC POSE ({x:.4f}, {y:.4f}, yaw=保持当前)")
+    else:
+        print(f"  SYNC POSE ({x:.4f}, {y:.4f}, yaw={yaw:.1f}°)")
     ok = comm.sync_pose(x, y, yaw, timeout=5.0)
     if ok:
         _update_cur(x, y)
@@ -205,19 +226,29 @@ def place_rank(rank_name, letter, x, y, arm_state, after_arm_state):
     return go_to_split(bx, by)
 
 
+def place_rank_with_ring(rank_name):
+    """到名次点后切机械臂/补光灯/转盘，调用 ring 放置，再同步该点后的坐标。"""
+    letter, x, y, arm_state, sync_x, sync_y = RANK_PLACE_POINTS[rank_name]
+    slot = ALPHA_TO_POS[letter]
+    print(f"\n=== {rank_name}: {letter} -> 槽位 {slot}, 目标=({x:.4f}, {y:.4f}) ===")
+    if not go_to(x, y):
+        return False
+    if not arm_light_rotate(arm_state, slot, light_id=4, light_on=True):
+        return False
+    if not ring.align_checked_then_forward(verbose=True):
+        return False
+    return sync_pose(sync_x, sync_y, None)
+
+
 # ============== 阶段 A + B ==============
 def run_task_ab():
     print("\n=== 阶段 A+B: 按指定路线测试 ===")
 
-    # 1. 起点位姿基准
-    if not sync_pose(0.0, 0.0, INIT_YAW_D):
+    # 1. 起步直接把当前位置同步为扫码点，减少前置移动等待。
+    if not sync_pose(0.7, 0.25, INIT_YAW_D):
         raise RuntimeError("初始位姿同步失败")
 
-    # 2. 扫码前移动
-    go_to(0.0, 0.25)
-    go_to(0.7, 0.25)
-
-    # 3. QR2 识别 1->2->3 三个位置上的 ABC 摆放顺序
+    # 2. QR2 识别 1->2->3 三个位置上的 ABC 摆放顺序
     seq2 = qr2.recognize()                       # 例: "CAB"
     pos_to_slot = {
         pos_no: ALPHA_TO_POS[letter]
@@ -225,7 +256,7 @@ def run_task_ab():
     }
     print(f"  QR2: {seq2} -> 1/2/3位置转盘槽位 {pos_to_slot}")
 
-    # 4. 圆弧启动时同步进入取放状态，并让转盘切到第一个经过的位置 3
+    # 3. 圆弧启动时同步进入取放状态，并让转盘切到第一个经过的位置 3。
     first_slot = pos_to_slot[ARC_PRELOAD_POSITION]
     first_letter = seq2[ARC_PRELOAD_POSITION - 1]
     print(f"  [圆弧预置位置 {ARC_PRELOAD_POSITION}] 转盘切到槽位 {first_slot} ({first_letter})")
@@ -247,24 +278,39 @@ def run_task_ab():
                            timeout=arc_timeout):
         raise RuntimeError("arc_rotate failed: 未收到 0x30 响应；请确认下位机已烧录支持 ARC_ROTATE 的新固件")
 
-    # 5. 圆弧后进入冠亚季放置流程
+    # 4. 圆弧后进入冠亚季放置流程。
     refresh_cur_from_pose()
     turn_to(0)
     arm(2)
-    for rank_name, letter, x, y, arm_state, after_arm_state in RANK_TARGETS:
-        if not place_rank(rank_name, letter, x, y, arm_state, after_arm_state):
-            raise RuntimeError(f"{rank_name} 放置流程失败")
 
-    # 6. 后续回退点
-    for x, y in RETURN_POINTS:
-        if not go_to_split(x, y):
-            raise RuntimeError("回退路径失败")
+    if not place_rank_with_ring("亚军"):
+        raise RuntimeError("亚军 放置流程失败")
+    arm(2)
+    if not go_to(0.0, 1.67):
+        raise RuntimeError("亚军后横移到冠军前置点失败")
+    arm(2)
+
+    if not place_rank_with_ring("冠军"):
+        raise RuntimeError("冠军 放置流程失败")
+    if not go_to(-0.25, 1.66):
+        raise RuntimeError("冠军后横移到季军前置点失败")
+
+    if not place_rank_with_ring("季军"):
+        raise RuntimeError("季军 放置流程失败")
+    arm(0)
+    if not go_to(0.0, 1.67):
+        raise RuntimeError("回程横移失败")
+    if not go_to(0.0, 0.0):
+        raise RuntimeError("回原点失败")
 
     print("\n[完成] 阶段 A + B 测试结束")
 
 
 def main():
-    comm.init("/dev/ttyCH341USB0", 115200)
+    port = sys.argv[1] if len(sys.argv) > 1 else None
+    print(f"  SERIAL {port or 'AUTO'} @ 115200")
+    comm.init(port, 115200)
+    ring.configure({"comm_port": port, "comm_baud": 115200})
     time.sleep(1.0)
     try:
         run_task_ab()
@@ -273,6 +319,14 @@ def main():
     except KeyboardInterrupt:
         print("\n[用户中断]")
     finally:
+        try:
+            comm.light(4, False, timeout=2.0)
+        except Exception as e:
+            print(f"[清理] light 4 off failed: {e}")
+        try:
+            ring.close()
+        except Exception as e:
+            print(f"[清理] ring camera close failed: {e}")
         comm.shutdown()
 
 

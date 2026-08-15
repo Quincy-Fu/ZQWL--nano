@@ -1,486 +1,224 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""黑色圆环识别 + 3步对齐 (对准, +100mm, 退后500px)"""
-import cv2
-import numpy as np
+"""
+test_ring.py - 同心圆环视觉定位测试入口
+
+用途：车先靠轮子定位到圆环附近，再用 USB 摄像头识别 50/90/130/170/210mm
+同心圆，自动估算 mm/px，并通过下位机 FINE_MOVE 做 dx/dy 位置修正。
+"""
+
+import sys
 import time
+import importlib.util
+from pathlib import Path
+
 import comm
 
 
-CONFIG = {
+def _load_local_ring_module():
+    """强制加载同目录 ring.py，避免误导入系统/旧版本 ring 模块。"""
+    ring_path = Path(__file__).resolve().with_name("ring.py")
+    spec = importlib.util.spec_from_file_location("zqwl_local_ring", ring_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载本目录 ring.py: {ring_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, "CONFIG"):
+        raise RuntimeError(
+            f"加载到的 ring.py 没有 CONFIG: {ring_path}\n"
+            "请确认已经把新版 ring.py 和 test_ring.py 一起复制到车端同一目录。"
+        )
+    return module
+
+
+ring = _load_local_ring_module()
+
+
+def _parse_args(argv):
+    """解析测试入口参数；模式参数和覆盖参数可以任意顺序传入。"""
+    mode = "preview"
+    usb_device = None
+    usb_devices = None
+    port = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        low = arg.lower()
+        if low in ("--device", "--usb-device"):
+            i += 1
+            if i >= len(argv):
+                raise SystemExit("缺少 USB 设备号，例如 --device 1")
+            usb_device = argv[i]
+        elif low.startswith("--device=") or low.startswith("--usb-device="):
+            usb_device = arg.split("=", 1)[1]
+        elif low in ("--devices", "--usb-devices"):
+            i += 1
+            if i >= len(argv):
+                raise SystemExit("缺少 USB 设备列表，例如 --devices 1,0")
+            usb_devices = argv[i]
+        elif low.startswith("--devices=") or low.startswith("--usb-devices="):
+            usb_devices = arg.split("=", 1)[1]
+        elif low in ("--port", "--serial"):
+            i += 1
+            if i >= len(argv):
+                raise SystemExit("缺少串口，例如 --port /dev/ttyUSB0")
+            port = argv[i]
+        elif low.startswith("--port=") or low.startswith("--serial="):
+            port = arg.split("=", 1)[1]
+        elif not arg.startswith("-"):
+            mode = low
+        else:
+            raise SystemExit(f"未知参数: {arg}")
+        i += 1
+    return mode, usb_device, usb_devices, port
+
+
+RING_TEST_CONFIG = {
+    "comm_port": "/dev/ttyCH341USB*",
+    "comm_baud": 115200,
     "usb_device": 1,
-    "width": 640,
-    "height": 480,
-    "fps": 30,
+    "usb_devices": [1, 0],
 
-    "black_thresh": 140,
-    "min_area": 2000,
-    "max_area": 200000,
-    "min_circularity": 0.6,
-    "min_eccentricity": 0.4,
-    "min_contour_points": 5,
+    # 当前场地同心圆直径，单位 mm。注意这里是直径，不是半径。
+    "known_ring_diameters_mm": [50, 90, 130, 170, 210],
+    "single_arc_default_diameter_mm": 210,
+    "use_manual_scale": True,
+    "manual_mm_per_px": 0.25,
+    "manual_center_min_diam_ratio": 0.38,
+    "manual_center_min_support": 2,
+    "manual_center_refine_enable": False,
+    "manual_center_refine_search_px": 32,
+    "manual_center_refine_step_px": 3,
+    "manual_center_refine_angles": 72,
+    "manual_center_refine_ring_width_px": 5,
+    "manual_center_refine_hit_thresh": 0.18,
+    "manual_center_refine_min_score": 0.08,
+    "manual_center_refine_min_hits": 2,
+    "manual_center_min_visible_ratio": 0.15,
+    "diam_merge_abs_px": 28,
+    "diam_merge_rel": 0.075,
 
-    "ring_actual_radius_m": 0.075,   # 固定 75mm
-    "calib_step": 0.0,
+    # 允许只看到部分圆弧：默认用椭圆/轮廓 + RANSAC；径向扫描只作手动调试兜底。
+    "enable_ransac": False,
+    "enable_radial_scan": False,
+    "radial_trigger_offset_mm": 30.0,
+    "radial_trigger_match_count": 4,
+    "radial_prefer_confidence_below": 0.70,
+    "radial_prefer_match_count_below": 4,
+    "radial_prefer_min_score": 0.14,
+    "radial_prefer_min_hits": 3,
+    "radial_outer_radius_max_px": 360,
+    "min_arc_coverage": 0.05,
+    "min_scale_matches": 2,
+    "match_rel_tol": 0.20,
 
+    # 移动前用多帧确认；单次修正限幅，避免方向未标定时一次跑偏太多。
     "detect_frames": 5,
     "detect_min_hits": 2,
-    "detect_timeout_s": 1.5,
-    "otsu_smooth_n": 3,
-    "consistency_max_diff": 80,
-    "last_known_max_age_s": 3.0,
+    "detect_timeout_s": 1.2,
+    "fine_move_max_step_mm": 30.0,
+    "align_tolerance_mm": 2.0,
+    "max_align_iterations": 10,
+    "checked_align_max_moves": 10,
+    "post_align_offset_y_mm": 105,
+    "post_align_back_y_mm": 200,
+    "auto_forward_after_align": False,
 
-    "dead_zone_px": 0,
-    "correct_timeout_s": 20.0,
-
-    "pre_cmd_sleep_s": 0.3,
-    "comm_port": "/dev/ttyCH341USB0",
-    "comm_baud": 115200,
-
-    "recover_pose_age_max": 1.0,
-    "recover_max_retry": 3,
-
-    # ★ 3 步流程
-    "step1_to_step2_pause_s": 2.0,   # 步骤1→2 等待
-    "post_align_offset_y_mm": 102,    # 步骤2: y +100mm
-    "step2_to_step3_pause_s": 2.0,   # 步骤2→3 等待
-    "step3_back_offset_px": 500,      # 步骤3: 退后 500 像素
+    # 摄像头安装方向必须现场确认；预览界面可用 X/Y/S 热键临时翻转。
+    "camera_dx_sign": -1.0,
+    "camera_dy_sign": 1.0,
+    "camera_swap_xy": False,
+    "show_candidate_circles": False,
+    "draw_selected_ellipse": False,
+    "draw_manual_reference_rings": False,
+    "draw_observed_fit_rings": True,
 }
 
 
-class USBCamera:
-    def __init__(self, device=1, width=640, height=480, fps=30):
-        self.device = device
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.cap = None
-
-    def start(self):
-        self.cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if not self.cap.isOpened():
-            raise RuntimeError("无法打开USB摄像头")
-
-    def read(self):
-        if self.cap is None:
-            return None
-        ret, frame = self.cap.read()
-        return frame if ret else None
-
-    def stop(self):
-        if self.cap:
-            self.cap.release()
-            self.cap = None
+def configure_ring_for_test(usb_device=None, usb_devices=None, port=None):
+    ring.configure(RING_TEST_CONFIG)
+    ring.apply_usb_env()
+    if usb_device is not None or usb_devices is not None:
+        ring.configure_usb(device=usb_device, devices=usb_devices)
+    if port is not None:
+        ring.CONFIG["comm_port"] = port
 
 
-def find_ring_center(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, dark = cv2.threshold(blur, CONFIG["black_thresh"], 255,
-                            cv2.THRESH_BINARY_INV)
+def _run_mapping_selftest():
+    """不打开摄像头和串口，只检查配置与像素偏差到车体 dx/dy 的映射。"""
+    def fmt_mm(value):
+        value = 0.0 if abs(float(value)) < 0.05 else float(value)
+        return f"{value:+.1f}mm"
 
-    kernel = np.ones((5, 5), np.uint8)
-    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, kernel)
-    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kernel)
-
-    contours, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    best = None
-    best_score = 0
-    for cnt in contours:
-        if len(cnt) < CONFIG["min_contour_points"]:
-            continue
-
-        area = cv2.contourArea(cnt)
-        if area < CONFIG["min_area"] or area > CONFIG["max_area"]:
-            continue
-
-        perim = cv2.arcLength(cnt, True)
-        if perim == 0:
-            continue
-        circularity = 4 * np.pi * area / (perim * perim)
-        if circularity < CONFIG["min_circularity"]:
-            continue
-
-        try:
-            ellipse = cv2.fitEllipse(cnt)
-        except cv2.error:
-            continue
-
-        (cx, cy), (w, h), angle = ellipse
-        axis_major = max(w, h)
-        axis_minor = min(w, h)
-        if axis_major == 0:
-            continue
-
-        eccentricity = axis_minor / axis_major
-        if eccentricity < CONFIG["min_eccentricity"]:
-            continue
-
-        r_avg = (axis_major + axis_minor) / 2.0
-
-        score = area * eccentricity
-        if score > best_score:
-            best = (int(cx), int(cy), int(r_avg), int(area),
-                   int(axis_major), int(axis_minor), float(eccentricity))
-            best_score = score
-    return best
+    ring.validate_config()
+    samples = [
+        ("图像圆心在右侧 10px", 10, 0),
+        ("图像圆心在左侧 10px", -10, 0),
+        ("图像圆心在下方 10px", 0, 10),
+        ("图像圆心在上方 10px", 0, -10),
+    ]
+    print("[test_ring] 配置自检 OK")
+    print(
+        "[test_ring] 当前映射: "
+        f"dx_sign={ring.CONFIG['camera_dx_sign']:+.0f}, "
+        f"dy_sign={ring.CONFIG['camera_dy_sign']:+.0f}, "
+        f"swap_xy={ring.CONFIG['camera_swap_xy']}, "
+        f"manual_mm_per_px={ring.CONFIG['manual_mm_per_px']:.3f}"
+    )
+    for label, dx_px, dy_px in samples:
+        mapped = ring.pixel_offset_to_body_mm(dx_px, dy_px, ring.CONFIG["manual_mm_per_px"])
+        print(f"  {label:<18} -> 下发 dx={fmt_mm(mapped['dx_mm'])}, dy={fmt_mm(mapped['dy_mm'])}")
+    return 0
 
 
-_cam_cache = {"cam": None}
-_last_known = {"result": None, "time": 0.0}
-
-
-def _get_cam():
-    if _cam_cache["cam"] is None:
-        cam = USBCamera(CONFIG["usb_device"], CONFIG["width"],
-                       CONFIG["height"], CONFIG["fps"])
-        cam.start()
-        _cam_cache["cam"] = cam
-    return _cam_cache["cam"]
-
-
-def detect():
-    cam = _get_cam()
-    hits = []
-    start = time.time()
-    frames = CONFIG["detect_frames"]
-    timeout = CONFIG["detect_timeout_s"]
-
-    while len(hits) < frames and (time.time() - start) < timeout:
-        frame = cam.read()
-        if frame is None:
-            continue
-        result = find_ring_center(frame)
-        if result:
-            hits.append((result[0], result[1], result[2]))
-
-    if len(hits) < CONFIG["detect_min_hits"]:
-        if _last_known["result"] is not None:
-            age = time.time() - _last_known["time"]
-            if age < CONFIG["last_known_max_age_s"]:
-                return _last_known["result"]
-        return None
-
-    xs = sorted([h[0] for h in hits])
-    ys = sorted([h[1] for h in hits])
-    rs = sorted([h[2] for h in hits])
-    n = len(hits)
-    cx = xs[n // 2]
-    cy = ys[n // 2]
-    r = rs[n // 2]
-
-    if len(hits) >= 3:
-        recent_xs = [h[0] for h in hits[-3:]]
-        if max(recent_xs) - min(recent_xs) > CONFIG["consistency_max_diff"]:
-            if _last_known["result"] is not None and \
-               time.time() - _last_known["time"] < CONFIG["last_known_max_age_s"]:
-                return _last_known["result"]
-            return None
-        recent_ys = [h[1] for h in hits[-3:]]
-        if max(recent_ys) - min(recent_ys) > CONFIG["consistency_max_diff"]:
-            if _last_known["result"] is not None and \
-               time.time() - _last_known["time"] < CONFIG["last_known_max_age_s"]:
-                return _last_known["result"]
-            return None
-
-    result = (cx, cy, r)
-    _last_known["result"] = result
-    _last_known["time"] = time.time()
-    return result
-
-
-def _is_comm_alive():
+def _init_comm(required=False):
     try:
-        pose = comm.get_pose(max_age=CONFIG["recover_pose_age_max"])
-        return pose is not None
-    except:
-        return False
-
-
-def _recover_comm(verbose=True):
-    if verbose:
-        print("  [recover] 关闭 comm...")
-    try:
-        comm.shutdown()
-    except:
-        pass
-    time.sleep(0.5)
-
-    if verbose:
-        print("  [recover] 重开 comm...")
-    try:
-        comm.init(CONFIG["comm_port"], CONFIG["comm_baud"])
-    except Exception as e:
-        if verbose:
-            print(f"  [recover] init err: {e}")
-        return False
-    time.sleep(1.0)
-
-    if verbose:
-        print("  [recover] 发启动脉冲...")
-    try:
-        comm.run(5.0)
-    except:
-        pass
-    time.sleep(1.0)
-
-    for i in range(5):
-        if _is_comm_alive():
-            if verbose:
-                print(f"  [recover] 恢复成功 ({i+1}/5)")
-            return True
-        time.sleep(0.3)
-
-    return False
-
-
-def ensure_comm_alive(verbose=True):
-    if _is_comm_alive():
+        port = ring.resolve_comm_port(ring.CONFIG.get("comm_port"))
+        ring.CONFIG["comm_port"] = port
+        comm.init(port, ring.CONFIG["comm_baud"])
+        print(f"[test_ring] 串口已连接: {port}")
+        time.sleep(0.5)
         return True
-    if verbose:
-        print("  [comm 死了, 自动恢复]")
-    for attempt in range(CONFIG["recover_max_retry"]):
-        if verbose:
-            print(f"  [恢复 {attempt+1}/{CONFIG['recover_max_retry']}]")
-        if _recover_comm(verbose=verbose):
-            return True
-        time.sleep(1.0)
-    return False
-
-
-def _safe_goto(target_x, target_y, timeout=20.0, max_retry=2):
-    for attempt in range(max_retry):
-        try:
-            ok = comm.goto(target_x, target_y, timeout=timeout)
-            if ok:
-                return True
-        except Exception as e:
-            print(f"  [goto {attempt+1}] err: {e}")
-        time.sleep(0.3)
-
-    if not ensure_comm_alive(verbose=True):
+    except Exception as exc:
+        if required:
+            raise
+        print(f"[test_ring] 串口暂未连接，只开启视觉预览: {exc}")
         return False
-    time.sleep(0.5)
-
-    try:
-        return comm.goto(target_x, target_y, timeout=timeout)
-    except Exception as e:
-        print(f"  [goto] 恢复后仍失败: {e}")
-        return False
-
-
-def _wait(seconds, label, verbose=True):
-    if verbose:
-        print(f"  === {label} (等 {seconds}s) ===")
-    for i in range(int(seconds)):
-        time.sleep(1.0)
-        if verbose:
-            remaining = int(seconds) - i - 1
-            print(f"  等待中... 剩余 {remaining} 秒")
-
-
-# ============ ★ 3 步对齐 ============
-def align_to_ring(verbose=True):
-    if not ensure_comm_alive(verbose=verbose):
-        return False
-
-    time.sleep(CONFIG["pre_cmd_sleep_s"])
-
-    result = detect()
-    if result is None:
-        if verbose:
-            print("  [圆环没找到, 试着重连]")
-        if not ensure_comm_alive(verbose=False):
-            return False
-        result = detect()
-        if result is None:
-            if verbose:
-                print("  [FAIL] 没找到圆环")
-            return False
-
-    h, w = CONFIG["height"], CONFIG["width"]
-    cx_target, cy_target = w // 2, h // 2
-
-    cx, cy, r_px = result
-    dx_px = cx - cx_target
-    dy_px = cy - cy_target
-
-    if verbose:
-        print(f"  ring center = ({cx}, {cy})")
-        print(f"  ring radius = {r_px} px")
-        print(f"  像素偏差    = dx {dx_px:+d} px, dy {dy_px:+d} px")
-
-    if r_px <= 0:
-        return False
-
-    k_m_per_px = CONFIG["ring_actual_radius_m"] / r_px
-    k_mm_per_px = k_m_per_px * 1000
-
-    # === 第 1 步: 对准 ===
-    dx_mm = -dx_px * k_mm_per_px
-    dy_mm = dy_px * k_mm_per_px
-    dx_m = dx_mm / 1000.0
-    dy_m_align = dy_mm / 1000.0
-
-    pose = comm.get_pose(max_age=1.0)
-    if pose is None:
-        if verbose:
-            print("  [FAIL] 没拿到位姿")
-        return False
-
-    x_now, y_now, _ = pose
-    target_x_align = x_now + dx_m
-    target_y_align = y_now + dy_m_align
-
-    if verbose:
-        print(f"\n  === 步骤 1: 对准 ===")
-        print(f"  标定系数    = {k_mm_per_px:.3f} mm/px (calib=75mm)")
-        print(f"  移动        = dx {dx_mm:+.1f} mm, dy {dy_mm:+.1f} mm")
-        print(f"  目标位置    = ({target_x_align:.3f}, {target_y_align:.3f}) m")
-
-    ok = _safe_goto(target_x_align, target_y_align,
-                    timeout=CONFIG["correct_timeout_s"])
-    if not ok:
-        if verbose:
-            print("  [step 1] FAIL")
-        return False
-    if verbose:
-        print(f"  [step 1] OK")
-
-    # === 第 1→2 步之间等待 ===
-    _wait(CONFIG["step1_to_step2_pause_s"], "步骤1→2 等待", verbose)
-
-    # === 第 2 步: y +100mm ===
-    target_y_step2 = target_y_align + CONFIG["post_align_offset_y_mm"] / 1000.0
-
-    if verbose:
-        print(f"\n  === 步骤 2: y +{CONFIG['post_align_offset_y_mm']}mm ===")
-        print(f"  目标位置    = ({target_x_align:.3f}, {target_y_step2:.3f}) m")
-
-    time.sleep(CONFIG["pre_cmd_sleep_s"])
-    ok = _safe_goto(target_x_align, target_y_step2,
-                    timeout=CONFIG["correct_timeout_s"])
-    if not ok:
-        if verbose:
-            print("  [step 2] FAIL")
-        return False
-    if verbose:
-        print(f"  [step 2] OK")
-
-    # === 第 2→3 步之间等待 ===
-    _wait(CONFIG["step2_to_step3_pause_s"], "步骤2→3 等待", verbose)
-
-    # === 第 3 步: 退后 500 像素 ===
-    # 500 像素 = 500 * k_mm_per_px mm
-    back_offset_mm = CONFIG["step3_back_offset_px"] * k_mm_per_px
-    target_y_step3 = target_y_step2 - back_offset_mm / 1000.0
-
-    if verbose:
-        print(f"\n  === 步骤 3: 退后 {CONFIG['step3_back_offset_px']} 像素 ===")
-        print(f"  500px 实际  = {back_offset_mm:.1f} mm")
-        print(f"  目标位置    = ({target_x_align:.3f}, {target_y_step3:.3f}) m")
-
-    time.sleep(CONFIG["pre_cmd_sleep_s"])
-    ok = _safe_goto(target_x_align, target_y_step3,
-                    timeout=CONFIG["correct_timeout_s"])
-    if verbose:
-        print(f"  [step 3] {'OK' if ok else 'FAIL'}")
-    return ok
-
-
-def reconnect():
-    print("[manual reconnect]")
-    _recover_comm(verbose=True)
-
-
-def close():
-    if _cam_cache["cam"] is not None:
-        _cam_cache["cam"].stop()
-        _cam_cache["cam"] = None
 
 
 def main():
-    print("=" * 50)
-    print("Black ring align 3-step (calib=75mm)")
-    print("  1. 对准")
-    print("  2. 等2s, y+100mm")
-    print("  3. 等2s, 退后 500 像素")
-    print("=" * 50)
-    print("q=quit  a=align  r=reconnect")
+    mode, usb_device, usb_devices, port = _parse_args(sys.argv[1:])
+    configure_ring_for_test(usb_device=usb_device, usb_devices=usb_devices, port=port)
 
-    comm.init(CONFIG["comm_port"], CONFIG["comm_baud"])
-    time.sleep(1.0)
-
-    cam = _get_cam()
-    cv2.namedWindow("Ring", cv2.WINDOW_NORMAL)
+    print("=" * 64)
+    print("同心圆环定位测试：只拟合圆心；mm/px 使用手动标定值")
+    print("preview: 实时画面；once/detect: 只识别；align: 微调到位后前进105mm并后退200mm；mapping: 坐标映射自检")
+    print("覆盖参数：--device 1 | --devices 1,0 | --port /dev/ttyUSB0")
+    print("预览热键：A=微调到位+前进105mm+后退200mm，M=多次定位不前进，P=打印，X/Y/S=方向标定，C=候选圆显示")
+    print("=" * 64)
 
     try:
-        while True:
-            frame = cam.read()
-            if frame is None:
-                continue
-
-            result = find_ring_center(frame)
-            display = frame.copy()
-            h, w = frame.shape[:2]
-
-            cv2.line(display, (w//2 - 30, h//2), (w//2 + 30, h//2),
-                    (0, 255, 255), 1)
-            cv2.line(display, (w//2, h//2 - 30), (w//2, h//2 + 30),
-                    (0, 255, 255), 1)
-
-            if result:
-                cx, cy, r, area, major, minor, ecc = result
-                cv2.ellipse(display, (cx, cy), (major // 2, minor // 2),
-                           0, 0, 360, (0, 255, 0), 2)
-                cv2.circle(display, (cx, cy), 3, (0, 0, 255), -1)
-                dx = cx - w // 2
-                dy = cy - h // 2
-                cv2.putText(display,
-                           f"({cx},{cy}) r={r}  dx={dx:+d} dy={dy:+d}",
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                           (0, 255, 0), 2)
-            else:
-                cv2.putText(display, "NO RING", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-            cv2.putText(display, "q=quit  a=align  r=reconnect",
-                       (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                       (255, 255, 0), 1)
-            cv2.putText(display, "calib=FIXED 75mm",
-                       (w - 220, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                       (255, 0, 255), 2)
-
-            cv2.imshow("Ring", display)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('a'):
-                print("\n[align 3-step]")
-                align_to_ring(verbose=True)
-                print()
-            elif key == ord('r'):
-                reconnect()
-
-    except KeyboardInterrupt:
-        pass
+        if mode in ("mapping", "selftest"):
+            return _run_mapping_selftest()
+        if mode in ("once", "detect"):
+            offset = ring.detect_offset(verbose=True)
+            if offset is None:
+                print("[test_ring] 未检测到可靠同心圆")
+                return 1
+            return 0
+        if mode in ("align", "a"):
+            _init_comm(required=True)
+            return 0 if ring.align_checked_then_forward(verbose=True) else 1
+        _init_comm(required=False)
+        ring.preview()
+        return 0
     finally:
-        close()
-        cv2.destroyAllWindows()
+        ring.close()
         try:
             comm.shutdown()
-        except:
+        except Exception:
             pass
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

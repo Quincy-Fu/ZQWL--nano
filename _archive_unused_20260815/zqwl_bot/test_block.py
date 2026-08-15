@@ -50,7 +50,7 @@ def load_thresholds(path):
 
 
 class USBCamera:
-    def __init__(self, device=0, width=640, height=480, fps=30):
+    def __init__(self, device=1, width=640, height=480, fps=30):
         self.device = device
         self.width = width
         self.height = height

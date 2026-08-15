@@ -8,14 +8,15 @@ import cv2
 import numpy as np
 import json
 import os
+import re
 import time
 import threading
 import comm
 
 
 CONFIG = {
-    "usb_device": 0,
-    "usb_devices": [0, 1],
+    "usb_device": 1,
+    "usb_devices": [1, 0],
     "width": 640,
     "height": 480,
     "fps": 30,
@@ -23,6 +24,14 @@ CONFIG = {
     "roi_radius": 140,
 
     "vote_min_pct": 0.20,
+    "motion_vote_min_pct": 0.08,
+    "motion_chroma_min_pct": 0.04,
+    "motion_black_min_pct": 0.28,
+    "motion_white_min_pct": 0.82,
+    "instant_recent_window_s": 0.80,
+    "instant_chroma_min_pct": 0.02,
+    "instant_black_min_pct": 0.18,
+    "instant_white_min_pct": 0.90,
 
     "black_v_max": 60,
     "white_v_min": 150,
@@ -109,13 +118,52 @@ _last_known = {"result": None, "time": 0.0}
 _latest_frame = None           # ★ viewer 线程共享的最近帧
 _latest_frame_time = 0.0
 _frame_lock = threading.Lock()
-_recent_color_samples = []     # 圆弧运动中复用 viewer 连续识别结果
+_recent_color_samples = []     # 圆弧运动中复用 viewer 连续识别结果: (time, color, pct)
 _recent_color_lock = threading.Lock()
 _viewer_started = False
 _viewer_thread = None
 _viewer_stop = threading.Event()
 _status_text = "等待识别"
 _status_lock = threading.Lock()
+
+
+def _parse_device_list(value):
+    """解析 USB 设备号列表，支持 "1,0" / "1 0" 这类写法。"""
+    if value is None or value == "":
+        return []
+    if isinstance(value, int):
+        return [int(value)]
+    if isinstance(value, (list, tuple)):
+        return [int(v) for v in value]
+    items = re.split(r"[,;\s]+", str(value).strip())
+    return [int(v) for v in items if v != ""]
+
+
+def configure_usb(device=None, devices=None):
+    """配置 USB 摄像头候选顺序；默认优先 1，再回退 0。"""
+    ordered = []
+    if device is not None:
+        ordered.extend(_parse_device_list(device))
+    if devices is not None:
+        ordered.extend(_parse_device_list(devices))
+    ordered.extend([1, 0])
+
+    unique = []
+    for dev in ordered:
+        if dev not in unique:
+            unique.append(dev)
+    CONFIG["usb_device"] = unique[0]
+    CONFIG["usb_devices"] = unique
+    return unique
+
+
+def apply_usb_env(prefix="ZQWL_BLOCK"):
+    """从环境变量覆盖 USB 设备号；专用变量优先，通用变量兜底。"""
+    device = os.environ.get(f"{prefix}_USB_DEVICE", os.environ.get("ZQWL_USB_DEVICE"))
+    devices = os.environ.get(f"{prefix}_USB_DEVICES", os.environ.get("ZQWL_USB_DEVICES"))
+    if device is not None or devices is not None:
+        return configure_usb(device=device, devices=devices)
+    return configure_usb(CONFIG.get("usb_device", 1), CONFIG.get("usb_devices", [1, 0]))
 
 
 def set_status(text):
@@ -131,13 +179,8 @@ def _get_status():
 
 
 def _ordered_devices():
-    """生成 USB 摄像头尝试顺序；当前首选 + 配置列表 + 0/1 兜底。"""
-    devices = CONFIG.get("usb_devices") or [CONFIG.get("usb_device", 0)]
-    ordered_devices = []
-    for dev in [CONFIG.get("usb_device", 0), *devices, 0, 1]:
-        if dev not in ordered_devices:
-            ordered_devices.append(dev)
-    return ordered_devices
+    """生成 USB 摄像头尝试顺序；实车优先 1，0 只作为回退。"""
+    return apply_usb_env()
 
 
 def _available_devices():
@@ -264,8 +307,12 @@ def _viewer_loop():
         frame = _read_camera_frame()
         if frame is not None:
             # 单帧识别结果持续写入缓存；显示窗口只是消费这个结果。
-            color, pcts = _single_frame_color(frame, thresholds)
-            _record_color_sample(color)
+            color, pcts = _single_frame_color(
+                frame,
+                thresholds,
+                vote_min_pct=CONFIG["motion_vote_min_pct"],
+            )
+            _record_color_sample(color, pcts)
 
             # 实时显示
             if CONFIG["show_window"]:
@@ -338,18 +385,100 @@ def clear_recent_colors():
         _recent_color_samples.clear()
 
 
-def _record_color_sample(color):
+def clear_recognition_cache():
+    """清空颜色识别缓存；用于机械臂/车体调整后重新从当前画面开始判断。"""
+    clear_recent_colors()
+    _last_known["result"] = None
+    _last_known["time"] = 0.0
+
+
+def _record_color_sample(color, pct=None):
     """记录 viewer 每帧颜色结果，供圆弧运动中快速读取。"""
     now = time.time()
-    keep_s = max(CONFIG["motion_recent_window_s"], 0.5)
+    keep_s = max(CONFIG["motion_recent_window_s"], CONFIG["instant_recent_window_s"], 1.0)
     with _recent_color_lock:
-        _recent_color_samples.append((now, color))
+        _recent_color_samples.append((now, color, pct or {}))
         cutoff = now - keep_s
         while _recent_color_samples and _recent_color_samples[0][0] < cutoff:
             _recent_color_samples.pop(0)
 
 
-def get_recent_motion_color(window_s=None, min_hits=None):
+def _motion_color_from_pct(pct, exclude_colors=None):
+    """运动中从 ROI 占比判断物块颜色，避免白/黑背景按最大面积误胜出。"""
+    exclude = set(exclude_colors or [])
+
+    chroma = [c for c in ("红", "绿", "蓝") if c not in exclude]
+    if chroma:
+        best_chroma = max(chroma, key=lambda c: pct.get(c, 0.0))
+        if pct.get(best_chroma, 0.0) >= CONFIG["motion_chroma_min_pct"]:
+            return best_chroma
+
+    if "黑" not in exclude and pct.get("黑", 0.0) >= CONFIG["motion_black_min_pct"]:
+        return "黑"
+    if "白" not in exclude and pct.get("白", 0.0) >= CONFIG["motion_white_min_pct"]:
+        return "白"
+    return None
+
+
+def _instant_color_from_sample(sample_color, pct, exclude_colors=None):
+    """从 viewer 已显示过的一帧里取色；彩色优先，白色背景最后才接受。"""
+    exclude = set(exclude_colors or [])
+
+    chroma = [c for c in ("红", "绿", "蓝") if c not in exclude]
+    if chroma:
+        best_chroma = max(chroma, key=lambda c: pct.get(c, 0.0))
+        if pct.get(best_chroma, 0.0) >= CONFIG["instant_chroma_min_pct"]:
+            return best_chroma
+
+    if "黑" not in exclude and pct.get("黑", 0.0) >= CONFIG["instant_black_min_pct"]:
+        return "黑"
+
+    if sample_color in ("红", "绿", "蓝") and sample_color not in exclude:
+        return sample_color
+    if sample_color == "黑" and sample_color not in exclude:
+        return "黑"
+
+    # 白色最容易被地面/反光误触发，只有没有明显彩色/黑色证据时才接受。
+    max_chroma = max((pct.get(c, 0.0) for c in ("红", "绿", "蓝")), default=0.0)
+    if (
+        "白" not in exclude
+        and sample_color == "白"
+        and pct.get("白", 0.0) >= CONFIG["instant_white_min_pct"]
+        and max_chroma < CONFIG["instant_chroma_min_pct"]
+        and pct.get("黑", 0.0) < CONFIG["instant_black_min_pct"]
+    ):
+        return "白"
+
+    return None
+
+
+def get_recent_display_color(window_s=None, exclude_colors=None):
+    """读取 viewer 最近显示过的一次有效颜色；用于“看到一次就算到位”的场景。"""
+    if window_s is None:
+        window_s = CONFIG["instant_recent_window_s"]
+    now = time.time()
+    with _recent_color_lock:
+        samples = [(t, c, pct) for t, c, pct in _recent_color_samples
+                   if (now - t) <= window_s]
+    for _t, color, pct in reversed(samples):
+        instant_color = _instant_color_from_sample(color, pct or {}, exclude_colors=exclude_colors)
+        if instant_color is not None:
+            return instant_color
+    return None
+
+
+def wait_for_display_color(timeout_s=0.5, window_s=None, exclude_colors=None):
+    """在 timeout 内只要 viewer 显示过一次有效颜色就返回。"""
+    start = time.time()
+    while (time.time() - start) <= timeout_s:
+        color = get_recent_display_color(window_s=window_s, exclude_colors=exclude_colors)
+        if color is not None:
+            return color
+        time.sleep(0.02)
+    return None
+
+
+def get_recent_motion_color(window_s=None, min_hits=None, exclude_colors=None):
     """读取最近连续识别缓存；不使用 last_known 兜底，适合运动中触发点。"""
     if window_s is None:
         window_s = CONFIG["motion_recent_window_s"]
@@ -358,9 +487,10 @@ def get_recent_motion_color(window_s=None, min_hits=None):
     now = time.time()
     votes = {"黑": 0, "白": 0, "红": 0, "绿": 0, "蓝": 0}
     with _recent_color_lock:
-        samples = [(t, c) for t, c in _recent_color_samples
-                   if (now - t) <= window_s and c is not None]
-    for _, color in samples:
+        samples = [(t, pct) for t, _c, pct in _recent_color_samples
+                   if (now - t) <= window_s]
+    for _, pct in samples:
+        color = _motion_color_from_pct(pct or {}, exclude_colors=exclude_colors)
         if color in votes:
             votes[color] += 1
     winner = max(votes, key=votes.get)
@@ -369,9 +499,38 @@ def get_recent_motion_color(window_s=None, min_hits=None):
     return None
 
 
+def recent_motion_debug(window_s=None, exclude_colors=None):
+    """返回最近运动识别窗口的统计，判断是没赶上还是 ROI 比例不够。"""
+    if window_s is None:
+        window_s = CONFIG["motion_recent_window_s"]
+    now = time.time()
+    votes = {"黑": 0, "白": 0, "红": 0, "绿": 0, "蓝": 0, None: 0}
+    best_pct = {"黑": 0.0, "白": 0.0, "红": 0.0, "绿": 0.0, "蓝": 0.0}
+    ages = []
+    with _recent_color_lock:
+        samples = [(t, c, pct) for t, c, pct in _recent_color_samples
+                   if (now - t) <= window_s]
+    for t, _color, pct in samples:
+        color = _motion_color_from_pct(pct or {}, exclude_colors=exclude_colors)
+        votes[color if color else None] = votes.get(color if color else None, 0) + 1
+        ages.append(now - t)
+        for c, v in (pct or {}).items():
+            if c in best_pct and v > best_pct[c]:
+                best_pct[c] = float(v)
+    return {
+        "samples": len(samples),
+        "newest_age": min(ages) if ages else None,
+        "oldest_age": max(ages) if ages else None,
+        "votes": votes,
+        "best_pct": best_pct,
+    }
+
+
 # ============ 单帧识别 (供 recognizer + viewer 共享) ============
-def _single_frame_color(frame, thresholds):
+def _single_frame_color(frame, thresholds, vote_min_pct=None):
     """单帧识别, 返回 (color, pct_dict) 或 (None, {})"""
+    if vote_min_pct is None:
+        vote_min_pct = CONFIG["vote_min_pct"]
     h, w = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     V = hsv[:, :, 2]
@@ -404,10 +563,16 @@ def _single_frame_color(frame, thresholds):
 
     pct = {c: float(np.sum(m == 255)) / roi_total
            for c, m in color_masks.items()}
+    # 不再用“整个 ROI 最大占比”直接判色；白色地面/黑色边缘面积通常更大。
+    # 先按物块颜色规则判断，彩色小块优先，白/黑必须达到更高占比才算。
+    object_color = _motion_color_from_pct(pct)
+    if object_color is not None:
+        return object_color, pct
+
     best = max(pct, key=lambda k: pct[k])
-    if pct[best] < CONFIG["vote_min_pct"]:
-        return None, pct
-    return best, pct
+    if best in ("红", "绿", "蓝") and pct[best] >= vote_min_pct:
+        return best, pct
+    return None, pct
 
 
 # ============ 公共 API ============
@@ -485,17 +650,43 @@ def recognize_no_fallback(frames=None, timeout=None, min_hits=None):
     return result
 
 
-def recognize_motion(window_s=None, min_hits=None):
+def recognize_motion(window_s=None, min_hits=None, exclude_colors=None):
     """圆弧运动中取色：优先用 viewer 连续缓存，失败再极短补采。"""
     start_viewer()
-    color = get_recent_motion_color(window_s=window_s, min_hits=min_hits)
+    color = get_recent_motion_color(window_s=window_s,
+                                    min_hits=min_hits,
+                                    exclude_colors=exclude_colors)
     if color is not None:
         return color
-    return recognize_no_fallback(
-        frames=CONFIG["motion_fallback_frames"],
-        timeout=CONFIG["motion_fallback_timeout_s"],
-        min_hits=CONFIG["motion_fallback_min_hits"],
-    )
+
+    thresholds = load_thresholds(CONFIG["thresholds_file"])
+    votes = {"黑": 0, "白": 0, "红": 0, "绿": 0, "蓝": 0}
+    start = time.time()
+    count = 0
+    while count < CONFIG["motion_fallback_frames"] and \
+          (time.time() - start) < CONFIG["motion_fallback_timeout_s"]:
+        frame = _read_latest_frame()
+        if frame is None:
+            frame = _read_camera_frame()
+        if frame is None:
+            time.sleep(0.01)
+            continue
+        _plain_color, pct = _single_frame_color(
+            frame,
+            thresholds,
+            vote_min_pct=CONFIG["motion_vote_min_pct"],
+        )
+        motion_color = _motion_color_from_pct(pct, exclude_colors=exclude_colors)
+        if motion_color in votes:
+            votes[motion_color] += 1
+        count += 1
+
+    if count == 0:
+        return None
+    winner = max(votes, key=votes.get)
+    if votes[winner] >= CONFIG["motion_fallback_min_hits"]:
+        return winner
+    return None
 
 
 def recognize_stable(frames=None, timeout=None):
@@ -511,6 +702,12 @@ def recognize_stable(frames=None, timeout=None):
     result, hits = _recognize_multi(frames, min_hits, timeout)
 
     if result is None:
+        debug = recent_motion_debug(window_s=0.5)
+        print(
+            f"[block] 稳定识别失败: samples={debug['samples']}, "
+            f"votes={debug['votes']}, best_pct={debug['best_pct']}",
+            flush=True,
+        )
         return None
 
     _last_known["result"] = result

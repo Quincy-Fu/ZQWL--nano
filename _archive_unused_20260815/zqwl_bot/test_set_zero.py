@@ -27,7 +27,7 @@ except ImportError:
 
 
 def main() -> int:
-    port = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyCH341USB0"
+    port = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyCH341USB*"
     baud = 115200
 
     print(f"[set_zero] 串口={port} 波特率={baud}")
