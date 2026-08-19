@@ -19,7 +19,7 @@ import ring
 
 
 # ============== 配置 ==============
-ARC_SPEED_MM_S = 300
+ARC_SPEED_MM_S = 180
 ARC_PRELOAD_POSITION = 3
 # 圆弧实际经过的三个物块位置顺序：3 → 2 → 1。
 ARC_COLLECT_ORDER = (3, 2, 1)
@@ -37,7 +37,7 @@ BACKUP_M = 0.05
 PLACE_BACKUP_M = 0.10
 SPLIT_THRESHOLD = 0.03
 AB_PATH_EPS = 1e-4
-AB_KEY_PATH_SPEED = 0.60
+AB_KEY_PATH_SPEED = 0.40
 QR2_RECOGNIZE_TIMEOUT_S = 18.0
 
 RANK_RING_BACK_MM = 200.0
@@ -47,9 +47,9 @@ BODY_POS_POST_SETTLE_S = 0.30
 
 # 冠军、亚军、季军固定对应 A、B、C。
 RANK_PLACE_POINTS = {
-    "亚军": ("B", 0.33, 1.779, 3, 0.25, 1.67),
+    "亚军": ("B", 0.25, 1.779, 3, 0.25, 1.67),
     "冠军": ("A", 0.00, 1.779, 4, 0.00, 1.66),
-    "季军": ("C", -0.25, 1.779, 1, -0.25, 1.67),
+    "季军": ("C", -0.10, 1.73, 1, -0.25, 1.67),
 }
 
 # 当前转盘映射：0=B，1=A，2=C；槽位4作为圆弧结束后的空槽。
@@ -328,11 +328,9 @@ def run_task_ab():
     if not comm.use_encoder_yaw(timeout=2.0):
         raise RuntimeError("A/B yaw源切到编码器失败")
 
-    # 1. 起步先同步当前位置，再沿当前90°朝向前进10cm到扫码点。
+    # 1. 起步直接把当前位置同步为扫码点，不做前置 10cm 移动。
     if not sync_pose(0.7, 0.25, INIT_YAW_D):
         raise RuntimeError("初始位姿同步失败")
-    if not go_to(0.80, 0.25):
-        raise RuntimeError("开局前进 10cm 到扫码点失败")
 
     # 2. QR2 识别 1->2->3 三个位置上的 ABC 摆放顺序
     seq2 = qr2.recognize(timeout=QR2_RECOGNIZE_TIMEOUT_S)  # 例: "CAB"
@@ -348,17 +346,17 @@ def run_task_ab():
         f"(B=0, A=1, C=2)"
     )
 
-    # 3. 扫码完成后先同步进入取放状态，并让转盘切到第一个经过的位置 3；随后前进5cm再进圆弧。
+    # 3. 扫码完成后先同步进入取放状态，并让转盘切到第一个经过的位置 3；随后前进 5cm 再进圆弧。
     first_slot = collect_slots[0]
     first_letter = collect_letters[0]
     print(f"  [圆弧预置位置 {ARC_PRELOAD_POSITION}] 先下发ARM1+转盘槽位 {first_slot} ({first_letter})，同时前进5cm")
     arm_and_rotate_async(1, first_slot)
 
-    # 扫码完成后进入 A/B 圆弧前目标点。
-    if not go_to(0.80, 0.20):
-        raise RuntimeError("扫码后进入圆弧前目标点失败")
+    # 扫码完成后按当前初始朝向 90° 前进 5cm：即 X 增加 0.05m，再开始 A/B 圆弧。
+    if not go_to(0.75, 0.25):
+        raise RuntimeError("扫码后前进 5cm 失败")
 
-    arc_r = 0.84
+    arc_r = 0.86
     arc_dir = -1
     arc_sweep_deg = 130.0
     arc_speed = ARC_SPEED_MM_S / 1000.0

@@ -35,10 +35,10 @@ INIT_X = 0.0
 INIT_Y = 0.0
 INIT_YAW = 90.0
 
-KEY_PATH_SPEED = 0.60
-KEY_PATH_MEDIUM_SPEED = 0.45
+KEY_PATH_SPEED = 0.50
+KEY_PATH_MEDIUM_SPEED = 0.40
 KEY_PATH_MEDIUM_SEG_M = 0.60
-KEY_PATH_LONG_SPEED = 0.42
+KEY_PATH_LONG_SPEED = 0.35
 KEY_PATH_LONG_SEG_M = 0.80
 KEY_PATH_XY_EPS = 1e-4
 KEY_PATH_SEG_TIMEOUT_MIN = 25.0
@@ -124,7 +124,7 @@ KEY_PATH_POINTS = [
 KEY_PATH_ROTATE_SLOTS = [1, 2, 3, 4]
 
 TARGET_POINTS = {
-    "A": (-0.600, 1.630),
+    "A": (-0.630, 1.630),
     "B": (-0.430, 1.340),
     "C": ( 0.210, 1.620),
     "D": ( 0.330, 1.340),
@@ -395,29 +395,26 @@ def go_axis_y_then_x(x: float, y: float, label: str = "axis move") -> bool:
 
 
 def go_axis_x_turn0_then_y(x: float, y: float, label: str = "axis move") -> bool:
-    """只给 E 点使用：先走 X，X 到位后转 0°，再走 Y，禁止斜移。"""
+    """只给 E 点使用：分段执行 X 方向 GOTO、转角、Y 方向 GOTO。"""
     print(f"  AXIS_MOVE_X_TURN0_Y {label}: target=({x:.4f}, {y:.4f})")
-    sx, sy = _CUR_X, _CUR_Y
-    yaw = _current_yaw()
-    pts = [(sx, sy, yaw)]
-    if abs(sx - x) > AXIS_MOVE_EPS:
-        pts.append((x, sy, yaw))
-    pts.append((x, sy, 0.0))
-    if abs(sy - y) > AXIS_MOVE_EPS:
-        pts.append((x, y, 0.0))
 
-    def fallback() -> bool:
-        if abs(_CUR_X - x) > AXIS_MOVE_EPS:
-            if not go_to(x, _CUR_Y):
-                return False
-        if not turn_to(0.0):
+    # 不再强行把当前坐标和航向同步成 180°，避免理想坐标覆盖实车当前位置。
+    # 先完成纯 X 方向移动，避免把 X/Y 合成为斜线。
+    if abs(_CUR_X - x) > AXIS_MOVE_EPS:
+        if not go_to(x, _CUR_Y):
             return False
-        if abs(_CUR_Y - y) > AXIS_MOVE_EPS:
-            if not go_to(x, y):
-                return False
-        return True
 
-    return _axis_path(pts, label, fallback)
+    # 保留原先的大角度分段转向：先转到 90°，再转到 0°。
+    if not turn_to(90.0):
+        return False
+    if not turn_to(0.0):
+        return False
+
+    # 转角完成后再执行纯 Y 方向移动。
+    if abs(_CUR_Y - y) > AXIS_MOVE_EPS:
+        if not go_to(x, y):
+            return False
+    return True
 
 
 def turn_to(deg: float, timeout: float = 30.0) -> bool:
