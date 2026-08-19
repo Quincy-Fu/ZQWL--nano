@@ -1,84 +1,70 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-test_A_B.py - 阶段 A 装载 + 阶段 B 圆环放置 测试
-1. 阶段 A: 走逆时针圆弧, 装载到转盘
-2. 阶段 B: 3 个圆环放置，调用 ring 完成微调放置
-"""
+"""A/B 阶段测试流程：二维码、圆弧收纳和三个圆环放置。"""
+
 import math
 import os
 import sys
-import time
 import threading
+import time
 
-# 必须在任何视觉模块导入 cv2 前设置，避免 USB 异常时 V4L2 select 默认等待约 10 秒。
+# 摄像头异常时缩短 V4L2 默认等待，避免 USB 打开失败后长时间卡住。
 os.environ.setdefault("OPENCV_VIDEOIO_V4L_SELECT_TIMEOUT", "1")
 os.environ.setdefault("OPENCV_VIDEOIO_V4L_READ_ATTEMPTS", "1")
 
 import comm
-import qr2, block, ring
+import qr2
+import block
+import ring
 
 
 # ============== 配置 ==============
 ARC_SPEED_MM_S = 300
-WAYPOINT_DELAY_S = 1.0
+ARC_PRELOAD_POSITION = 3
+# 圆弧实际经过的三个物块位置顺序：3 → 2 → 1。
+ARC_COLLECT_ORDER = (3, 2, 1)
+ARC_SWITCH_BY_DEG = [(50.0, 2), (80.0, 1)]
+ARC_END_UNUSED_SLOT = 4
+ARC_SPEED_MPS = ARC_SPEED_MM_S / 1000.0
+ARC_RADIUS_M = 0.84
+ARC_DIR = -1
+ARC_SWEEP_DEG = 130.0
+
+INIT_YAW_D = 90.0
+HEADING_D = 0.0
+# 兼容旧版测试辅助函数的默认后退距离。
 BACKUP_M = 0.05
 PLACE_BACKUP_M = 0.10
-HEADING_D = 0                  # 阶段 B 放物车头朝向 (车体坐标)
-INIT_YAW_D = 90.0
 SPLIT_THRESHOLD = 0.03
-AB_KEY_PATH_SPEED = 0.60
 AB_PATH_EPS = 1e-4
+AB_KEY_PATH_SPEED = 0.60
 QR2_RECOGNIZE_TIMEOUT_S = 18.0
+
 RANK_RING_BACK_MM = 200.0
 RANK_RING_BACK_TIMEOUT_S = 45.0
+# BODY_POS 完成后给电机驱动器留出额外稳定时间，再同步坐标。
+BODY_POS_POST_SETTLE_S = 0.30
 
-# 冠亚季点位。按用户说明: 冠/亚/季 对应 A/B/C。
+# 冠军、亚军、季军固定对应 A、B、C。
 RANK_PLACE_POINTS = {
-    "亚军": ("B", 0.25, 1.779, 3, 0.25, 1.67),
+    "亚军": ("B", 0.33, 1.779, 3, 0.25, 1.67),
     "冠军": ("A", 0.00, 1.779, 4, 0.00, 1.66),
-    "季军": ("C", -0.15, 1.730, 1, -0.25, 1.67),
+    "季军": ("C", -0.25, 1.779, 1, -0.25, 1.67),
 }
 
-# QR2 返回的 3 个字母对应位置 1、2、3 上的物块顺序；圆弧实际经过顺序固定为 3→2→1。
-ARC_COLLECT_ORDER = (3, 2, 1)
-ARC_PRELOAD_POSITION = ARC_COLLECT_ORDER[0]
-ARC_SWITCH_BY_DEG = [(50.0, ARC_COLLECT_ORDER[1]), (80.0, ARC_COLLECT_ORDER[2])]
-ARC_END_UNUSED_SLOT = 4
-
-# 阶段 B 3 个目标点
-TARGETS_B = [
-    ( 0.27017, 1.77938, 1),    # 1号圆环, 转盘 1
-    (-0.27017, 1.77938, 2),    # 2号圆环, 转盘 2
-    ( 0,         1.77938, 0),   # 3号圆环, 转盘 0
-]
-
+# 当前转盘映射：0=B，1=A，2=C；槽位4作为圆弧结束后的空槽。
 ALPHA_TO_POS = {"B": 0, "A": 1, "C": 2}
 
 _CUR_X, _CUR_Y = 0.0, 0.0
 
 
-# ============== 角度工具 (算 sweep) ==============
-def user_deg(p, c):
-    dx, dy = p[0] - c[0], p[1] - c[1]
-    return (90 - math.degrees(math.atan2(dy, dx))) % 360
-
-def arc_sweep(start, end, center, ccw):
-    a_s = user_deg(start, center)
-    a_e = user_deg(end, center)
-    if ccw:
-        return (a_s - a_e) % 360
-    return (a_e - a_s) % 360
-
-
-# ============== 串口高层 ==============
 def _update_cur(x, y):
     global _CUR_X, _CUR_Y
-    _CUR_X, _CUR_Y = x, y
+    _CUR_X, _CUR_Y = float(x), float(y)
 
 
 def refresh_cur_from_pose():
-    """圆弧后用下位机上报位姿刷新本地分段移动起点。"""
+    """从下位机读取新鲜位姿，作为后续分段路径的起点。"""
     pose = comm.get_pose(max_age=1.0)
     if pose is None:
         print("  !! 没有新鲜 POSE，本地分段起点沿用上一次记录")
@@ -86,6 +72,11 @@ def refresh_cur_from_pose():
     _update_cur(pose[0], pose[1])
     print(f"  当前位姿刷新: ({pose[0]:.4f}, {pose[1]:.4f}), yaw={pose[2]:.1f}°")
     return True
+
+
+def _current_yaw(default=HEADING_D):
+    pose = comm.get_pose(max_age=1.0)
+    return float(pose[2]) if pose is not None else float(default)
 
 
 def go_to(x, y):
@@ -96,85 +87,77 @@ def go_to(x, y):
     return ok
 
 
-def _current_yaw(default=0.0):
-    """读取当前yaw；path段用它保持现有朝向。"""
-    pose = comm.get_pose(max_age=1.0)
-    if pose is None:
-        return default
-    return float(pose[2])
-
-
 def _key_path_points(points, label, speed=AB_KEY_PATH_SPEED):
-    """A/B放置阶段短分段优先用key_path，减少多条GOTO之间的停顿。"""
+    """用短 key_path 发送连续轴向段，失败时由调用方回退 GOTO。"""
     compact = []
-    for p in points:
+    for point in points:
         if compact:
             last = compact[-1]
-            if (abs(last[0] - p[0]) <= AB_PATH_EPS and
-                    abs(last[1] - p[1]) <= AB_PATH_EPS and
-                    abs(last[2] - p[2]) <= 0.1):
+            if (abs(last[0] - point[0]) <= AB_PATH_EPS and
+                    abs(last[1] - point[1]) <= AB_PATH_EPS and
+                    abs(last[2] - point[2]) <= 0.1):
                 continue
-        compact.append(p)
-    points = compact
+        compact.append(tuple(point))
+    if len(compact) < 2:
+        return True
+    print(f"  KEY_PATH {label}: {len(compact)} pts, speed={speed:.2f}")
+    ok = comm.key_path(compact, speed=speed, prepend_current=False)
+    if ok:
+        _update_cur(compact[-1][0], compact[-1][1])
+    return ok
+
+
+def path_to(x, y, label="axis move", x_first=False):
+    """按纯横移/直行规划到目标点，不发送斜线段。"""
+    sx, sy = _CUR_X, _CUR_Y
+    yaw = _current_yaw()
+    points = [(sx, sy, yaw)]
+    if x_first:
+        if abs(x - sx) > AB_PATH_EPS:
+            points.append((x, sy, yaw))
+        if abs(y - sy) > AB_PATH_EPS:
+            points.append((x, y, yaw))
+    else:
+        if abs(y - sy) > AB_PATH_EPS:
+            points.append((sx, y, yaw))
+        if abs(x - sx) > AB_PATH_EPS:
+            points.append((x, y, yaw))
     if len(points) < 2:
         return True
-    print(f"  KEY_PATH {label}: {len(points)} pts, speed={speed:.2f}")
-    ok = comm.key_path(points, speed=speed, prepend_current=False)
-    if ok:
-        _update_cur(points[-1][0], points[-1][1])
-    return ok
-
-
-def path_to(x, y, label="path move", x_first=False):
-    """优先用key_path走到目标；失败则按原分轴顺序回退GOTO。"""
-    sx, sy = _CUR_X, _CUR_Y
-    yaw = _current_yaw(default=HEADING_D)
-    pts = [(sx, sy, yaw)]
-    dx = abs(x - sx)
-    dy = abs(y - sy)
-    if dx > SPLIT_THRESHOLD and dy > SPLIT_THRESHOLD:
-        if x_first:
-            pts.append((x, sy, yaw))
-            pts.append((x, y, yaw))
-        else:
-            pts.append((sx, y, yaw))
-            pts.append((x, y, yaw))
-    elif dx > AB_PATH_EPS or dy > AB_PATH_EPS:
-        pts.append((x, y, yaw))
-    else:
+    if _key_path_points(points, label):
         return True
-    if _key_path_points(pts, label):
-        return True
-    print(f"  [WARN] KEY_PATH {label}失败，回退原分轴GOTO")
+    print(f"  [WARN] KEY_PATH {label}失败，回退单轴GOTO")
     refresh_cur_from_pose()
-    cur_dx = abs(x - _CUR_X)
-    cur_dy = abs(y - _CUR_Y)
-    if cur_dx > SPLIT_THRESHOLD and cur_dy > SPLIT_THRESHOLD:
-        if x_first:
-            if not go_to(x, _CUR_Y):
-                return False
-            return go_to(x, y)
-        if not go_to(_CUR_X, y):
+    if x_first:
+        if abs(x - _CUR_X) > AB_PATH_EPS and not go_to(x, _CUR_Y):
             return False
-        return go_to(x, y)
-    return go_to(x, y)
-
-
-def lock_y_to(y, timeout=40.0):
-    """只沿 Y 方向后退/前进：复用 CD 的 TOY 锁轴模式，比普通 GOTO 更直接。"""
-    print(f"  LOCK_Y_TO {y:.4f} (keep X={_CUR_X:.4f})")
-    ok = comm.lock_axis("y", y, timeout=timeout)
-    if ok:
-        _update_cur(_CUR_X, y)
-    return ok
+        if abs(y - _CUR_Y) > AB_PATH_EPS and not go_to(x, y):
+            return False
+    else:
+        if abs(y - _CUR_Y) > AB_PATH_EPS and not go_to(_CUR_X, y):
+            return False
+        if abs(x - _CUR_X) > AB_PATH_EPS and not go_to(x, _CUR_Y):
+            return False
+    return True
 
 
 def go_to_split(x, y, x_first=False):
-    """两轴差距都较大时拆成横移和直行两段，减少斜移。"""
-    return path_to(x, y, label=f"split move to ({x:.3f},{y:.3f})", x_first=x_first)
+    """兼容旧调用名，统一转到纯轴向 path。"""
+    return path_to(x, y, label="分轴移动", x_first=x_first)
+
+
+def move_first_rank_y_then_x(rank_name):
+    """圆弧结束后先直行到名次点 Y，再横移到 X。"""
+    _letter, target_x, target_y, _arm_state, _sync_x, _sync_y = RANK_PLACE_POINTS[rank_name]
+    print(
+        f"  [AB] {rank_name}前置实走: "
+        f"先 Y {_CUR_Y:.4f}->{target_y:.4f}, 再 X {_CUR_X:.4f}->{target_x:.4f}"
+    )
+    return path_to(target_x, target_y, label=f"{rank_name}前置Y->X", x_first=False)
+
 
 def turn_to(deg):
-    print(f"  TURNTO {deg:.1f}° (车体)")
+    print(f"  TURNTO {deg:.1f}°")
     return comm.turnto(deg, timeout=30.0)
 
 
@@ -183,108 +166,54 @@ def rotate(pos):
     return comm.rotate(pos, timeout=12.0)
 
 
-def rotate_async(pos):
-    """只下发转盘切换命令，不等待估算到位响应，用于圆弧过程中提前切槽。"""
-    print(f"  ROTATE {pos} (不等待，双发防丢帧)")
-    comm.send_rotate(pos, repeats=2, repeat_delay_s=0.08)
-    return True
-
-
 def arm(state):
     print(f"  ARM {state}")
     return comm.arm(state, timeout=6.0)
 
 
+def arm_light(state, light_id=4, light_on=True):
+    """同时下发机械臂和补光灯，分别等待响应。"""
+    print(f"  ARM {state} + LIGHT {light_id} {'ON' if light_on else 'OFF'}")
+    seen = comm.response_seq()
+    comm.send_arm(state)
+    comm.send_light(light_id, light_on)
+    arm_ok = comm.wait_for_after(comm.TYPE_ARM_RESP, seen, 6.0)
+    light_ok = comm.wait_for_after(comm.TYPE_LIGHT_RESP, seen, 5.0)
+    return bool(arm_ok and light_ok)
+
+
 def arm_and_rotate_async(arm_state, slot):
-    """机械臂和转盘同时下发，不等待响应；圆弧立即开始。"""
-    print(f"  ARM {arm_state} + ROTATE {slot} (不等待，转盘双发，圆弧同步开始)")
+    """圆弧开始前同时下发机械臂和转盘，不等待响应。"""
+    print(f"  ARM {arm_state} + ROTATE {slot} (不等待，圆弧同步开始)")
     comm.send_arm(arm_state)
-    time.sleep(0.05)
-    comm.send_rotate(slot, repeats=2, repeat_delay_s=0.08)
+    comm.send_rotate(slot)
     return True
 
 
 def arm_and_rotate(arm_state, slot):
-    """机械臂和转盘同时下发，两个都确认后才继续。"""
     print(f"  ARM {arm_state} + ROTATE {slot} (等待到位)")
     seen = comm.response_seq()
     comm.send_arm(arm_state)
-    time.sleep(0.05)
     comm.send_rotate(slot)
-    arm_ok = comm.wait_for_after(comm.TYPE_ARM_RESP, seen, 6.0)
-    rotate_ok = comm.wait_for_after(comm.TYPE_ROTATE_RESP, seen, 12.0)
-    if not arm_ok:
-        print("  !! 机械臂响应超时或失败")
-    if not rotate_ok:
-        print("  !! 转盘响应超时或失败")
-        rotate_ok = comm.rotate(slot, timeout=12.0)
-    return arm_ok and rotate_ok
-
-
-def arm_light(arm_state, light_id=4, light_on=True):
-    """机械臂和补光灯同时下发，全部确认后再进入 ring 放置。"""
-    print(f"  ARM {arm_state} + LIGHT {light_id} {'ON' if light_on else 'OFF'} (等待到位)")
-    seen = comm.response_seq()
-    comm.send_arm(arm_state)
-    time.sleep(0.05)
-    comm.send_light(light_id, light_on)
-    arm_ok = comm.wait_for_after(comm.TYPE_ARM_RESP, seen, 6.0)
-    light_ok = comm.wait_for_after(comm.TYPE_LIGHT_RESP, seen, 5.0)
-    if not arm_ok:
-        print("  !! 机械臂响应超时或失败")
-    if not light_ok:
-        print("  !! 补光灯响应超时或失败")
-    return arm_ok and light_ok
-
-
-def arm_light_rotate(arm_state, slot, light_id=4, light_on=True):
-    """机械臂、补光灯和转盘同时下发，全部确认后再进入 ring 放置。"""
-    print(f"  ARM {arm_state} + LIGHT {light_id} {'ON' if light_on else 'OFF'} + ROTATE {slot} (等待到位)")
-    seen = comm.response_seq()
-    comm.send_arm(arm_state)
-    time.sleep(0.05)
-    comm.send_light(light_id, light_on)
-    time.sleep(0.05)
-    comm.send_rotate(slot)
-    arm_ok = comm.wait_for_after(comm.TYPE_ARM_RESP, seen, 6.0)
-    light_ok = comm.wait_for_after(comm.TYPE_LIGHT_RESP, seen, 5.0)
-    rotate_ok = comm.wait_for_after(comm.TYPE_ROTATE_RESP, seen, 12.0)
-    if not arm_ok:
-        print("  !! 机械臂响应超时或失败")
-    if not light_ok:
-        print("  !! 补光灯响应超时或失败")
-    if not rotate_ok:
-        print("  !! 转盘响应超时或失败")
-        rotate_ok = comm.rotate(slot, timeout=12.0)
-    return arm_ok and light_ok and rotate_ok
+    return bool(
+        comm.wait_for_after(comm.TYPE_ARM_RESP, seen, 6.0)
+        and comm.wait_for_after(comm.TYPE_ROTATE_RESP, seen, 12.0)
+    )
 
 
 def arm_async(state):
-    """发送机械臂命令但不等待响应，用于后退时同步切状态。"""
-    print(f"  ARM {state} (不等待, 与后退动作衔接)")
+    print(f"  ARM {state} (不等待)")
     comm.send_arm(state)
     return True
 
 
 def sync_pose(x, y, yaw):
-    if yaw is None:
-        print(f"  SYNC POSE ({x:.4f}, {y:.4f}, yaw=保持当前)")
-    else:
-        print(f"  SYNC POSE ({x:.4f}, {y:.4f}, yaw={yaw:.1f}°)")
+    yaw_text = "保持当前" if yaw is None else f"{yaw:.1f}°"
+    print(f"  SYNC POSE ({x:.4f}, {y:.4f}, yaw={yaw_text})")
     ok = comm.sync_pose(x, y, yaw, timeout=5.0)
     if ok:
         _update_cur(x, y)
     return ok
-
-
-def move_first_rank_y_then_x(rank_name="季军"):
-    """圆弧后首个名次点衔接：先真实走到目标 Y，再横移到目标 X。"""
-    _letter, target_x, target_y, _arm_state, _sync_x, _sync_y = RANK_PLACE_POINTS[rank_name]
-    print(
-        f"  [AB] {rank_name}前置实走: "
-        f"先 Y {_CUR_Y:.4f}->{target_y:.4f}, 再 X {_CUR_X:.4f}->{target_x:.4f}"
-    )
-    return path_to(target_x, target_y, label=f"{rank_name}前置Y->X", x_first=False)
 
 
 def arc_with_waypoints(r, dir_, sweep_deg, on_waypoints):
@@ -363,6 +292,8 @@ def place_rank_with_ring(rank_name, move_to_target=True):
     back_ok = comm.body_pos_move(0.0, -RANK_RING_BACK_MM, timeout=RANK_RING_BACK_TIMEOUT_S)
     if not back_ok:
         print(f"  [WARN] {rank_name} BODY_POS 后退未确认完成；不重发，继续同步到后退坐标")
+    print(f"  BODY_POS 后退完成，等待 {BODY_POS_POST_SETTLE_S:.2f}s 后同步坐标")
+    time.sleep(BODY_POS_POST_SETTLE_S)
     return sync_pose(sync_x, sync_y, None)
 
 
@@ -397,9 +328,11 @@ def run_task_ab():
     if not comm.use_encoder_yaw(timeout=2.0):
         raise RuntimeError("A/B yaw源切到编码器失败")
 
-    # 1. 起步直接把当前位置同步为扫码点，减少前置移动等待。
+    # 1. 起步先同步当前位置，再沿当前90°朝向前进10cm到扫码点。
     if not sync_pose(0.7, 0.25, INIT_YAW_D):
         raise RuntimeError("初始位姿同步失败")
+    if not go_to(0.80, 0.25):
+        raise RuntimeError("开局前进 10cm 到扫码点失败")
 
     # 2. QR2 识别 1->2->3 三个位置上的 ABC 摆放顺序
     seq2 = qr2.recognize(timeout=QR2_RECOGNIZE_TIMEOUT_S)  # 例: "CAB"
@@ -415,15 +348,15 @@ def run_task_ab():
         f"(B=0, A=1, C=2)"
     )
 
-    # 3. 扫码完成后先同步进入取放状态，并让转盘切到第一个经过的位置 3；随后前进10cm再进圆弧。
+    # 3. 扫码完成后先同步进入取放状态，并让转盘切到第一个经过的位置 3；随后前进5cm再进圆弧。
     first_slot = collect_slots[0]
     first_letter = collect_letters[0]
-    print(f"  [圆弧预置位置 {ARC_PRELOAD_POSITION}] 先下发ARM1+转盘槽位 {first_slot} ({first_letter})，同时前进10cm")
+    print(f"  [圆弧预置位置 {ARC_PRELOAD_POSITION}] 先下发ARM1+转盘槽位 {first_slot} ({first_letter})，同时前进5cm")
     arm_and_rotate_async(1, first_slot)
 
-    # 扫码完成后按当前初始朝向 90° 前进 10cm：即 X 增加 0.10m，再开始 A/B 圆弧。
-    if not go_to(0.80, 0.25):
-        raise RuntimeError("扫码后前进 10cm 失败")
+    # 扫码完成后进入 A/B 圆弧前目标点。
+    if not go_to(0.80, 0.20):
+        raise RuntimeError("扫码后进入圆弧前目标点失败")
 
     arc_r = 0.84
     arc_dir = -1

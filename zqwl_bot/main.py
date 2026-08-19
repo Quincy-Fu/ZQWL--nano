@@ -6,6 +6,7 @@ main.py - C/D 物块放置 + A/B 奖杯放置整合入口
 运行方式：
   python main.py
   python main.py /dev/ttyCH341USB1
+  python main.py --autorun --headless  # 开机自启动服务使用：循环等待实体 RUN
   python main.py --no-run          # 调试用：不等待实体 RUN 开关
   python main.py --no-preflight    # 跳过等待 RUN 前的摄像头预检
   python main.py /dev/ttyCH341USB1 --no-run
@@ -38,9 +39,13 @@ BAUDRATE = 115200
 RUN_ARG_SET = {"run", "--run", "wait-run", "--wait-run"}
 NO_RUN_ARGS = {"no-run", "--no-run", "skip-run", "--skip-run"}
 NO_PREFLIGHT_ARGS = {"no-preflight", "--no-preflight", "skip-preflight", "--skip-preflight"}
+AUTORUN_ARGS = {"autorun", "--autorun", "loop", "--loop", "service", "--service"}
+HEADLESS_ARGS = {"headless", "--headless", "no-window", "--no-window"}
 RUN_QUERY_TIMEOUT = 0.7
 RUN_QUERY_INTERVAL = 0.2
 RUN_WAIT_NOTICE_INTERVAL = 5.0
+RUN_RELEASE_CONFIRM_COUNT = 3
+CYCLE_RESTART_DELAY_S = 0.5
 PREFLIGHT_BLOCK_TIMEOUT_S = 2.5
 RUN_BLOCK_KEEPALIVE_INTERVAL = 1.5
 BASE_DIR = Path(__file__).resolve().parent
@@ -68,13 +73,36 @@ def _need_preflight(argv: list[str]) -> bool:
     return not any(arg.lower() in NO_PREFLIGHT_ARGS for arg in argv)
 
 
+def _is_autorun(argv: list[str]) -> bool:
+    """systemd 开机自启动模式：常驻循环等待 RUN。"""
+    return any(arg.lower() in AUTORUN_ARGS for arg in argv)
+
+
+def _is_headless(argv: list[str]) -> bool:
+    """无显示窗口模式，用于 systemd 开机自启动。"""
+    env = os.environ.get("ZQWL_HEADLESS", "").strip().lower()
+    if env in {"1", "true", "yes", "on"}:
+        return True
+    return any(arg.lower() in HEADLESS_ARGS for arg in argv)
+
+
 def _port_arg(argv: list[str]) -> Optional[str]:
     """命令行里除 RUN 控制参数之外的第一个参数视为串口；没有则自动匹配。"""
     for arg in argv:
-        if arg.lower() in RUN_ARG_SET or arg.lower() in NO_RUN_ARGS or arg.lower() in NO_PREFLIGHT_ARGS:
+        if (arg.lower() in RUN_ARG_SET or arg.lower() in NO_RUN_ARGS or
+                arg.lower() in NO_PREFLIGHT_ARGS or arg.lower() in AUTORUN_ARGS or
+                arg.lower() in HEADLESS_ARGS):
             continue
         return arg
     return None
+
+
+def _apply_runtime_mode(argv: list[str]) -> None:
+    """根据启动参数设置运行模式；自启动默认不打开 OpenCV 窗口。"""
+    if _is_headless(argv) or _is_autorun(argv):
+        os.environ["ZQWL_HEADLESS"] = "1"
+        block.CONFIG["show_window"] = False
+        print("[MAIN] headless模式：关闭调试窗口，只保留识别逻辑。")
 
 
 def _preflight_item(name: str, func) -> bool:
@@ -90,7 +118,7 @@ def _preflight_item(name: str, func) -> bool:
 
 def _preflight_block_usb() -> bool:
     """打开 block USB 摄像头拿有效帧，并保持热启动直到 RUN 后正式识别。"""
-    block.CONFIG["show_window"] = True
+    block.CONFIG["show_window"] = os.environ.get("ZQWL_HEADLESS") not in {"1", "true", "yes", "on"}
     block.set_status("RUN 前预热: block USB 保持打开")
     return bool(block.wait_until_ready(timeout_s=PREFLIGHT_BLOCK_TIMEOUT_S))
 
@@ -151,6 +179,45 @@ def _wait_run_start_if_requested(argv: list[str]) -> None:
         time.sleep(RUN_QUERY_INTERVAL)
 
 
+def _wait_run_release_if_requested(argv: list[str]) -> None:
+    """一轮结束/异常后等待 RUN 变低，避免 RUN 一直高电平导致立即重复跑。"""
+    if not _need_run_gate(argv):
+        return
+    print("[MAIN] 等待 RUN 关闭：RUN 低电平后进入下一轮待机。")
+    last_notice = time.monotonic()
+    low_count = 0
+    while True:
+        if comm.run(RUN_QUERY_TIMEOUT):
+            low_count = 0
+        else:
+            low_count += 1
+            if low_count >= RUN_RELEASE_CONFIRM_COUNT:
+                print("[MAIN] RUN 已关闭，重新进入待机。")
+                return
+        now = time.monotonic()
+        if now - last_notice >= RUN_WAIT_NOTICE_INTERVAL:
+            print("[MAIN] 仍在等待 RUN 关闭；关闭后可再次按 RUN 启动。")
+            last_notice = now
+        time.sleep(RUN_QUERY_INTERVAL)
+
+
+def _cleanup_cycle_vision(comm_started: bool) -> None:
+    """单轮结束后释放视觉资源，但保留串口，便于继续等待下一次 RUN。"""
+    if comm_started:
+        try:
+            comm.light(4, False, timeout=2.0)
+        except Exception as exc:
+            print(f"[清理] light 4 off failed: {exc}")
+    try:
+        block.close()
+    except Exception as exc:
+        print(f"[清理] block camera close failed: {exc}")
+    try:
+        ring.close()
+    except Exception as exc:
+        print(f"[清理] ring camera close failed: {exc}")
+
+
 def _cleanup(comm_started: bool) -> None:
     if comm_started:
         try:
@@ -203,6 +270,7 @@ def run_all() -> None:
 
 def main() -> int:
     argv = sys.argv[1:]
+    _apply_runtime_mode(argv)
     port = _port_arg(argv)
     comm_started = False
     exit_code = 0
@@ -214,8 +282,33 @@ def main() -> int:
         ring.configure({"comm_port": port, "comm_baud": BAUDRATE})
         time.sleep(1.0)
 
-        _wait_run_start_if_requested(argv)
-        run_all()
+        if _is_autorun(argv) and _need_run_gate(argv):
+            cycle = 0
+            while True:
+                cycle += 1
+                cycle_ok = False
+                try:
+                    print(f"\n=== MAIN AUTORUN: 等待第 {cycle} 轮 RUN ===")
+                    _wait_run_start_if_requested(argv)
+                    run_all()
+                    print(f"[MAIN] 第 {cycle} 轮完成。")
+                    cycle_ok = True
+                except RuntimeError as exc:
+                    print(f"\n[兜底] 第 {cycle} 轮主流程中断: {exc}")
+                except Exception as exc:
+                    print(f"\n[兜底] 第 {cycle} 轮出现未预期异常: {exc}")
+                finally:
+                    _cleanup_cycle_vision(comm_started)
+
+                if not cycle_ok:
+                    print("[MAIN] 自启动模式本轮异常，退出当前 main.py，由 systemd 重新拉起。")
+                    return 1
+
+                _wait_run_release_if_requested(argv)
+                time.sleep(CYCLE_RESTART_DELAY_S)
+        else:
+            _wait_run_start_if_requested(argv)
+            run_all()
     except RuntimeError as exc:
         exit_code = 1
         print(f"\n[兜底] 主流程中断: {exc}")

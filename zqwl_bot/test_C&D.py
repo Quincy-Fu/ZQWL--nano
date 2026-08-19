@@ -128,12 +128,14 @@ TARGET_POINTS = {
     "B": (-0.430, 1.340),
     "C": ( 0.210, 1.620),
     "D": ( 0.330, 1.340),
-    "E": ( 0.820, 0.550),
+    "E": ( 0.820, 0.600),
 }
 RING_PUSH_FORWARD_M = 0.098
 CD_RING_BACK_SETTLE_S = 0.15
 CD_RING_BACK_ZERO_VEL_SETTLE_S = 0.08
 CD_RING_BODY_BACK_TIMEOUT_S = 45.0
+# BODY_POS 完成后给电机驱动器留出额外稳定时间，再同步理论坐标。
+BODY_POS_POST_SETTLE_S = 0.30
 RING_BACK_MM_BY_POINT = {
     "A": 200.0,
     "B": 200.0,
@@ -1132,6 +1134,8 @@ def ring_place_and_sync(name: str,
     back_ok = comm.body_pos_move(0.0, -back_mm, timeout=CD_RING_BODY_BACK_TIMEOUT_S)
     if not back_ok:
         print(f"  [WARN] {name} BODY_POS 后退未确认完成；不重发，继续同步到后退坐标")
+    print(f"  BODY_POS 后退完成，等待 {BODY_POS_POST_SETTLE_S:.2f}s 后同步坐标")
+    time.sleep(BODY_POS_POST_SETTLE_S)
     return sync_pose(back_sync_x, back_sync_y, None)
 
 
