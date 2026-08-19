@@ -106,12 +106,12 @@ HEADER = (0xAA, 0x55)
 
 # 辅助命令
 TYPE_CMD_VEL  = 0x01
-TYPE_POSE     = 0x02   # 下位机50Hz上报位姿, payload 12B [x(f32), y(f32), theta(f32,CW弧度,当前yaw源)]
-TYPE_ROTATE   = 0x03   # 转盘位置切换, payload 1B (0-4槽位, 5=324°特殊状态)
+TYPE_POSE     = 0x02   # 下位机50Hz上报位姿, payload 12B [x(f32), y(f32), theta(f32,CW弧度,编码器)]
+TYPE_ROTATE   = 0x03   # 转盘位置切换, payload 1B (0-4槽位, 5=36°特殊状态)
 TYPE_ARM      = 0x04   # 机械臂状态切换, payload 1B (0-7, 0=默认位)
 TYPE_LIGHT    = 0x05   # 补光灯控制, payload 2B [id, on_off] (id: 0=全部, 1-4=单灯, 4=PA3/TIM5)
-TYPE_RUN      = 0x06   # RUN状态查询, payload 空；下位机读取PD15实体开关
-TYPE_RUN_RESP = 0x07   # RUN状态响应, payload 1B status (1=PD15高电平)
+TYPE_RUN      = 0x06   # 启动命令(模拟按键PD15), payload 空
+TYPE_RUN_RESP = 0x07   # 启动响应, payload 1B status
 TYPE_ROTATE_RESP = 0x08   # 转盘响应(估算移动时间后), payload 1B status
 TYPE_ARM_RESP    = 0x09   # 机械臂响应, payload 1B status
 TYPE_LIGHT_RESP  = 0x0A   # 补光灯响应, payload 1B status
@@ -160,13 +160,6 @@ TYPE_CMD_ARC_ROTATE      = 0x2F   # PC->MCU: 圆弧 + 3个转盘触发点
 TYPE_CMD_ARC_ROTATE_RESP = 0x30   # MCU->PC: payload 1B status
 TYPE_CMD_BODY_POS_MOVE   = 0x31   # PC->MCU: 车体坐标开环相对位移 dx_mm/dy_mm
 TYPE_CMD_BODY_POS_RESP   = 0x32   # MCU->PC: payload 1B status (估算到位)
-TYPE_CMD_CD_FIXED_ARC    = 0x33   # PC->MCU: C/D专用固定连续段, payload空
-TYPE_CMD_CD_FIXED_ARC_RESP = 0x34 # MCU->PC: payload 1B status
-TYPE_CMD_YAW_SOURCE      = 0x35   # PC->MCU: payload 1B, 0=编码器, 1=IMU优先
-TYPE_CMD_YAW_SOURCE_RESP = 0x36   # MCU->PC: payload 1B status
-
-YAW_SOURCE_ENCODER = 0
-YAW_SOURCE_IMU = 1
 
 ROTATE_STATE_SPECIAL_36 = 5
 ROTATE_STATE_MAX = ROTATE_STATE_SPECIAL_36
@@ -190,8 +183,6 @@ _NAV_RESP_TYPES = frozenset({
     TYPE_CMD_IMU_CALIB_RESP,
     TYPE_CMD_ARC_ROTATE_RESP,
     TYPE_CMD_BODY_POS_RESP,
-    TYPE_CMD_CD_FIXED_ARC_RESP,
-    TYPE_CMD_YAW_SOURCE_RESP,
 })
 
 FRAME_OVERHEAD = 2 + 1 + 1 + 2  # header + type + len + crc16
@@ -294,7 +285,7 @@ class SerialComm:
         if not self._ser:
             raise RuntimeError("serial not started")
         if not (0 <= pos <= ROTATE_STATE_MAX):
-            raise ValueError("rotate pos must be 0-5 (0-4 slots, 5=324deg special)")
+            raise ValueError("rotate pos must be 0-5 (0-4 slots, 5=36deg special)")
         seen = self._mark_send()
         frame = pack_frame(TYPE_ROTATE, struct.pack("<B", pos))
         repeat_n = max(1, int(repeats))
@@ -331,14 +322,6 @@ class SerialComm:
         if not self._ser:
             raise RuntimeError("serial not started")
         self._send_nav(TYPE_CMD_IMU_CALIB, b"")
-
-    def send_yaw_source(self, source: int) -> None:
-        """切换下位机 yaw 反馈源: 0=编码器, 1=IMU优先。"""
-        if not self._ser:
-            raise RuntimeError("serial not started")
-        if source not in (YAW_SOURCE_ENCODER, YAW_SOURCE_IMU):
-            raise ValueError("yaw source must be 0(encoder) or 1(imu)")
-        self._send_nav(TYPE_CMD_YAW_SOURCE, struct.pack("<B", source))
 
     def send_light(self, light_id: int, on: bool) -> None:
         if not self._ser:
@@ -449,7 +432,7 @@ class SerialComm:
         for deg, slot in triggers:
             self._check_finite(float(deg))
             if not (0 <= int(slot) <= ROTATE_STATE_MAX):
-                raise ValueError(f"rotate state must be 0-5 (0-4 slots, 5=324deg special), got {slot}")
+                raise ValueError(f"rotate state must be 0-5 (0-4 slots, 5=36deg special), got {slot}")
             vals.append((float(deg), int(slot)))
         self._send_nav(
             TYPE_CMD_ARC_ROTATE,
@@ -465,10 +448,6 @@ class SerialComm:
         """发送开环车体相对位移命令，单位 mm，+X 右移，+Y 前进。"""
         self._check_finite(dx_mm, dy_mm)
         self._send_nav(TYPE_CMD_BODY_POS_MOVE, struct.pack("<ff", dx_mm, dy_mm))
-
-    def send_cd_fixed_arc(self) -> None:
-        """发送 C/D 专用固定连续段命令，payload 为空。"""
-        self._send_nav(TYPE_CMD_CD_FIXED_ARC, b"")
 
     def send_sync_pose(self, x: float, y: float, yaw_deg: float | None = None) -> None:
         """同步下位机里程计坐标。
@@ -847,19 +826,14 @@ class SerialComm:
         self.send_body_pos_move(dx_mm, dy_mm)
         return self.wait_for(TYPE_CMD_BODY_POS_RESP, timeout)
 
-    def cd_fixed_arc(self, timeout: float = 18.0) -> bool:
-        """C/D 专用固定连续段：识别后直接连贯过渡到圆弧结束。"""
-        self.send_cd_fixed_arc()
-        return self.wait_for(TYPE_CMD_CD_FIXED_ARC_RESP, timeout)
-
     def run(self, timeout: float = 5.0) -> bool:
-        """查询实体 RUN 开关状态。
+        """启动命令 (模拟按下启动按键).
 
-        下位机收到后读取 PD15：低电平=未按下，高电平=已按下，
-        并回 TYPE_RUN_RESP status。main.py 会轮询该状态作为全流程启动门。
+        下位机收到后 PD15 拉高 500ms 再释放 (默认低电平=未开始),
+        执行完回 TYPE_RUN_RESP status=1. 阻塞等待响应.
 
         Returns:
-            True = PD15 为高电平; 超时/低电平/异常响应返回 False.
+            True = 启动脉冲已执行; 超时/异常响应返回 False.
         """
         self.send_run()
         return self.wait_for(TYPE_RUN_RESP, timeout)
@@ -882,14 +856,9 @@ class SerialComm:
         self.send_imu_calib()
         return self.wait_for(TYPE_CMD_IMU_CALIB_RESP, timeout)
 
-    def yaw_source(self, source: int, timeout: float = 2.0) -> bool:
-        """阻塞式切换 yaw 反馈源: 0=编码器, 1=IMU优先。"""
-        self.send_yaw_source(source)
-        return self.wait_for(TYPE_CMD_YAW_SOURCE_RESP, timeout)
-
     def rotate(self, pos: int, timeout: float = 10.0,
                retries: int = 1, retry_delay_s: float = 0.20) -> bool:
-        """转盘切状态 (0-4为槽位, 5为324°特殊状态), 阻塞等待 TYPE_ROTATE_RESP.
+        """转盘切状态 (0-4为槽位, 5为36°特殊状态), 阻塞等待 TYPE_ROTATE_RESP.
 
         下位机收到后移动转盘, 按估算移动时间等待后回响应 (status=1).
         注: 下位机只发不收 CAN, 响应代表"命令已执行+估算时间已到",
@@ -993,7 +962,7 @@ class SerialComm:
         elif msg_type == TYPE_POSE and len(payload) >= 12:
             x, y, theta_rad = struct.unpack("<fff", payload[:12])
             yaw = math.degrees(theta_rad)
-            # 下位机 move_yaw 内部是累加值(不解卷), 防御性归一到 (-180, 180],
+            # 下位机 move_yaw(编码器) 内部是累加值(不解卷), 防御性归一到 (-180, 180],
             # 避免位姿显示出现 540/720 累加 (新固件已在MCU侧归一)
             yaw = (yaw + 180.0) % 360.0 - 180.0
             with self._lock:
@@ -1008,7 +977,7 @@ class SerialComm:
         Args:
             max_age: 帧龄上限 s, 超过视为通信中断.
         Returns:
-            (x, y, yaw_deg): x/y 米, yaw 度 CW+ (当前yaw源, 与命令约定一致);
+            (x, y, yaw_deg): x/y 米, yaw 度 CW+ (编码器里程计, 与命令约定一致);
             从未收到帧或帧过旧返回 None.
         """
         with self._lock:
@@ -1190,11 +1159,6 @@ def send_imu_calib() -> None:
         raise RuntimeError("serial not initialized, call init() first")
     _comm.send_imu_calib()
 
-def send_yaw_source(source: int) -> None:
-    if _comm is None:
-        raise RuntimeError("serial not initialized, call init() first")
-    _comm.send_yaw_source(source)
-
 def wait_nav_response(timeout: float = 30.0) -> tuple[int, int] | None:
     if _comm is None:
         return None
@@ -1293,18 +1257,6 @@ def imu_calib(timeout: float = 12.0) -> bool:
         raise RuntimeError("serial not initialized, call init() first")
     return _comm.imu_calib(timeout)
 
-def yaw_source(source: int, timeout: float = 2.0) -> bool:
-    """切换下位机 yaw 反馈源: YAW_SOURCE_ENCODER / YAW_SOURCE_IMU。"""
-    if _comm is None:
-        raise RuntimeError("serial not initialized, call init() first")
-    return _comm.yaw_source(source, timeout)
-
-def use_encoder_yaw(timeout: float = 2.0) -> bool:
-    return yaw_source(YAW_SOURCE_ENCODER, timeout)
-
-def use_imu_yaw(timeout: float = 2.0) -> bool:
-    return yaw_source(YAW_SOURCE_IMU, timeout)
-
 def turnto(yaw_deg: float, timeout: float = 20.0) -> bool:
     if _comm is None:
         raise RuntimeError("serial not initialized, call init() first")
@@ -1336,12 +1288,6 @@ def vision_correct(dx_mm: float, dy_mm: float,
     if _comm is None:
         raise RuntimeError("serial not initialized, call init() first")
     return _comm.vision_correct(dx_mm, dy_mm, target_x, target_y, timeout)
-
-def cd_fixed_arc(timeout: float = 18.0) -> bool:
-    """C/D 专用固定连续段：下位机写死速度表，payload 为空。"""
-    if _comm is None:
-        raise RuntimeError("serial not initialized, call init() first")
-    return _comm.cd_fixed_arc(timeout)
 
 
 # --- 自检 ---
@@ -1532,7 +1478,7 @@ def _self_check() -> None:
     assert c.run()
     assert c._ser.written[-1] == pack_frame(TYPE_RUN, b"")
 
-    # 6.9 send_rotate 范围校验: 0-5 合法(5=324°特殊状态), 越界抛 ValueError
+    # 6.9 send_rotate 范围校验: 0-5 合法(5=36°特殊状态), 越界抛 ValueError
     c.send_rotate(4)
     assert c._ser.written[-1] == pack_frame(TYPE_ROTATE, struct.pack("<B", 4))
     c.send_rotate(5)

@@ -11,6 +11,11 @@ import os
 import time
 import logging
 import threading
+
+# 必须在 cv2 首次导入前设置；本文件通常早于 block/ring 被导入。
+os.environ.setdefault("OPENCV_VIDEOIO_V4L_SELECT_TIMEOUT", "1")
+os.environ.setdefault("OPENCV_VIDEOIO_V4L_READ_ATTEMPTS", "1")
+
 import cv2
 import numpy as np
 
@@ -39,6 +44,28 @@ WB_GAIN = np.array([[1.047, 0, 0], [0, 1.0, 0], [0, 0, 0.952]], dtype=np.float32
 ROI_W, ROI_H = 960, 540
 ROI_OFFSET_X = (1920 - ROI_W) // 2
 ROI_OFFSET_Y = (1080 - ROI_H) // 2
+
+CSI_START_VERIFY_TIMEOUT_S = 2.0
+CSI_NO_FRAME_RESTART_S = 0.8
+CSI_NO_DETECT_RESTART_S = 3.0
+CSI_MAX_RESTARTS = 3
+CSI_RESTART_SLEEP_S = 0.25
+
+
+def _frame_is_valid(frame) -> bool:
+    """判断 CSI 帧是否有效；防止管线已启动但实际无画面/黑屏。"""
+    if frame is None:
+        return False
+    if getattr(frame, "size", 0) <= 0:
+        return False
+    try:
+        mean_v = float(np.mean(frame))
+        std_v = float(np.std(frame))
+    except Exception:
+        return False
+    if mean_v < 5.0:
+        return False
+    return not (mean_v < 25.0 and std_v < 1.0)
 
 # 数字 1-6 -> 3 字母顺序 (按规则文档核对!)
 QR2_NUM_TO_LETTERS = {
@@ -93,8 +120,10 @@ class QRDetector:
     def _try_detect(self, img):
         if self.det_type == "wechat":
             results, _ = self.det.detectAndDecode(img)
-            if results and results[0]:
-                return results[0]
+            if results:
+                for data in results:
+                    if data:
+                        return data
         else:
             data, _, _ = self.det.detectAndDecode(img)
             if data:
@@ -114,6 +143,15 @@ class CSICamera:
             raise RuntimeError("CSI 启动失败")
         self.sink = self.pipe.get_by_name("sink")
         log.info("CSI 启动成功")
+
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < CSI_START_VERIFY_TIMEOUT_S:
+            frame = self.read()
+            if _frame_is_valid(frame):
+                return
+            time.sleep(0.03)
+        self.stop(async_stop=False)
+        raise RuntimeError("CSI 启动后未读到有效画面，疑似黑屏/Argus卡住")
 
     def read(self):
         if self.sink is None:
@@ -153,6 +191,24 @@ class CSICamera:
             _stop_pipe()
 
 
+def _start_csi_with_retries(label: str = "QR2") -> CSICamera:
+    """启动 CSI 并验证首帧；失败时释放后重试，避免黑屏管线继续跑。"""
+    last_error = None
+    for idx in range(CSI_MAX_RESTARTS + 1):
+        cam = CSICamera()
+        try:
+            cam.start()
+            if idx > 0:
+                print(f"[{label}] CSI 重启成功: {idx}/{CSI_MAX_RESTARTS}", flush=True)
+            return cam
+        except Exception as exc:
+            last_error = exc
+            print(f"[{label}] CSI 启动/首帧验证失败: {exc}，重试 {idx + 1}/{CSI_MAX_RESTARTS + 1}", flush=True)
+            cam.stop(async_stop=False)
+            time.sleep(CSI_RESTART_SLEEP_S)
+    raise RuntimeError(f"{label}: CSI 多次启动失败: {last_error}")
+
+
 def _is_valid_num(data: str) -> bool:
     """检查是否是 1-6 的数字字符串"""
     if not data or len(data) != 1:
@@ -169,25 +225,38 @@ def _set_light(light_id: int, on: bool) -> None:
         pass
 
 
-def recognize(timeout: float = 3.0) -> str:
-    """识别数字 1-6, 查表返回 3 字母顺序 ('CAB' 这种). 超时抛 RuntimeError."""
-    cam = CSICamera()
+def recognize(timeout: float = 10.0) -> str:
+    """识别数字 1-6, 查表返回 3 字母顺序 ('CAB' 这种). 超时抛 RuntimeError。"""
     t_start = time.monotonic()
-    cam.start()
-    detector = QRDetector(MODEL_DIR)
     log.info("[QR2] 开补光灯 3")
     _set_light(3, True)
+    cam = None
     try:
+        cam = _start_csi_with_retries("QR2")
+        detector = QRDetector(MODEL_DIR)
         t0 = time.time()
         attempts = 0
+        restart_count = 0
+        last_frame_time = time.time()
+        last_detect_activity_time = time.time()
         while time.time() - t0 < timeout:
             frame = cam.read()
-            if frame is None:
+            now = time.time()
+            if not _frame_is_valid(frame):
+                if now - last_frame_time >= CSI_NO_FRAME_RESTART_S and restart_count < CSI_MAX_RESTARTS:
+                    restart_count += 1
+                    print(f"[QR2] CSI 无有效帧 {now - last_frame_time:.1f}s，重启管线 {restart_count}/{CSI_MAX_RESTARTS}", flush=True)
+                    cam.stop(async_stop=False)
+                    cam = _start_csi_with_retries("QR2")
+                    last_frame_time = time.time()
+                time.sleep(0.02)
                 continue
+            last_frame_time = now
             attempts += 1
             data = detector.detect(frame)
 
             if data:
+                last_detect_activity_time = now
                 log.info(f"  [QR2] 扫到: '{data}' (尝试 {attempts} 次)")
                 if _is_valid_num(data):
                     letters = QR2_NUM_TO_LETTERS[data]
@@ -198,9 +267,18 @@ def recognize(timeout: float = 3.0) -> str:
                     return letters
                 else:
                     log.info(f"  [QR2] '{data}' 不在 1-6, 跳过")
+            elif now - last_detect_activity_time >= CSI_NO_DETECT_RESTART_S and restart_count < CSI_MAX_RESTARTS:
+                restart_count += 1
+                print(f"[QR2] 有有效画面但 {CSI_NO_DETECT_RESTART_S:.1f}s 未扫到二维码，重启管线 {restart_count}/{CSI_MAX_RESTARTS}", flush=True)
+                cam.stop(async_stop=False)
+                cam = _start_csi_with_retries("QR2")
+                last_frame_time = time.time()
+                last_detect_activity_time = time.time()
+                continue
 
-            if attempts % 20 == 0:
+            if attempts % 40 == 0:
                 log.info(f"  [QR2] 已尝试 {attempts} 次, 未扫到合法二维码")
+                print(f"[QR2] 有有效画面，已尝试 {attempts} 帧，未扫到合法二维码", flush=True)
             time.sleep(0.05)
         raise RuntimeError(f"QR2: {timeout}s 内未识别到合法二维码 (1-6)")
     finally:
@@ -209,27 +287,40 @@ def recognize(timeout: float = 3.0) -> str:
         dt_light = time.monotonic() - t_cleanup
         log.info("[QR2 timing] light off %.3fs", dt_light)
         print(f"[QR2 timing] light off {dt_light:.3f}s", flush=True)
-        cam.stop(async_stop=True)
+        if cam is not None:
+            cam.stop(async_stop=True)
         dt_cleanup = time.monotonic() - t_cleanup
         log.info("[QR2 timing] return after cleanup %.3fs", dt_cleanup)
         print(f"[QR2 timing] return after cleanup {dt_cleanup:.3f}s", flush=True)
 
-
 def recognize_with_preview(timeout: float = 30.0) -> str:
     """带实时预览 - 调试用, 按 q 提前退出."""
-    cam = CSICamera()
-    cam.start()
-    detector = QRDetector(MODEL_DIR)
-    cv2.namedWindow("QR2 Preview", cv2.WINDOW_NORMAL)
     log.info("[QR2] 开补光灯 3")
     _set_light(3, True)
+    cam = None
     try:
+        cam = _start_csi_with_retries("QR2-preview")
+        detector = QRDetector(MODEL_DIR)
+        cv2.namedWindow("QR2 Preview", cv2.WINDOW_NORMAL)
         t0 = time.time()
         attempts = 0
+        restart_count = 0
+        last_frame_time = time.time()
+        last_detect_activity_time = time.time()
         while time.time() - t0 < timeout:
             frame = cam.read()
-            if frame is None:
+            now = time.time()
+            if not _frame_is_valid(frame):
+                if now - last_frame_time >= CSI_NO_FRAME_RESTART_S and restart_count < CSI_MAX_RESTARTS:
+                    restart_count += 1
+                    print(f"[QR2-preview] CSI 无有效帧 {now - last_frame_time:.1f}s，重启管线 {restart_count}/{CSI_MAX_RESTARTS}", flush=True)
+                    cam.stop(async_stop=False)
+                    cam = _start_csi_with_retries("QR2-preview")
+                    last_frame_time = time.time()
+                    last_detect_activity_time = time.time()
+                time.sleep(0.02)
                 continue
+            last_frame_time = now
             attempts += 1
             data = detector.detect(frame)
             display = frame.copy()
@@ -239,6 +330,7 @@ def recognize_with_preview(timeout: float = 30.0) -> str:
                          (255, 0, 0), 2)
 
             if data:
+                last_detect_activity_time = now
                 cv2.putText(display, f"识别: '{data}'", (50, 80),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
                 if _is_valid_num(data):
@@ -251,6 +343,14 @@ def recognize_with_preview(timeout: float = 30.0) -> str:
             else:
                 cv2.putText(display, f"请对准 (尝试 {attempts})", (50, 80),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 2)
+                if now - last_detect_activity_time >= CSI_NO_DETECT_RESTART_S and restart_count < CSI_MAX_RESTARTS:
+                    restart_count += 1
+                    print(f"[QR2-preview] 有有效画面但 {CSI_NO_DETECT_RESTART_S:.1f}s 未扫到二维码，重启管线 {restart_count}/{CSI_MAX_RESTARTS}", flush=True)
+                    cam.stop(async_stop=False)
+                    cam = _start_csi_with_retries("QR2-preview")
+                    last_frame_time = time.time()
+                    last_detect_activity_time = time.time()
+                    continue
 
             cv2.imshow("QR2 Preview", display)
             key = cv2.waitKey(1) & 0xFF
@@ -260,7 +360,8 @@ def recognize_with_preview(timeout: float = 30.0) -> str:
         raise RuntimeError(f"QR2: {timeout}s 内未识别")
     finally:
         _set_light(3, False)
-        cam.stop()
+        if cam is not None:
+            cam.stop()
         cv2.destroyAllWindows()
 
 

@@ -118,11 +118,14 @@ RING_TEST_CONFIG = {
     "detect_min_hits": 2,
     "detect_timeout_s": 1.2,
     "fine_move_max_step_mm": 30.0,
-    "align_tolerance_mm": 2.0,
+    "align_tolerance_mm": 3.0,
     "max_align_iterations": 10,
     "checked_align_max_moves": 6,
-    "post_align_offset_y_mm": 105,
-    "post_align_back_y_mm": 200,
+    "align_detect_retry_count": 4,
+    "align_detect_retry_sleep_s": 0.15,
+    "push_move_timeout_s": 35.0,
+    "back_move_timeout_s": 45.0,
+    # 推送/后退距离只在 ring.py 的 CONFIG 里配置，避免测试入口覆盖后看起来“改了没生效”。
     "auto_forward_after_align": False,
 
     # 摄像头安装方向必须现场确认；预览界面可用 X/Y/S 热键临时翻转。
@@ -143,6 +146,10 @@ def configure_ring_for_test(usb_device=None, usb_devices=None, port=None):
         ring.configure_usb(device=usb_device, devices=usb_devices)
     if port is not None:
         ring.CONFIG["comm_port"] = port
+    print(
+        f"[test_ring] 推送距离: forward={ring.CONFIG['post_align_offset_y_mm']}mm, "
+        f"back={ring.CONFIG['post_align_back_y_mm']}mm"
+    )
 
 
 def _run_mapping_selftest():

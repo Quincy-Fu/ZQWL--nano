@@ -12,6 +12,19 @@ main 里用法:
     ring.close()                  # 退出时
 """
 
+import glob
+import math
+import os
+import re
+import sys
+import threading
+import time
+import comm
+
+# 必须在 cv2 首次导入前设置；否则 USB 摄像头异常时 V4L2 select 可能一次卡约 10 秒。
+os.environ.setdefault("OPENCV_VIDEOIO_V4L_SELECT_TIMEOUT", "1")
+os.environ.setdefault("OPENCV_VIDEOIO_V4L_READ_ATTEMPTS", "1")
+
 try:
     import cv2
 except ModuleNotFoundError:
@@ -20,12 +33,6 @@ try:
     import numpy as np
 except ModuleNotFoundError:
     np = None
-import glob
-import os
-import re
-import sys
-import time
-import comm
 
 
 CONFIG = {
@@ -34,6 +41,14 @@ CONFIG = {
     "width": 640,
     "height": 480,
     "fps": 30,
+    "usb_open_verify_frames": 1,
+    "usb_black_mean_min": 5.0,
+    "usb_dark_uniform_mean_max": 25.0,
+    "usb_dark_uniform_std_min": 1.0,
+    "device_retry_cooldown_s": 8.0,
+    "camera_read_timeout_s": 0.12,
+    "camera_stale_timeout_s": 1.0,
+    "camera_no_frame_reopen_s": 1.2,
 
     # 黑线不是靠单一黑度阈值抠出来，而是靠“局部暗线 + 边缘 + 同心几何”联合判断。
     "evidence_percentile": 88,
@@ -118,13 +133,24 @@ CONFIG = {
     "otsu_smooth_n": 3,
     "consistency_max_diff": 80,
     "last_known_max_age_s": 3.0,
+    "camera_warmup_frames": 5,
+    "camera_warmup_timeout_s": 1.2,
 
     "dead_zone_px": 0,
-    "align_tolerance_mm": 2.0,
+    "align_tolerance_mm": 3.0,
+    "align_tolerance_x_mm": 2.0,
+    "align_tolerance_y_mm": 2.0,
     "max_align_iterations": 10,
     "checked_align_max_moves": 6,
+    "align_detect_retry_count": 4,
+    "align_detect_retry_sleep_s": 0.15,
+    "align_confirm_frames": 2,
+    "align_confirm_sleep_s": 0.12,
     "post_fine_move_settle_s": 0.25,
     "correct_timeout_s": 20.0,
+    "push_move_timeout_s": 35.0,
+    "post_push_quiesce_s": 0.0,
+    "back_move_timeout_s": 45.0,
     "fine_move_max_step_mm": 30.0,
     "auto_forward_after_align": False,
     "camera_dx_sign": -1.0,
@@ -135,11 +161,15 @@ CONFIG = {
     "comm_port": "/dev/ttyCH341USB*",
     "comm_baud": 115200,
 
-    "recover_pose_age_max": 1.0,
+    "recover_pose_age_max": 5.0,
     "recover_max_retry": 3,
 
     "step1_to_step2_pause_s": 2.0,
-    "post_align_offset_y_mm": 105,
+    # 摄像头安装补偿：视觉圆心对准后，实测车身偏右，因此前推时额外向左 2mm。
+    # 车体坐标约定：+dx=右移，-dx=左移；该补偿只作用在对准后的固定前推动作。
+    "post_align_trim_dx_mm": -2.0,
+    "post_align_trim_dy_mm": 0.0,
+    "post_align_offset_y_mm": 97,
     "post_align_back_y_mm": 200,
     "step2_to_step3_pause_s": 2.0,
     "step3_back_offset_px": 500,
@@ -222,6 +252,10 @@ def validate_config():
         raise ValueError("detect_min_hits 不能大于 detect_frames")
     if int(CONFIG.get("checked_align_max_moves", 1)) < 1:
         raise ValueError("checked_align_max_moves 至少为 1")
+    if float(CONFIG.get("align_tolerance_x_mm", CONFIG.get("align_tolerance_mm", 0.0))) <= 0.0:
+        raise ValueError("align_tolerance_x_mm 必须为正数")
+    if float(CONFIG.get("align_tolerance_y_mm", CONFIG.get("align_tolerance_mm", 0.0))) <= 0.0:
+        raise ValueError("align_tolerance_y_mm 必须为正数")
     if float(CONFIG.get("post_align_offset_y_mm", 0.0)) <= 0.0:
         raise ValueError("post_align_offset_y_mm 必须为正数")
     if float(CONFIG.get("post_align_back_y_mm", 0.0)) < 0.0:
@@ -325,6 +359,25 @@ def _require_cv2():
 
 
 # ============ 摄像头 ============
+def _frame_is_valid(frame):
+    """判断摄像头帧是否有效；防止 isOpened=True 但实际黑屏/空帧。"""
+    if frame is None:
+        return False
+    if getattr(frame, "size", 0) <= 0:
+        return False
+    try:
+        mean_v = float(np.mean(frame))
+        std_v = float(np.std(frame))
+    except Exception:
+        return False
+    if mean_v < float(CONFIG.get("usb_black_mean_min", 5.0)):
+        return False
+    return not (
+        mean_v < float(CONFIG.get("usb_dark_uniform_mean_max", 25.0))
+        and std_v < float(CONFIG.get("usb_dark_uniform_std_min", 1.0))
+    )
+
+
 class USBCamera:
     def __init__(self, device=1, width=640, height=480, fps=30):
         self.device = device
@@ -332,6 +385,13 @@ class USBCamera:
         self.height = height
         self.fps = fps
         self.cap = None
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._latest_frame = None
+        self._latest_time = 0.0
+        self._started_time = 0.0
+        self._read_fail_count = 0
 
     def start(self):
         _require_cv2()
@@ -342,18 +402,72 @@ class USBCamera:
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if not self.cap.isOpened():
-            raise RuntimeError("无法打开USB摄像头")
+            self.stop()
+            raise RuntimeError(f"无法打开USB摄像头 device={self.device}")
 
-    def read(self):
-        if self.cap is None:
-            return None
-        ret, frame = self.cap.read()
-        return frame if ret else None
+        self._started_time = time.time()
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._reader_loop,
+                                        name=f"ring-usb-camera-{self.device}",
+                                        daemon=True)
+        self._thread.start()
+
+        verify_need = max(0, int(CONFIG.get("usb_open_verify_frames", 0)))
+        if verify_need > 0:
+            got = 0
+            verify_timeout = max(0.5, float(CONFIG.get("camera_read_timeout_s", 0.35)) * 3.0)
+            deadline = time.time() + verify_timeout
+            while got < verify_need and time.time() < deadline:
+                frame = self.read(timeout=0.05)
+                if frame is not None:
+                    got += 1
+                else:
+                    time.sleep(0.02)
+            if got <= 0:
+                print(f"[ring] USB摄像头 device={self.device} 已打开，但首帧尚未就绪，后台继续预热", flush=True)
+
+    def _reader_loop(self):
+        while not self._stop_event.is_set():
+            cap = self.cap
+            if cap is None:
+                break
+            ret, frame = cap.read()
+            if ret and _frame_is_valid(frame):
+                with self._lock:
+                    self._latest_frame = frame
+                    self._latest_time = time.time()
+                    self._read_fail_count = 0
+            else:
+                with self._lock:
+                    self._read_fail_count += 1
+                time.sleep(0.02)
+
+    def read(self, timeout=None):
+        if timeout is None:
+            timeout = float(CONFIG.get("camera_read_timeout_s", 0.35))
+        deadline = time.time() + max(0.0, float(timeout))
+        while True:
+            with self._lock:
+                frame = self._latest_frame
+                age = time.time() - self._latest_time if self._latest_time > 0.0 else float("inf")
+                if frame is not None and age <= float(CONFIG.get("camera_stale_timeout_s", 1.0)):
+                    return frame.copy()
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.01)
 
     def stop(self):
+        self._stop_event.set()
         if self.cap:
             self.cap.release()
             self.cap = None
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+        self._thread = None
+        with self._lock:
+            self._latest_frame = None
+            self._latest_time = 0.0
+            self._started_time = 0.0
 
 
 # ============ 圆环检测 ============
@@ -1616,41 +1730,136 @@ def _draw_debug(frame, result=None, candidates=None):
 
 # ============ 摄像头单例 ============
 _cam_cache = {"cam": None}
+_cam_lock = threading.RLock()
+_bad_devices = {}
 _last_known = {"result": None, "time": 0.0}
+_prepare_thread = None
+
+
+def _available_usb_devices():
+    """返回当前可尝试的 USB 设备；近期黑屏/读帧失败的设备短暂冷却。"""
+    now = time.time()
+    ordered = apply_usb_env()
+    available = []
+    for dev in ordered:
+        until = _bad_devices.get(dev, 0.0)
+        if until <= now:
+            _bad_devices.pop(dev, None)
+            available.append(dev)
+    if not available:
+        _bad_devices.clear()
+        available = ordered
+    return available
+
+
+def _drop_cam_locked(cam, reason):
+    """释放异常 USB 摄像头，下一次读帧会重新枚举 1/0。"""
+    if cam is None:
+        return
+    print(f"[ring] USB摄像头 device={cam.device} 异常: {reason}，准备重开/切换", flush=True)
+    _bad_devices[cam.device] = time.time() + float(CONFIG.get("device_retry_cooldown_s", 8.0))
+    if _cam_cache.get("cam") is cam:
+        try:
+            cam.stop()
+        finally:
+            _cam_cache["cam"] = None
+            _last_known["result"] = None
+            _last_known["time"] = 0.0
 
 
 def _get_cam():
-    if _cam_cache["cam"] is None:
-        ordered_devices = apply_usb_env()
-
-        last_error = None
-        for dev in ordered_devices:
-            cam = USBCamera(dev, CONFIG["width"], CONFIG["height"], CONFIG["fps"])
-            try:
-                cam.start()
-            except Exception as e:
-                last_error = e
-                continue
-            CONFIG["usb_device"] = dev
-            _cam_cache["cam"] = cam
-            print(f"[ring] USB摄像头已打开: device={dev}")
-            break
-
+    with _cam_lock:
         if _cam_cache["cam"] is None:
-            raise RuntimeError(f"无法打开USB摄像头，已尝试 {ordered_devices}: {last_error}")
-    return _cam_cache["cam"]
+            ordered_devices = _available_usb_devices()
+
+            last_error = None
+            for dev in ordered_devices:
+                cam = USBCamera(dev, CONFIG["width"], CONFIG["height"], CONFIG["fps"])
+                try:
+                    cam.start()
+                except Exception as e:
+                    last_error = e
+                    _bad_devices[dev] = time.time() + float(CONFIG.get("device_retry_cooldown_s", 8.0))
+                    continue
+                CONFIG["usb_device"] = dev
+                _cam_cache["cam"] = cam
+                print(f"[ring] USB摄像头已打开: device={dev}", flush=True)
+                break
+
+            if _cam_cache["cam"] is None:
+                raise RuntimeError(f"无法打开USB摄像头，已尝试 {ordered_devices}: {last_error}")
+        return _cam_cache["cam"]
+
+
+def _read_usb_frame():
+    """统一 USB 读帧入口；黑屏/读帧失败时释放并重新尝试 1/0。"""
+    attempts = max(1, len(apply_usb_env()))
+    for _ in range(attempts):
+        try:
+            with _cam_lock:
+                cam = _get_cam()
+                frame = cam.read()
+                if _frame_is_valid(frame):
+                    return frame
+                with cam._lock:
+                    no_frame_age = time.time() - cam._latest_time if cam._latest_time > 0.0 else time.time() - getattr(cam, "_started_time", time.time())
+                if no_frame_age < float(CONFIG.get("camera_no_frame_reopen_s", 20.0)):
+                    return None
+                _drop_cam_locked(cam, "读帧失败或黑屏")
+        except RuntimeError as exc:
+            print(f"[ring] USB摄像头读帧失败: {exc}", flush=True)
+        time.sleep(0.05)
+    return None
+
+
+def _warmup_usb_camera(verbose=False):
+    """定位前预读几帧，丢掉刚打开/刚切换 USB 后的黑屏、旧帧和曝光波动。"""
+    need = max(0, int(CONFIG.get("camera_warmup_frames", 0)))
+    if need <= 0:
+        return True
+    timeout = max(0.1, float(CONFIG.get("camera_warmup_timeout_s", 1.2)))
+    start = time.time()
+    got = 0
+    while got < need and (time.time() - start) < timeout:
+        frame = _read_usb_frame()
+        if frame is not None:
+            got += 1
+        else:
+            time.sleep(0.03)
+    if verbose and got < need:
+        print(f"  [WARN] ring 摄像头热身帧不足: {got}/{need}")
+    return got > 0
+
+
+def prepare_camera_async(verbose=True):
+    """后台预热 ring 摄像头，避免到放置点才打开 USB 导致等待。"""
+    global _prepare_thread
+
+    def worker():
+        try:
+            ok = _warmup_usb_camera(verbose=verbose)
+            if verbose:
+                print(f"[ring] 后台预热 {'OK' if ok else '未拿到足够帧，后续继续尝试'}", flush=True)
+        except Exception as exc:
+            if verbose:
+                print(f"[ring] 后台预热失败: {exc}", flush=True)
+
+    if _prepare_thread is not None and _prepare_thread.is_alive():
+        return
+    _prepare_thread = threading.Thread(target=worker, name="ring-camera-prewarm", daemon=True)
+    _prepare_thread.start()
 
 
 def detect():
-    cam = _get_cam()
     hits = []
     start = time.time()
     frames = CONFIG["detect_frames"]
     timeout = CONFIG["detect_timeout_s"]
 
     while len(hits) < frames and (time.time() - start) < timeout:
-        frame = cam.read()
+        frame = _read_usb_frame()
         if frame is None:
+            time.sleep(0.02)
             continue
         result = find_ring_center(frame)
         if result:
@@ -1729,6 +1938,11 @@ def detect():
 
 # ============ 自愈 ============
 def _is_comm_alive():
+    try:
+        if hasattr(comm, "is_started") and comm.is_started():
+            return True
+    except:
+        pass
     try:
         pose = comm.get_pose(max_age=CONFIG["recover_pose_age_max"])
         return pose is not None
@@ -1812,19 +2026,44 @@ def _safe_goto(target_x, target_y, timeout=20.0, max_retry=2):
         return False
 
 
-def _safe_fine_move(dx_mm, dy_mm, timeout=20.0, max_retry=2):
-    """发送下位机已有 dx/dy 微调命令，并等待到位反馈。"""
-    for attempt in range(max_retry):
+def _safe_fine_move(dx_mm, dy_mm, timeout=20.0, max_retry=1, allow_resend=False):
+    """发送下位机已有 dx/dy 微调命令，并等待到位反馈。
+
+    FINE_MOVE 是真实运动命令，超时后下位机可能仍在执行。
+    默认不重发，避免同一段前进/后退被执行两次。
+    """
+    if not ensure_comm_alive(verbose=True):
+        return False
+
+    attempts = max(1, int(max_retry)) if allow_resend else 1
+    for attempt in range(attempts):
         try:
             seen_seq = comm.response_seq()
             comm.send_fine_move(dx_mm, dy_mm)
-            ok = comm.wait_for_after(comm.TYPE_CMD_FINE_RESP, seen_seq, timeout)
-            if ok:
-                return True
-            print(f"  [fine_move {attempt+1}] 下位机返回失败或等待超时")
+            if hasattr(comm, "wait_status_after"):
+                status = comm.wait_status_after(comm.TYPE_CMD_FINE_RESP, seen_seq, timeout)
+                if status == 1:
+                    return True
+                if status == 0:
+                    print(f"  [fine_move {attempt+1}] 收到 FINE_RESP=0，下位机判定本次微调失败/超时")
+                else:
+                    print(f"  [fine_move {attempt+1}] 未收到 FINE_RESP，等待超时")
+            else:
+                ok = comm.wait_for_after(comm.TYPE_CMD_FINE_RESP, seen_seq, timeout)
+                if ok:
+                    return True
+                print(f"  [fine_move {attempt+1}] 下位机返回失败或等待超时")
         except Exception as e:
             print(f"  [fine_move {attempt+1}] err: {e}")
+            if not allow_resend:
+                return False
+        if not allow_resend:
+            print("  [fine_move] 已下发过运动命令，不重发，避免重复运动")
+            return False
         time.sleep(0.3)
+
+    if not allow_resend:
+        return False
 
     if not ensure_comm_alive(verbose=True):
         return False
@@ -1837,6 +2076,60 @@ def _safe_fine_move(dx_mm, dy_mm, timeout=20.0, max_retry=2):
     except Exception as e:
         print(f"  [fine_move] 恢复后仍失败: {e}")
         return False
+
+
+def _safe_body_pos_move(dx_mm, dy_mm, timeout=3.0):
+    """使用下位机 BODY_POS_MOVE：四轮 Emm 位置模式开环相对位移。"""
+    if not ensure_comm_alive(verbose=True):
+        return False
+    try:
+        ok = comm.body_pos_move(dx_mm, dy_mm, timeout=timeout)
+        if not ok:
+            print("  [body_pos_move] 下位机返回失败或等待超时")
+        return bool(ok)
+    except Exception as e:
+        print(f"  [body_pos_move] err: {e}")
+        return False
+
+
+def _fresh_pose_after_wait(max_age=0.5, wait_s=0.25):
+    """等待一小段时间，读取开环位置模式更新后的最新 POSE。"""
+    deadline = time.monotonic() + max(0.0, float(wait_s))
+    pose = comm.get_pose(max_age=max_age)
+    while pose is None and time.monotonic() < deadline:
+        time.sleep(0.03)
+        pose = comm.get_pose(max_age=max_age)
+    return pose
+
+
+def _body_delta_target_from_pose(pose, dx_body_m, dy_body_m):
+    """把车体相对位移换算成地图目标点；yaw 使用下位机 CW+ 约定。"""
+    x, y, yaw_cw_deg = pose
+    yaw_ccw_rad = math.radians(-float(yaw_cw_deg))
+    cy = math.cos(yaw_ccw_rad)
+    sy = math.sin(yaw_ccw_rad)
+    target_x = float(x) + float(dx_body_m) * cy - float(dy_body_m) * sy
+    target_y = float(y) + float(dx_body_m) * sy + float(dy_body_m) * cy
+    return target_x, target_y
+
+
+def _safe_body_back_goto(back_mm, timeout=20.0, verbose=True):
+    """后退使用普通 GOTO：按当前 yaw 将车体 dy 负方向换算成地图目标点。"""
+    pose = _fresh_pose_after_wait(max_age=0.8, wait_s=0.35)
+    if pose is None:
+        print("  [WARN] 没有新鲜 POSE，后退回退为 FINE_MOVE，避免用错误地图点")
+        return _safe_fine_move(0.0, -back_mm, timeout=timeout)
+    target_x, target_y = _body_delta_target_from_pose(pose, 0.0, -float(back_mm) / 1000.0)
+    if verbose:
+        print(f"  后退 GOTO 目标 = ({target_x:.4f}, {target_y:.4f}), pose=({pose[0]:.4f}, {pose[1]:.4f}, yaw={pose[2]:.1f}°)")
+    return _safe_goto(target_x, target_y, timeout=timeout, max_retry=1)
+
+
+def _post_align_forward_command(forward_mm):
+    """返回对准后前推 BODY_POS 指令；包含摄像头安装左右补偿。"""
+    trim_dx = float(CONFIG.get("post_align_trim_dx_mm", 0.0))
+    trim_dy = float(CONFIG.get("post_align_trim_dy_mm", 0.0))
+    return trim_dx, float(forward_mm) + trim_dy, trim_dx, trim_dy
 
 
 def _wait(seconds, label, verbose=True):
@@ -1904,6 +2197,48 @@ def detect_offset(verbose=False):
     return offset
 
 
+def _offset_distance_mm(offset):
+    """返回当前圆心偏差距离，单位 mm。"""
+    if offset is None:
+        return float("inf")
+    return float((offset["dx_mm"] * offset["dx_mm"] + offset["dy_mm"] * offset["dy_mm"]) ** 0.5)
+
+
+def _alignment_tolerances_mm():
+    """返回 X/Y 分轴到位容差；缺省时兼容旧的总容差配置。"""
+    base = float(CONFIG.get("align_tolerance_mm", 3.0))
+    tol_x = float(CONFIG.get("align_tolerance_x_mm", base))
+    tol_y = float(CONFIG.get("align_tolerance_y_mm", base))
+    return tol_x, tol_y
+
+
+def _alignment_error_text(offset):
+    tol_x, tol_y = _alignment_tolerances_mm()
+    return (f"dx={offset['dx_mm']:+.1f}/{tol_x:.1f}mm, "
+            f"dy={offset['dy_mm']:+.1f}/{tol_y:.1f}mm, "
+            f"dist={_offset_distance_mm(offset):.1f}mm")
+
+
+def _detect_offset_with_retries(verbose=False, retries=None, label=""):
+    """识别同心圆；偶发没识别到时重试几次，避免单帧/短时卡顿直接中断流程。"""
+    if retries is None:
+        retries = int(CONFIG.get("align_detect_retry_count", 4))
+    attempts = max(1, int(retries))
+    sleep_s = float(CONFIG.get("align_detect_retry_sleep_s", 0.15))
+    prefix = f" {label}" if label else ""
+    for attempt in range(attempts):
+        offset = detect_offset(verbose=verbose)
+        if offset is not None:
+            if verbose and attempt > 0:
+                print(f"  [OK] 同心圆重试识别成功{prefix}: {attempt + 1}/{attempts}")
+            return offset
+        if verbose:
+            print(f"  [WARN] 未检测到可靠同心圆{prefix}: {attempt + 1}/{attempts}")
+        if attempt + 1 < attempts and sleep_s > 0.0:
+            time.sleep(sleep_s)
+    return None
+
+
 def _limited_dxdy(dx_mm, dy_mm):
     """限制单次视觉微调距离，防止未标定时一次跑偏过大。"""
     limit = float(CONFIG.get("fine_move_max_step_mm", 30.0))
@@ -1915,23 +2250,22 @@ def _limited_dxdy(dx_mm, dy_mm):
 
 
 def _offset_is_aligned(offset):
-    """判断圆心偏差是否已经足够小；毫米阈值比纯像素阈值更稳定。"""
+    """判断圆心偏差是否已经足够小；X/Y 分轴容差避免左右误差被前后容差放宽。"""
     dead_px = int(CONFIG.get("dead_zone_px", 0))
     if dead_px > 0 and abs(offset["dx_px"]) <= dead_px and abs(offset["dy_px"]) <= dead_px:
         return True
 
-    tolerance_mm = float(CONFIG.get("align_tolerance_mm", 0.0))
-    if tolerance_mm <= 0.0:
+    tol_x, tol_y = _alignment_tolerances_mm()
+    if tol_x <= 0.0 or tol_y <= 0.0:
         return False
-    dist_mm = float((offset["dx_mm"] * offset["dx_mm"] + offset["dy_mm"] * offset["dy_mm"]) ** 0.5)
-    return dist_mm <= tolerance_mm
+    return abs(float(offset["dx_mm"])) <= tol_x and abs(float(offset["dy_mm"])) <= tol_y
 
 
 def _fine_adjust_by_offset(offset, verbose=True):
     """只按检测得到的 dx/dy 做一次微调，不附带前进动作。"""
     if _offset_is_aligned(offset):
         if verbose:
-            print("  [OK] 已在允许误差内，无需移动")
+            print(f"  [OK] 已在允许误差内，无需移动: {_alignment_error_text(offset)}")
         return True
 
     if not ensure_comm_alive(verbose=verbose):
@@ -1954,6 +2288,33 @@ def _fine_adjust_by_offset(offset, verbose=True):
     return bool(align_ok)
 
 
+def _confirm_aligned_twice(first_offset, verbose=True):
+    """进容差后再复检一次；连续两次都在容差内才放行前推。"""
+    confirm_frames = max(1, int(CONFIG.get("align_confirm_frames", 1)))
+    if confirm_frames <= 1:
+        return True, first_offset
+
+    last_offset = first_offset
+    sleep_s = float(CONFIG.get("align_confirm_sleep_s", 0.12))
+    for idx in range(2, confirm_frames + 1):
+        if sleep_s > 0.0:
+            time.sleep(sleep_s)
+        offset = _detect_offset_with_retries(verbose=verbose, label=f"对准确认{idx}/{confirm_frames}")
+        if offset is None:
+            if verbose:
+                print(f"  [WARN] 对准确认 {idx}/{confirm_frames} 未检测到可靠同心圆，继续微调流程")
+            return False, last_offset
+        last_offset = offset
+        if not _offset_is_aligned(offset):
+            if verbose:
+                print(f"  [WARN] 对准确认 {idx}/{confirm_frames} 未进容差: "
+                      f"{_alignment_error_text(offset)}，继续微调流程")
+            return False, last_offset
+        if verbose:
+            print(f"  [OK] 对准确认 {idx}/{confirm_frames} 通过: {_alignment_error_text(offset)}")
+    return True, last_offset
+
+
 def _move_by_offset(offset, verbose=True):
     """按检测得到的 dx/dy 微调；是否前进由配置控制。"""
     if not _fine_adjust_by_offset(offset, verbose=verbose):
@@ -1969,7 +2330,8 @@ def _move_by_offset(offset, verbose=True):
         return False
     if verbose:
         print(f"\n  === 定位后前进 dy +{forward_mm:.0f}mm ===")
-    ok = _safe_fine_move(0.0, forward_mm, timeout=CONFIG["correct_timeout_s"])
+    ok = _safe_fine_move(0.0, forward_mm,
+                         timeout=float(CONFIG.get("push_move_timeout_s", CONFIG["correct_timeout_s"])))
     if verbose:
         print(f"  [forward dy] {'OK' if ok else 'FAIL'}")
     return ok
@@ -1980,15 +2342,16 @@ def align_iterative_to_ring(max_iterations=None, verbose=True):
     if max_iterations is None:
         max_iterations = int(CONFIG.get("max_align_iterations", 10))
     max_iterations = max(1, int(max_iterations))
+    _warmup_usb_camera(verbose=verbose)
 
     for i in range(max_iterations):
         if verbose:
             print(f"\n[ring] 视觉定位迭代 {i + 1}/{max_iterations}")
-        offset = detect_offset(verbose=verbose)
+        offset = _detect_offset_with_retries(verbose=verbose, label=f"迭代{i + 1}")
         if offset is None:
             if verbose:
-                print("  [FAIL] 未检测到可靠同心圆")
-            return False
+                print("  [WARN] 本轮未检测到可靠同心圆，继续下一轮")
+            continue
         if _offset_is_aligned(offset):
             if verbose:
                 print("  [OK] 圆心已经对齐")
@@ -1999,7 +2362,7 @@ def align_iterative_to_ring(max_iterations=None, verbose=True):
 
     if verbose:
         print("\n[ring] 末次复查")
-    offset = detect_offset(verbose=verbose)
+    offset = _detect_offset_with_retries(verbose=verbose, label="末次复查")
     if offset is None:
         return False
     ok = _offset_is_aligned(offset)
@@ -2008,73 +2371,133 @@ def align_iterative_to_ring(max_iterations=None, verbose=True):
     return ok
 
 
-def _push_forward_then_back(verbose=True):
-    """对准后执行固定推送：先前进，再立刻后退。"""
+def _push_forward_then_back(verbose=True, back_mm=None):
+    """对准后执行推送：前推走电机位置模式，默认后退仍走 FINE_MOVE。"""
     forward_mm = float(CONFIG["post_align_offset_y_mm"])
-    back_mm = float(CONFIG.get("post_align_back_y_mm", 0.0))
+    if back_mm is None:
+        back_mm = float(CONFIG.get("post_align_back_y_mm", 0.0))
+    else:
+        back_mm = float(back_mm)
+    push_timeout = float(CONFIG.get("push_move_timeout_s", CONFIG["correct_timeout_s"]))
+    back_timeout = float(CONFIG.get("back_move_timeout_s", CONFIG["correct_timeout_s"]))
     if not ensure_comm_alive(verbose=verbose):
         return False
+    cmd_dx, cmd_dy, trim_dx, trim_dy = _post_align_forward_command(forward_mm)
     if verbose:
-        print(f"\n  === 对准完成，车体 dy 方向前进 +{forward_mm:.0f}mm ===")
-    ok = _safe_fine_move(0.0, forward_mm, timeout=CONFIG["correct_timeout_s"])
+        print(f"\n  === 对准完成，车体前推 +{forward_mm:.0f}mm（BODY_POS 位置模式） ===")
+        if abs(trim_dx) > 1e-6 or abs(trim_dy) > 1e-6:
+            print(f"  安装补偿    = dx {trim_dx:+.1f}mm, dy {trim_dy:+.1f}mm；实际下发 dx {cmd_dx:+.1f}mm, dy {cmd_dy:+.1f}mm")
+    ok = _safe_body_pos_move(cmd_dx, cmd_dy, timeout=push_timeout)
     if verbose:
-        print(f"  [forward dy] {'OK' if ok else 'FAIL'}")
+        print(f"  [forward body_pos] {'OK' if ok else 'FAIL'}")
     if not ok:
         return False
+    settle_s = float(CONFIG.get("post_push_quiesce_s", 0.0))
+    if settle_s > 0.0:
+        try:
+            comm.send_velocity(0.0, 0.0, 0.0)
+        except Exception as exc:
+            if verbose:
+                print(f"  [WARN] 前推后零速度帧发送失败，继续后续流程: {exc}")
+        if verbose:
+            print(f"  前推后停稳等待 {settle_s:.2f}s，避免微调/位置模式残留影响后退")
+        time.sleep(settle_s)
     if back_mm <= 0.0:
         return True
     if verbose:
-        print(f"\n  === 前进完成，立刻后退 dy -{back_mm:.0f}mm ===")
-    ok = _safe_fine_move(0.0, -back_mm, timeout=CONFIG["correct_timeout_s"])
+        print(f"\n  === 前进完成，后退 dy -{back_mm:.0f}mm（FINE_MOVE） ===")
+    ok = _safe_fine_move(0.0, -back_mm, timeout=back_timeout)
     if verbose:
-        print(f"  [backward dy] {'OK' if ok else 'FAIL'}")
-    return bool(ok)
+        print(f"  [backward fine_move] {'OK' if ok else 'FAIL'}")
+    if not ok:
+        # 固定后退属于放置后的安全退出动作；下位机可能实际已移动但因内部闭环超时返回0。
+        # 不重发，避免二次后退；继续交给调用方按实测点 sync_pose 修正坐标。
+        print("  [WARN] 后退未确认完成；不重发，继续主流程并依赖后续 sync_pose 修正坐标")
+        return True
+    return True
 
 
-def align_checked_then_forward(max_moves=None, verbose=True):
-    """A 键流程：闭环微调到位后，才执行固定前推/后退。"""
+def align_checked_then_forward(max_moves=None, verbose=True, back_mm=None, pre_push_wait=None):
+    """A 键流程：先微调；前推前可等待并行动作确认，避免槽位未到位就推出。"""
     if max_moves is None:
         max_moves = int(CONFIG.get("checked_align_max_moves", 10))
     max_moves = max(1, int(max_moves))
     settle_s = float(CONFIG.get("post_fine_move_settle_s", 0.25))
 
     time.sleep(float(CONFIG.get("pre_cmd_sleep_s", 0.0)))
+    _warmup_usb_camera(verbose=verbose)
     moves_done = 0
     final_offset = None
-    for check_idx in range(max_moves + 1):
+    best_offset = None
+    best_dist = float("inf")
+    check_idx = 0
+    max_check_rounds = max_moves + max(2, int(CONFIG.get("align_detect_retry_count", 4)))
+
+    while moves_done <= max_moves and check_idx < max_check_rounds:
+        check_idx += 1
         if verbose:
-            print(f"\n[ring] A 键定位复检 {check_idx + 1}/{max_moves + 1}，已微调 {moves_done}/{max_moves} 次")
-        offset = detect_offset(verbose=verbose)
+            print(f"\n[ring] A 键定位复检 {check_idx}/{max_check_rounds}，已微调 {moves_done}/{max_moves} 次")
+        offset = _detect_offset_with_retries(verbose=verbose, label=f"A键复检{check_idx}")
         if offset is None:
             if verbose:
-                print("  [FAIL] 当前没有可靠同心圆检测，停止流程，不执行前推/后退")
-            return False
+                print("  [WARN] 当前没有可靠同心圆检测，先不退出，继续尝试")
+            continue
+
         final_offset = offset
+        dist_mm = _offset_distance_mm(offset)
+        if dist_mm < best_dist:
+            best_dist = dist_mm
+            best_offset = dict(offset)
+
         if _offset_is_aligned(offset):
-            if verbose:
-                print("  [OK] 复检通过，圆心已对准")
-            break
+            confirmed, confirm_offset = _confirm_aligned_twice(offset, verbose=verbose)
+            final_offset = confirm_offset
+            if confirmed:
+                if verbose:
+                    print("  [OK] 双帧确认通过，圆心已对准")
+                break
+            offset = confirm_offset
+            dist_mm = _offset_distance_mm(offset)
+            if dist_mm < best_dist:
+                best_dist = dist_mm
+                best_offset = dict(offset)
         if moves_done >= max_moves:
             if verbose:
-                print("  [FAIL] 已达到微调次数上限，仍未进容差；不执行前推/后退")
-            return False
+                print("  [WARN] 已达到微调次数上限，仍未进容差；按当前最小误差继续前推/后退")
+            break
         if not _fine_adjust_by_offset(offset, verbose=verbose):
             if verbose:
-                print("  [FAIL] 本次微调失败，停止流程，不执行前推/后退")
-            return False
+                print("  [WARN] 本次微调失败；停止继续微调，但仍执行前推/后退")
+            break
         moves_done += 1
         if settle_s > 0.0:
             time.sleep(settle_s)
-    else:
-        if verbose:
-            print("  [FAIL] 微调循环结束，仍未确认对准")
-        return False
 
-    if final_offset is None or not _offset_is_aligned(final_offset):
+    if final_offset is None:
         if verbose:
-            print("  [FAIL] 最终未确认完全对准，不执行前进/后退")
-        return False
-    return _push_forward_then_back(verbose=verbose)
+            print("  [WARN] 本轮始终未检测到可靠同心圆；按流程仍执行前进/后退")
+    elif not _offset_is_aligned(final_offset):
+        if verbose:
+            if best_offset is not None:
+                print(f"  [WARN] 未进分轴容差；当前误差 {_alignment_error_text(final_offset)}，"
+                      f"过程最小总误差 {best_dist:.1f}mm，继续前推/后退")
+            else:
+                print("  [WARN] 最终未确认完全对准，但继续前进/后退")
+    if pre_push_wait is not None:
+        if verbose:
+            print("\n  === 前推前确认并行动作完成 ===")
+        try:
+            ready = bool(pre_push_wait())
+        except Exception as exc:
+            if verbose:
+                print(f"  [parallel wait] FAIL: {exc}")
+            return False
+        if verbose:
+            print(f"  [parallel wait] {'OK' if ready else 'FAIL'}")
+        if not ready:
+            return False
+
+    return _push_forward_then_back(verbose=verbose, back_mm=back_mm)
 
 
 _trackbars_ready = False
@@ -2131,22 +2554,25 @@ def _print_mapping():
 
 
 def _forward_after_align(verbose=True):
-    """沿车体 dy 正方向单独前进固定距离。"""
+    """沿车体 dy 正方向单独前进固定距离，使用电机位置模式。"""
     if not ensure_comm_alive(verbose=verbose):
         return False
     forward_mm = float(CONFIG["post_align_offset_y_mm"])
+    cmd_dx, cmd_dy, trim_dx, trim_dy = _post_align_forward_command(forward_mm)
     if verbose:
-        print(f"\n  === 手动前进 dy +{forward_mm:.0f}mm ===")
-    ok = _safe_fine_move(0.0, forward_mm, timeout=CONFIG["correct_timeout_s"])
+        print(f"\n  === 手动前进 dy +{forward_mm:.0f}mm（BODY_POS 位置模式） ===")
+        if abs(trim_dx) > 1e-6 or abs(trim_dy) > 1e-6:
+            print(f"  安装补偿    = dx {trim_dx:+.1f}mm, dy {trim_dy:+.1f}mm；实际下发 dx {cmd_dx:+.1f}mm, dy {cmd_dy:+.1f}mm")
+    ok = _safe_body_pos_move(cmd_dx, cmd_dy,
+                             timeout=float(CONFIG.get("push_move_timeout_s", CONFIG["correct_timeout_s"])))
     if verbose:
-        print(f"  [forward dy] {'OK' if ok else 'FAIL'}")
+        print(f"  [forward body_pos] {'OK' if ok else 'FAIL'}")
     return ok
 
 
 def preview():
     """实时显示圆环识别画面，并提供现场校准热键。"""
     _require_cv2()
-    cam = _get_cam()
     cv2.namedWindow(CONFIG["debug_window_name"], cv2.WINDOW_NORMAL)
     cv2.namedWindow(CONFIG["debug_mask_window_name"], cv2.WINDOW_NORMAL)
     _setup_debug_trackbars()
@@ -2161,9 +2587,9 @@ def preview():
     last_evidence = None
     while True:
         _read_debug_trackbars()
-        frame = cam.read()
+        frame = _read_usb_frame()
         if frame is None:
-            time.sleep(0.02)
+            time.sleep(0.03)
             continue
         now = time.time()
         result = None
@@ -2309,7 +2735,7 @@ def _print_manual_scale_trials(offset):
 def align_once_to_ring(verbose=True):
     """到达圆环附近后，只根据当前画面圆心偏差执行一次 dx/dy 定位。"""
     time.sleep(CONFIG["pre_cmd_sleep_s"])
-    offset = detect_offset(verbose=verbose)
+    offset = _detect_offset_with_retries(verbose=verbose, label="单次定位")
     if offset is None:
         if verbose:
             print("  [FAIL] 没找到同心圆环")
@@ -2331,24 +2757,23 @@ def align_to_ring(verbose=True):
         return False
 
     time.sleep(CONFIG["pre_cmd_sleep_s"])
-    offset = detect_offset(verbose=verbose)
+    offset = _detect_offset_with_retries(verbose=verbose, label="旧3步流程")
     if offset is None:
         if verbose:
-            print("  [FAIL] 没找到同心圆环")
-        return False
-    if verbose:
-        print("\n  === 步骤 1: 视觉 dx/dy 对准 ===")
-    if not _move_by_offset(offset, verbose=verbose):
+            print("  [WARN] 没找到同心圆环，跳过步骤1微调，仍继续前进/后退")
+        k_mm_per_px = float(CONFIG.get("manual_mm_per_px", 0.25))
+    else:
         if verbose:
-            print("  [step 1] FAIL")
-        return False
-    if verbose:
-        print("  [step 1] OK")
-
-    if offset["radius_px"] <= 0 or offset["mm_per_px"] <= 0:
-        return False
-
-    k_mm_per_px = offset["mm_per_px"]
+            print("\n  === 步骤 1: 视觉 dx/dy 对准 ===")
+        if not _move_by_offset(offset, verbose=verbose):
+            if verbose:
+                print("  [step 1] WARN: 微调失败，仍继续前进/后退")
+        else:
+            if verbose:
+                print("  [step 1] OK")
+        k_mm_per_px = float(offset.get("mm_per_px", CONFIG.get("manual_mm_per_px", 0.25)))
+        if k_mm_per_px <= 0.0:
+            k_mm_per_px = float(CONFIG.get("manual_mm_per_px", 0.25))
 
     # === 等 1→2 ===
     _wait(CONFIG["step1_to_step2_pause_s"], "步骤1→2 等待", verbose)
@@ -2360,7 +2785,8 @@ def align_to_ring(verbose=True):
         print(f"\n  === 步骤 2: 车体 dy +{forward_mm:.0f}mm ===")
 
     time.sleep(CONFIG["pre_cmd_sleep_s"])
-    ok = _safe_fine_move(0.0, forward_mm, timeout=CONFIG["correct_timeout_s"])
+    ok = _safe_fine_move(0.0, forward_mm,
+                         timeout=float(CONFIG.get("push_move_timeout_s", CONFIG["correct_timeout_s"])))
     if not ok:
         if verbose:
             print("  [step 2] FAIL")
@@ -2379,7 +2805,8 @@ def align_to_ring(verbose=True):
         print(f"  {CONFIG['step3_back_offset_px']}px 实际  = {back_offset_mm:.1f} mm")
 
     time.sleep(CONFIG["pre_cmd_sleep_s"])
-    ok = _safe_fine_move(0.0, -back_offset_mm, timeout=CONFIG["correct_timeout_s"])
+    ok = _safe_fine_move(0.0, -back_offset_mm,
+                         timeout=float(CONFIG.get("back_move_timeout_s", CONFIG["correct_timeout_s"])))
     if verbose:
         print(f"  [step 3] {'OK' if ok else 'FAIL'}")
     return ok
@@ -2387,9 +2814,11 @@ def align_to_ring(verbose=True):
 
 def close():
     """关闭摄像头 (main 退出时调用)"""
-    if _cam_cache["cam"] is not None:
-        _cam_cache["cam"].stop()
-        _cam_cache["cam"] = None
+    with _cam_lock:
+        if _cam_cache["cam"] is not None:
+            _cam_cache["cam"].stop()
+            _cam_cache["cam"] = None
+        _bad_devices.clear()
 
 
 if __name__ == "__main__":

@@ -193,6 +193,7 @@ def _run_key_turn_with_rotate(a, b, idx: int, slot: int) -> bool:
             print("  !! 原地转角 PATH_RESP 超时或失败")
         if not rotate_ok:
             print("  !! 转盘 ROTATE_RESP 超时或失败")
+            rotate_ok = comm.rotate(slot, KEY_PATH_ROTATE_TIMEOUT)
         return path_ok and rotate_ok
 
     return timed(
