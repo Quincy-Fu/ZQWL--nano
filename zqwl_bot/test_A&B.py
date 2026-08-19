@@ -356,7 +356,7 @@ def run_task_ab():
     if not go_to(0.75, 0.25):
         raise RuntimeError("扫码后前进 5cm 失败")
 
-    arc_r = 0.86
+    arc_r = 0.84
     arc_dir = -1
     arc_sweep_deg = 130.0
     arc_speed = ARC_SPEED_MM_S / 1000.0

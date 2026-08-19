@@ -161,7 +161,7 @@ PLACE_SYNC_POINTS = {
     "E": ( 0.820, TARGET_POINTS["E"][1] + RING_PUSH_FORWARD_M),
 }
 E_EXIT_X_SHIFT_M = -0.240
-E_EXIT_YAW = 90.0
+E_EXIT_YAW = 93.0
 QR_TARGET_ORDER = ["A", "B", "C", "D", "E"]
 ROTATE_SPECIAL_STATE = 5
 
@@ -1173,7 +1173,7 @@ def place_target_with_ring(name: str,
 
 
 def finish_cd_after_e() -> bool:
-    """E 点完成后只做 X 左移 240mm，再转到 90 度结束 C/D 段。"""
+    """E 点完成后只做 X 左移 240mm，再转到结束角度，结束 C/D 段。"""
     exit_x = PLACE_BACK_TARGET_POINTS["E"][0] + E_EXIT_X_SHIFT_M
     sx, sy = _CUR_X, _CUR_Y
     yaw = _current_yaw(default=0.0)
@@ -1302,7 +1302,8 @@ def run_task_cd() -> None:
 
     _require(comm.use_encoder_yaw(timeout=2.0), "set yaw source to encoder for C/D")
     _require(sync_pose(INIT_X, INIT_Y, INIT_YAW), "SYNC initial pose")
-    _require(go_to(-0.662, 0.25), "go to (-0.662, 0.25)")
+    _require(go_to(0.0, 0.25), "go to (0.000, 0.250)")
+    _require(go_to(-0.662, 0.25), "go to (-0.662, 0.250)")
 
     target_colors = recognize_qr1_targets()
 
