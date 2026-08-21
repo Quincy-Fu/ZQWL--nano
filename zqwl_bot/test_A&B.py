@@ -325,13 +325,9 @@ def return_home_strict() -> bool:
 def run_task_ab():
     print("\n=== 阶段 A+B: 按指定路线测试 ===")
 
-    if comm.use_imu_yaw(timeout=2.0):
-        print("  A/B yaw源=IMU")
-    else:
-        print("  [WARN] A/B IMU yaw不可用，立即切回编码器yaw继续")
-        if not comm.use_encoder_yaw(timeout=2.0):
-            raise RuntimeError("A/B yaw源兜底到编码器失败")
-        print("  A/B yaw源已回退到编码器")
+    if not comm.use_encoder_yaw(timeout=2.0):
+        raise RuntimeError("A/B yaw源切到编码器失败")
+    print("  A/B yaw源=编码器")
 
     # 1. 起步直接把当前位置同步为扫码点，不做前置 10cm 移动。
     if not sync_pose(0.7, 0.25, INIT_YAW_D):
@@ -361,7 +357,7 @@ def run_task_ab():
     if not go_to(0.75, 0.25):
         raise RuntimeError("扫码后前进 5cm 失败")
 
-    arc_r = 0.82
+    arc_r = 0.84
     arc_dir = -1
     arc_sweep_deg = 130.0
     arc_speed = ARC_SPEED_MM_S / 1000.0

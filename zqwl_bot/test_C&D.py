@@ -447,25 +447,6 @@ def turn_180_after_arc() -> bool:
     return turn_ok
 
 
-def switch_to_imu_yaw_at_180() -> bool:
-    """转到180°后优先切到IMU yaw；IMU不可用则立即回退编码器。"""
-    print("\n=== C/D 180°后切换到 IMU yaw ===")
-    if not refresh_cur_from_pose("before IMU yaw switch"):
-        print("  [WARN] 切IMU前位姿刷新失败，沿用本地记录坐标继续同步180°")
-    if not sync_pose(_CUR_X, _CUR_Y, 180.0):
-        print("  !! 切IMU前同步 yaw=180° 失败")
-        return False
-    if not comm.use_imu_yaw(timeout=2.0):
-        print("  [WARN] IMU yaw不可用，立即切回编码器yaw继续")
-        if not comm.use_encoder_yaw(timeout=2.0):
-            print("  !! 编码器yaw兜底切换也未确认")
-            return False
-        print("  yaw源已回退到编码器")
-        return True
-    print("  IMU yaw 已接管，当前坐标航向基准=180°")
-    return True
-
-
 def rotate_async(pos: int, label: str = "") -> bool:
     """只下发转盘槽位命令，不等待响应；用于和转向/圆弧并行动作。"""
     suffix = f" {label}" if label else ""
@@ -1398,7 +1379,8 @@ def run_task_cd() -> None:
     color_to_slot = invert_loaded_slot_colors(loaded_slot_colors)
     release_block_camera_before_ring()
     _require(turn_180_after_arc(), "turn to 180 after arc")
-    _require(switch_to_imu_yaw_at_180(), "switch to IMU yaw at 180")
+    _require(comm.use_encoder_yaw(timeout=2.0), "keep encoder yaw after turn 180")
+    print("  C/D 180°后继续使用编码器 yaw")
 
     _require(place_target_with_ring("A", target_colors, color_to_slot, move_order="xy"),
              "place A with ring")
@@ -1411,7 +1393,8 @@ def run_task_cd() -> None:
     _require(place_target_with_ring("E", target_colors, color_to_slot, move_order="x_turn0_y"),
              "place E with ring")
     _require(finish_cd_after_e(), "finish C/D after E")
-    print("  C/D 结束后保持当前yaw源，供 A/B 继续使用；若IMU已失效，下位机会保持编码器兜底。")
+    if not comm.use_encoder_yaw(timeout=2.0):
+        print("  [WARN] C/D 结束后保持编码器 yaw 失败，A/B 入口会再次强制切换")
 
     print("\n=== test_C&D 流程完成 ===")
 
