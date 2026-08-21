@@ -37,7 +37,7 @@ BACKUP_M = 0.05
 PLACE_BACKUP_M = 0.10
 SPLIT_THRESHOLD = 0.03
 AB_PATH_EPS = 1e-4
-AB_KEY_PATH_SPEED = 0.40
+AB_KEY_PATH_SPEED = 0.35
 QR2_RECOGNIZE_TIMEOUT_S = 18.0
 
 RANK_RING_BACK_MM = 200.0
@@ -49,7 +49,7 @@ BODY_POS_POST_SETTLE_S = 0.30
 RANK_PLACE_POINTS = {
     "亚军": ("B", 0.25, 1.779, 3, 0.25, 1.67),
     "冠军": ("A", 0.00, 1.779, 4, 0.00, 1.66),
-    "季军": ("C", -0.10, 1.73, 1, -0.25, 1.67),
+    "季军": ("C", -0.15, 1.73, 1, -0.25, 1.67),
 }
 
 # 当前转盘映射：0=B，1=A，2=C；槽位4作为圆弧结束后的空槽。
@@ -325,8 +325,13 @@ def return_home_strict() -> bool:
 def run_task_ab():
     print("\n=== 阶段 A+B: 按指定路线测试 ===")
 
-    if not comm.use_encoder_yaw(timeout=2.0):
-        raise RuntimeError("A/B yaw源切到编码器失败")
+    if comm.use_imu_yaw(timeout=2.0):
+        print("  A/B yaw源=IMU")
+    else:
+        print("  [WARN] A/B IMU yaw不可用，立即切回编码器yaw继续")
+        if not comm.use_encoder_yaw(timeout=2.0):
+            raise RuntimeError("A/B yaw源兜底到编码器失败")
+        print("  A/B yaw源已回退到编码器")
 
     # 1. 起步直接把当前位置同步为扫码点，不做前置 10cm 移动。
     if not sync_pose(0.7, 0.25, INIT_YAW_D):
@@ -356,7 +361,7 @@ def run_task_ab():
     if not go_to(0.75, 0.25):
         raise RuntimeError("扫码后前进 5cm 失败")
 
-    arc_r = 0.84
+    arc_r = 0.82
     arc_dir = -1
     arc_sweep_deg = 130.0
     arc_speed = ARC_SPEED_MM_S / 1000.0
