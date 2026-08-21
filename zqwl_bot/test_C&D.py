@@ -50,7 +50,7 @@ CD_ARC_START = (-0.900, 0.250)
 CD_ARC_START_YAW = -69.0
 CD_ARC_RADIUS = 0.869
 CD_ARC_DIR = 1
-CD_ARC_SWEEP_DEG = 130.0
+CD_ARC_SWEEP_DEG = 150.0
 # C/D圆弧速度预设：需要快速切回0.30时，只改 CD_ARC_PROFILE = "stable_030"。
 CD_ARC_PROFILE = "stable_030"
 CD_ARC_PROFILES = {
@@ -124,11 +124,11 @@ KEY_PATH_POINTS = [
 KEY_PATH_ROTATE_SLOTS = [1, 2, 3, 4]
 
 TARGET_POINTS = {
-    "A": (-0.630, 1.630),
+    "A": (-0.630, 1.640),
     "B": (-0.430, 1.340),
     "C": ( 0.210, 1.620),
     "D": ( 0.330, 1.340),
-    "E": ( 0.820, 0.600),
+    "E": ( 0.850, 0.570),
 }
 RING_PUSH_FORWARD_M = 0.098
 CD_RING_BACK_SETTLE_S = 0.15
@@ -149,7 +149,7 @@ PLACE_BACK_TARGET_POINTS = {
     "C": ( 0.220, 1.700),
     # D 点后退后落到 C 点的 Y 坐标，下一步只需要走 X。
     "D": ( 0.330, TARGET_POINTS["C"][1]),
-    # E 点朝向 0°，前推后直退 460mm，最终接近 C/D 结束区。
+    # E 点朝向 2°，前推后直退 460mm，最终接近 C/D 结束区。
     "E": ( 0.820, TARGET_POINTS["E"][1] + RING_PUSH_FORWARD_M - 0.460),
 }
 PLACE_SYNC_POINTS = {
@@ -396,7 +396,7 @@ def go_axis_y_then_x(x: float, y: float, label: str = "axis move") -> bool:
 
 def go_axis_x_turn0_then_y(x: float, y: float, label: str = "axis move") -> bool:
     """只给 E 点使用：分段执行 X 方向 GOTO、转角、Y 方向 GOTO。"""
-    print(f"  AXIS_MOVE_X_TURN0_Y {label}: target=({x:.4f}, {y:.4f})")
+    print(f"  AXIS_MOVE_X_TURN2_Y {label}: target=({x:.4f}, {y:.4f})")
 
     # 不再强行把当前坐标和航向同步成 180°，避免理想坐标覆盖实车当前位置。
     # 先完成纯 X 方向移动，避免把 X/Y 合成为斜线。
@@ -404,10 +404,12 @@ def go_axis_x_turn0_then_y(x: float, y: float, label: str = "axis move") -> bool
         if not go_to(x, _CUR_Y):
             return False
 
-    # 保留原先的大角度分段转向：先转到 90°，再转到 0°。
+    # 保留原先的大角度分段转向：先转到 90°，再转到 2°；随后把当前航向基准同步为 0°。
     if not turn_to(90.0):
         return False
-    if not turn_to(0.0):
+    if not turn_to(2.0):
+        return False
+    if not sync_pose(_CUR_X, _CUR_Y, 0.0):
         return False
 
     # 转角完成后再执行纯 Y 方向移动。

@@ -50,6 +50,8 @@ CSI_NO_FRAME_RESTART_S = 0.8
 CSI_NO_DETECT_RESTART_S = 3.0
 CSI_MAX_RESTARTS = 3
 CSI_RESTART_SLEEP_S = 0.25
+QR2_LIGHT_SETTLE_S = 0.20
+QR2_CONFIRM_HITS = 2
 
 
 def _frame_is_valid(frame) -> bool:
@@ -109,13 +111,35 @@ class QRDetector:
 
     def detect(self, frame):
         h, w = frame.shape[:2]
+        regions = []
         if w >= ROI_W + 2 * ROI_OFFSET_X and h >= ROI_H + 2 * ROI_OFFSET_Y:
-            roi = frame[ROI_OFFSET_Y:ROI_OFFSET_Y + ROI_H,
-                        ROI_OFFSET_X:ROI_OFFSET_X + ROI_W]
-            result = self._try_detect(roi)
-            if result:
-                return result
-        return self._try_detect(frame)
+            regions.append(frame[ROI_OFFSET_Y:ROI_OFFSET_Y + ROI_H,
+                                 ROI_OFFSET_X:ROI_OFFSET_X + ROI_W])
+        regions.append(frame)
+
+        for img in regions:
+            for candidate in self._candidate_images(img):
+                result = self._try_detect(candidate)
+                if result:
+                    return result
+        return None
+
+    def _candidate_images(self, img):
+        """二维码解码候选图：原图优先，失败时再尝试增强对比度。"""
+        yield img
+        try:
+            work = img if img.dtype == np.uint8 else np.clip(img, 0, 255).astype(np.uint8)
+            gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            eq = clahe.apply(gray)
+            yield cv2.cvtColor(eq, cv2.COLOR_GRAY2BGR)
+            thr = cv2.adaptiveThreshold(
+                eq, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 31, 3,
+            )
+            yield cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)
+        except Exception:
+            return
 
     def _try_detect(self, img):
         if self.det_type == "wechat":
@@ -230,6 +254,7 @@ def recognize(timeout: float = 10.0) -> str:
     t_start = time.monotonic()
     log.info("[QR2] 开补光灯 3")
     _set_light(3, True)
+    time.sleep(QR2_LIGHT_SETTLE_S)
     cam = None
     try:
         cam = _start_csi_with_retries("QR2")
@@ -239,6 +264,7 @@ def recognize(timeout: float = 10.0) -> str:
         restart_count = 0
         last_frame_time = time.time()
         last_detect_activity_time = time.time()
+        votes: dict[str, int] = {}
         while time.time() - t0 < timeout:
             frame = cam.read()
             now = time.time()
@@ -259,12 +285,15 @@ def recognize(timeout: float = 10.0) -> str:
                 last_detect_activity_time = now
                 log.info(f"  [QR2] 扫到: '{data}' (尝试 {attempts} 次)")
                 if _is_valid_num(data):
-                    letters = QR2_NUM_TO_LETTERS[data]
-                    log.info(f"  [QR2] 确认: {data} -> {letters}")
-                    dt = time.monotonic() - t_start
-                    log.info("[QR2 timing] detected in %.3fs", dt)
-                    print(f"[QR2 timing] detected in {dt:.3f}s", flush=True)
-                    return letters
+                    votes[data] = votes.get(data, 0) + 1
+                    print(f"[QR2] 候选数字 {data}: {votes[data]}/{QR2_CONFIRM_HITS}", flush=True)
+                    if votes[data] >= QR2_CONFIRM_HITS:
+                        letters = QR2_NUM_TO_LETTERS[data]
+                        log.info(f"  [QR2] 确认: {data} -> {letters}")
+                        dt = time.monotonic() - t_start
+                        log.info("[QR2 timing] detected in %.3fs", dt)
+                        print(f"[QR2 timing] detected in {dt:.3f}s", flush=True)
+                        return letters
                 else:
                     log.info(f"  [QR2] '{data}' 不在 1-6, 跳过")
             elif now - last_detect_activity_time >= CSI_NO_DETECT_RESTART_S and restart_count < CSI_MAX_RESTARTS:
@@ -280,6 +309,17 @@ def recognize(timeout: float = 10.0) -> str:
                 log.info(f"  [QR2] 已尝试 {attempts} 次, 未扫到合法二维码")
                 print(f"[QR2] 有有效画面，已尝试 {attempts} 帧，未扫到合法二维码", flush=True)
             time.sleep(0.05)
+        if votes:
+            best_num, best_hits = max(votes.items(), key=lambda item: item[1])
+            tied = [num for num, hits in votes.items() if hits == best_hits]
+            if len(tied) == 1:
+                letters = QR2_NUM_TO_LETTERS[best_num]
+                print(
+                    f"[QR2 WARN] 超时前未达到{QR2_CONFIRM_HITS}次确认，"
+                    f"采用唯一最高票 {best_num}({best_hits}票)->{letters}; votes={votes}",
+                    flush=True,
+                )
+                return letters
         raise RuntimeError(f"QR2: {timeout}s 内未识别到合法二维码 (1-6)")
     finally:
         t_cleanup = time.monotonic()

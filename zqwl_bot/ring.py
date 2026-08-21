@@ -169,7 +169,7 @@ CONFIG = {
     # 车体坐标约定：+dx=右移，-dx=左移；该补偿只作用在对准后的固定前推动作。
     "post_align_trim_dx_mm": -2.0,
     "post_align_trim_dy_mm": 0.0, 
-    "post_align_offset_y_mm": 95,
+    "post_align_offset_y_mm": 94,
     "post_align_back_y_mm": 200,
     "step2_to_step3_pause_s": 2.0,
     "step3_back_offset_px": 500,

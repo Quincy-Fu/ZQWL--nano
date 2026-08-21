@@ -39,6 +39,8 @@ SPLIT_THRESHOLD = 0.03
 AB_PATH_EPS = 1e-4
 AB_KEY_PATH_SPEED = 0.35
 QR2_RECOGNIZE_TIMEOUT_S = 18.0
+QR2_RECOGNIZE_RETRIES = 2
+QR2_RETRY_DELAY_S = 0.35
 
 RANK_RING_BACK_MM = 200.0
 RANK_RING_BACK_TIMEOUT_S = 45.0
@@ -49,7 +51,7 @@ BODY_POS_POST_SETTLE_S = 0.30
 RANK_PLACE_POINTS = {
     "亚军": ("B", 0.25, 1.779, 3, 0.25, 1.67),
     "冠军": ("A", 0.00, 1.779, 4, 0.00, 1.66),
-    "季军": ("C", -0.15, 1.73, 1, -0.25, 1.67),
+    "季军": ("C", -0.37, 1.73, 1, -0.25, 1.67),
 }
 
 # 当前转盘映射：0=B，1=A，2=C；槽位4作为圆弧结束后的空槽。
@@ -216,6 +218,25 @@ def sync_pose(x, y, yaw):
     return ok
 
 
+def recognize_qr2_sequence() -> str:
+    """QR2 识别偶发不稳定时重试一次；成功后返回 ABC 顺序字符串。"""
+    last_error = None
+    for attempt in range(1, QR2_RECOGNIZE_RETRIES + 1):
+        try:
+            seq = qr2.recognize(timeout=QR2_RECOGNIZE_TIMEOUT_S)
+            if len(seq) == 3 and set(seq) == {"A", "B", "C"}:
+                if attempt > 1:
+                    print(f"  QR2 第 {attempt} 次识别成功: {seq}")
+                return seq
+            last_error = RuntimeError(f"QR2 返回非法顺序: {seq!r}")
+        except Exception as exc:
+            last_error = exc
+            print(f"  [WARN] QR2 第 {attempt}/{QR2_RECOGNIZE_RETRIES} 次识别失败: {exc}")
+        if attempt < QR2_RECOGNIZE_RETRIES:
+            time.sleep(QR2_RETRY_DELAY_S)
+    raise RuntimeError(f"QR2 识别失败: {last_error}")
+
+
 def arc_with_waypoints(r, dir_, sweep_deg, on_waypoints):
     """走圆弧 + 定时回调. dir=-1 左(逆时针), +1 右(顺时针)."""
     def timer():
@@ -334,7 +355,7 @@ def run_task_ab():
         raise RuntimeError("初始位姿同步失败")
 
     # 2. QR2 识别 1->2->3 三个位置上的 ABC 摆放顺序
-    seq2 = qr2.recognize(timeout=QR2_RECOGNIZE_TIMEOUT_S)  # 例: "CAB"
+    seq2 = recognize_qr2_sequence()  # 例: "CAB"
     pos_to_slot = {
         pos_no: ALPHA_TO_POS[letter]
         for pos_no, letter in zip((1, 2, 3), seq2)
@@ -357,7 +378,7 @@ def run_task_ab():
     if not go_to(0.75, 0.25):
         raise RuntimeError("扫码后前进 5cm 失败")
 
-    arc_r = 0.84
+    arc_r = 0.80
     arc_dir = -1
     arc_sweep_deg = 130.0
     arc_speed = ARC_SPEED_MM_S / 1000.0
@@ -375,7 +396,10 @@ def run_task_ab():
 
     # 4. 圆弧后进入冠亚季放置流程。
     refresh_cur_from_pose()
-    turn_to(0)
+    if not turn_to(0):
+        raise RuntimeError("圆弧后转到 3° 失败")
+    if not sync_pose(_CUR_X, _CUR_Y, 0.0):
+        raise RuntimeError("圆弧后同步 yaw=0° 失败")
     arm(2)
     if not move_first_rank_y_then_x("季军"):
         raise RuntimeError("圆弧后首个名次点 Y->X 实走失败")
@@ -396,7 +420,7 @@ def run_task_ab():
     if not place_rank_with_ring("亚军"):
         raise RuntimeError("亚军 放置流程失败")
     arm(0)
-    if not turn_to(0):
+    if not turn_to(3):
         print("  [WARN] 回程转到 0° 失败，继续执行回程")
     if not return_home_strict():
         raise RuntimeError("回到 (-0.05, 0.0) 失败")
